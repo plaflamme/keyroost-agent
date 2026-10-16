@@ -1,4 +1,10 @@
 {
+  nixConfig = {
+    extra-substituters = [ "https://keyroost-agent.cachix.org" ];
+    extra-trusted-public-keys = [
+      "keyroost-agent.cachix.org-1:nrFszUmhznRvl52Zes9nEhgu7NjjJt/otBRAILg2Uo0="
+    ];
+  };
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
