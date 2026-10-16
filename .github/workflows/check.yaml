@@ -1,0 +1,35 @@
+name: check
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
+        include:
+          - system: x86_64-linux
+            runs-on: ubuntu-26.04
+          - system: aarch64-linux
+            runs-on: ubuntu-26.04-arm
+          - system: aarch64-darwin
+            runs-on: macos-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix build
+      - run: |
+          checks=$(nix flake show --json | jq -r '.checks."${{ matrix.system }}" | keys? | .[]')
+          for check in $checks;
+          do
+            echo "Building check $check"
+            nix build '.#checks.${{ matrix.system }}'.$check -L
