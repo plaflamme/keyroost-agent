@@ -51,13 +51,14 @@ impl PivSshAgent {
     }
 
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
-        let mut session = keyroost_transport::PivSession::open(&self.reader)?;
-        let identities = self.list_identities(&mut session);
-        Ok(identities
-            .into_iter()
-            .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
-            .map(Into::into)
-            .collect())
+        PivSession::with_transaction(&self.reader, |session| {
+            let identities = self.list_identities(session);
+            Ok(identities
+                .into_iter()
+                .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
+                .map(Into::into)
+                .collect())
+        })
     }
 
     pub(super) fn sign(
@@ -66,71 +67,75 @@ impl PivSshAgent {
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<Option<Signature>, crate::Error> {
-        let mut session = keyroost_transport::PivSession::open(&self.reader)?;
+        PivSession::with_transaction(&self.reader, |session| {
+            let piv_identity = self
+                .list_identities(session)
+                .into_iter()
+                .find(|id| &id.ssh_identity.credential == public_credential);
 
-        let piv_identity = self
-            .list_identities(&mut session)
-            .into_iter()
-            .find(|id| &id.ssh_identity.credential == public_credential);
+            let Some(piv_identity) = piv_identity else {
+                tracing::debug!("not matching PIV identity for requested public key");
+                return Ok(None);
+            };
 
-        let Some(piv_identity) = piv_identity else {
-            tracing::debug!("not matching PIV identity for requested public key");
-            return Ok(None);
-        };
+            // TODO: slot policy
+            let Some(pin) = self.prompt_pin()? else {
+                return Ok(None);
+            };
 
-        // TODO: slot policy
-        let Some(pin) = self.prompt_pin()? else {
-            return Ok(None);
-        };
+            session.verify_pin(pin.expose_secret().as_bytes())?;
 
-        session.verify_pin(pin.expose_secret().as_bytes())?;
+            let sig_hash = match keyroost_piv::x509::signature_hash(piv_identity.key_alg) {
+                Ok(sig_hash) => sig_hash,
+                Err(X509Error::UnsupportedAlgorithm) => return Ok(None),
+                Err(other) => return Err(crate::Error::Other(Box::new(other))),
+            };
 
-        let sig_hash = match keyroost_piv::x509::signature_hash(piv_identity.key_alg) {
-            Ok(sig_hash) => sig_hash,
-            Err(X509Error::UnsupportedAlgorithm) => return Ok(None),
-            Err(other) => return Err(crate::Error::Other(Box::new(other))),
-        };
+            let prepared = match sig_hash {
+                SigHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                SigHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                SigHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+                SigHash::None => data.to_vec(),
+            };
 
-        let prepared = match sig_hash {
-            SigHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-            SigHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-            SigHash::None => data.to_vec(),
-        };
+            let signature = session.sign(piv_identity.slot, piv_identity.key_alg, &prepared)?;
 
-        let signature = session.sign(piv_identity.slot, piv_identity.key_alg, &prepared)?;
+            let signature = match piv_identity.key_alg {
+                KeyAlg::EccP256 => {
+                    Signature::try_from(ecdsa::Signature::<p256::NistP256>::from_der(&signature)?)?
+                }
+                KeyAlg::EccP384 => {
+                    Signature::try_from(ecdsa::Signature::<p384::NistP384>::from_der(&signature)?)?
+                }
+                KeyAlg::EccP521 => {
+                    Signature::try_from(ecdsa::Signature::<p521::NistP521>::from_der(&signature)?)?
+                }
 
-        let signature = match piv_identity.key_alg {
-            KeyAlg::EccP256 => {
-                Signature::try_from(ecdsa::Signature::<p256::NistP256>::from_der(&signature)?)?
-            }
-            KeyAlg::EccP384 => {
-                Signature::try_from(ecdsa::Signature::<p384::NistP384>::from_der(&signature)?)?
-            }
+                KeyAlg::Ed25519 => {
+                    Signature::new(ssh_agent_lib::ssh_key::Algorithm::Ed25519, signature)?
+                }
+                KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+                    let signature = match rsa_sig_hash {
+                        Some(HashAlg::Sha256) => sha2::Sha256::digest(signature).to_vec(),
+                        Some(HashAlg::Sha512) => sha2::Sha512::digest(signature).to_vec(),
+                        None => signature,
+                        Some(other) => {
+                            return Err(crate::Error::Other(
+                                format!("Unsupported RSA hash algorithm {other}").into(),
+                            ));
+                        }
+                    };
+                    Signature::new(Algorithm::Rsa { hash: rsa_sig_hash }, signature)?
+                }
+                KeyAlg::X25519 => {
+                    return Err(crate::Error::Other(
+                        "Unsupported signature algorithm X25519".into(),
+                    ));
+                }
+            };
 
-            KeyAlg::Ed25519 => {
-                Signature::new(ssh_agent_lib::ssh_key::Algorithm::Ed25519, signature)?
-            }
-            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-                let signature = match rsa_sig_hash {
-                    Some(HashAlg::Sha256) => sha2::Sha256::digest(signature).to_vec(),
-                    Some(HashAlg::Sha512) => sha2::Sha512::digest(signature).to_vec(),
-                    None => signature,
-                    Some(other) => {
-                        return Err(crate::Error::Other(
-                            format!("Unsupported RSA hash algorithm {other}").into(),
-                        ));
-                    }
-                };
-                Signature::new(Algorithm::Rsa { hash: rsa_sig_hash }, signature)?
-            }
-            KeyAlg::X25519 => {
-                return Err(crate::Error::Other(
-                    "Unsupported signature algorithm X25519".into(),
-                ));
-            }
-        };
-
-        Ok(Some(signature))
+            Ok(Some(signature))
+        })
     }
 
     fn prompt_pin(&self) -> Result<Option<secrecy::SecretBox<str>>, crate::Error> {
@@ -210,6 +215,9 @@ fn ssh_public_credentials(
             }
             KeyAlg::EccP384 => {
                 KeyData::Ecdsa(EcdsaPublicKey::NistP384(EncodedPoint::from_bytes(&point)?))
+            }
+            KeyAlg::EccP521 => {
+                KeyData::Ecdsa(EcdsaPublicKey::NistP521(EncodedPoint::from_bytes(&point)?))
             }
             KeyAlg::Ed25519 => KeyData::Ed25519(Ed25519PublicKey::try_from(point.as_slice())?),
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
