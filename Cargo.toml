@@ -5,6 +5,8 @@ edition = "2024"
 description = "Implementation of the ssh agent protocol on top of keyroost APIs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+clap-verbosity-flag = { version = "3", features = ["tracing"] }
 ecdsa = "0.16"
 keyroost-openpgp = { version = "0.13.0" }
 keyroost-piv = { version = "0.13.0" }
@@ -16,8 +18,13 @@ pinentry = "0.8"
 sha2 = "0.10"
 signature = "2"
 ssh-agent-lib = "0.6"
-tokio = { version = "1", default-features = false, features = ["net"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+] }
 tracing = "0.1"
+tracing-subscriber = "0.3"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [lints.clippy]
