@@ -39,7 +39,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
 
         let signature = self
             .piv
-            .sign(request.credential, &request.data, rsa_sig_hash)?;
+            .sign(&request.credential, &request.data, rsa_sig_hash)?;
 
         let Some(signature) = signature else {
             return Err(AgentError::Failure); // TODO: what error should we return for "not found"?
@@ -50,21 +50,26 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
 }
 
 /// Launch an SSH agent and bind it to the specified socket path.
+///
+/// # Errors
+///
+/// Will return `Err` if an error occurs while binding to the socket or if the ssh agent raises an error while listening for connections.
 pub async fn run(
     socket_path: &Path,
     piv_reader: String,
     pinentry_binary: Option<String>,
 ) -> Result<(), std::io::Error> {
     let listener = UnixListener::bind(socket_path)?;
-    match ssh_agent_lib::agent::listen(
+    let result = ssh_agent_lib::agent::listen(
         listener,
         KeyroostAgent {
             piv: piv::PivSshAgent::new(piv_reader, pinentry_binary),
         },
     )
-    .await
-    {
-        Ok(_) => Ok(()),
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
         Err(AgentError::IO(e)) => Err(e),
         Err(other) => Err(std::io::Error::other(other.to_string())),
     }

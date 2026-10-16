@@ -52,7 +52,7 @@ impl PivSshAgent {
 
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
         let mut session = keyroost_transport::PivSession::open(&self.reader)?;
-        let identities = self.list_identities(&mut session)?;
+        let identities = self.list_identities(&mut session);
         Ok(identities
             .into_iter()
             .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
@@ -62,16 +62,16 @@ impl PivSshAgent {
 
     pub(super) fn sign(
         &self,
-        public_credential: PublicCredential,
+        public_credential: &PublicCredential,
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<Option<Signature>, crate::Error> {
         let mut session = keyroost_transport::PivSession::open(&self.reader)?;
 
         let piv_identity = self
-            .list_identities(&mut session)?
+            .list_identities(&mut session)
             .into_iter()
-            .find(|id| id.ssh_identity.credential == public_credential);
+            .find(|id| &id.ssh_identity.credential == public_credential);
 
         let Some(piv_identity) = piv_identity else {
             tracing::debug!("not matching PIV identity for requested public key");
@@ -162,16 +162,16 @@ impl PivSshAgent {
     fn list_identities<'a: 'b, 'b>(
         &'a self,
         session: &'b mut PivSession,
-    ) -> Result<impl Iterator<Item = PivIdentity> + 'b, crate::Error> {
-        Ok(self.slots.iter().flat_map(|slot| {
+    ) -> impl Iterator<Item = PivIdentity> + 'b {
+        self.slots.iter().filter_map(|slot| {
             // TODO: deal with Err here, probably logging is sufficient
             slot_to_ssh_identity(session, *slot)
                 .inspect_err(|e| {
-                    tracing::warn!("failed to configure slot {slot:?} as PIV identity: {e}")
+                    tracing::warn!("failed to configure slot {slot:?} as PIV identity: {e}");
                 })
                 .ok()
                 .flatten()
-        }))
+        })
     }
 }
 
