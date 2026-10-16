@@ -23,7 +23,7 @@
         let
           keyroostAgentCargo = fromTOML (builtins.readFile ./Cargo.toml);
 
-          buildKeyroostPackage =
+          buildKeyroostAgentPackage =
             extraBuildInputs: debug:
             pkgs.rustPlatform.buildRustPackage {
               pname = keyroostAgentCargo.package.name;
@@ -61,21 +61,7 @@
               };
             };
 
-          keyroostExtraBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
-            with pkgs;
-            [
-              libGL
-              libx11
-              libxcb
-              libxcursor
-              libxi
-              libxkbcommon
-              libxrandr
-              wayland
-            ]
-          );
-
-          buildKeyroostAgent = buildKeyroostPackage keyroostExtraBuildInputs;
+          buildKeyroostAgent = buildKeyroostAgentPackage [ ];
         in
         {
           packages = {
