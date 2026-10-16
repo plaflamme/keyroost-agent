@@ -1,17 +1,31 @@
 {
-  description = "Independent, vendor-neutral GUI and CLI for managing hardware security keys (FIDO2, OATH, OpenPGP, PIV, Token2 TOTP tokens)";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    rust-flake = {
+      url = "github:juspay/rust-flake";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
+
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
+      ];
+
+      imports = [
+        inputs.rust-flake.flakeModules.default
+        inputs.rust-flake.flakeModules.nixpkgs
       ];
 
       perSystem =
@@ -21,73 +35,29 @@
           ...
         }:
         let
-          keyroostAgentCargo = fromTOML (builtins.readFile ./Cargo.toml);
 
-          buildKeyroostAgentPackage =
-            extraBuildInputs: debug:
-            pkgs.rustPlatform.buildRustPackage {
-              pname = keyroostAgentCargo.package.name;
-              version = keyroostAgentCargo.package.version;
-              src = ./.;
-              cargoLock = {
-                lockFile = ./Cargo.lock;
-              };
-
-              buildType = if debug then "debug" else "release";
-              dontStrip = debug;
-
-              buildNoDefaultFeatures = true;
-
-              nativeBuildInputs = with pkgs; [
-                pkg-config
-              ];
-
-              buildInputs = [ pkgs.pcsclite ] ++ extraBuildInputs;
-
-              postFixup = pkgs.lib.optionalString (pkgs.stdenv.hostPlatform.isLinux) ''
-                patchelf \
-                  --set-rpath "${pkgs.lib.makeLibraryPath ([ pkgs.pcsclite ] ++ extraBuildInputs)}" \
-                  $out/bin/${keyroostAgentCargo.package.name}
-              '';
-
-              meta = {
-                description = keyroostAgentCargo.package.description;
-                homepage = "https://github.com/plaflamme/keyroost-agent";
-                license = with pkgs.lib.licenses; [
-                  mit
-                  asl20
-                ];
-                platforms = pkgs.lib.platforms.unix;
-              };
-            };
-
-          buildKeyroostAgent = buildKeyroostAgentPackage [ ];
         in
         {
-          packages = {
-            keyroostAgent = buildKeyroostAgent false;
-            keyroostAgent-debug = buildKeyroostAgent true;
-
-            default = config.packages.keyroostAgent;
+          rust-project = {
+            crates = {
+              keyroost-agent = {
+                crane = {
+                  extraBuildArgs = {
+                    CARGO_PROFILE = "dev"; # TODO: how do we output both release and dev profiles?
+                  };
+                  args = {
+                    nativeBuildInputs = with pkgs; [
+                      pkg-config
+                    ];
+                    buildInputs = [ pkgs.pcsclite ];
+                  };
+                };
+              };
+            };
           };
 
-          devShells.default = pkgs.mkShell {
-            inputsFrom = [
-              config.packages.keyroostAgent
-            ];
-
-            buildInputs = with pkgs; [ udev ]; # keyroost-hid
-
-            RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
-
-            packages = with pkgs; [
-              nixfmt
-              nixd
-              clippy
-              rustfmt
-              rust-analyzer
-            ];
-          };
+          packages.default = config.packages.keyroost-agent;
+          devShells.default = config.devShells.rust;
         };
     };
 }
