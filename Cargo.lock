@@ -711,6 +711,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-piv-applet"
+version = "0.1.0"
+dependencies = [
+ "keyroost-piv",
+ "keyroost-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "keyroost-proto"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

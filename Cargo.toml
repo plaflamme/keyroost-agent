@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/keyroost-piv-applet"]
+
 [package]
 name = "keyroost-agent"
 version = "0.1.0"

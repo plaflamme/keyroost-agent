@@ -1,0 +1,16 @@
+[package]
+name = "keyroost-piv-applet"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust PIV (NIST SP 800-73-4 / FIPS 201) card-side applet: host APDUs in, card responses out."
+
+[dependencies]
+# The host-side PIV byte layer: the instruction set, slots, algorithm
+# identifiers, status words, and BER-TLV / SPKI / X.509 parsers this applet
+# reuses for the responses it builds.
+keyroost-piv = { version = "0.13.0" }
+# APDU and codec primitives (TLV read/write) the command handlers parse with.
+keyroost-proto = { version = "0.13.0" }
+# Secret card state (PIN/PUK, management key, private key material) lives in
+# Zeroizing containers once the state fields land.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
