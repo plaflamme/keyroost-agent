@@ -41,7 +41,7 @@
           ...
         }:
         let
-
+          jcardengine = pkgs.callPackage ./nix/jcardengine.nix { };
         in
         {
           rust-project = {
@@ -62,7 +62,10 @@
             };
           };
 
-          packages.default = config.packages.keyroost-agent;
+          packages = {
+            default = config.packages.keyroost-agent;
+            jcardengine = jcardengine;
+          };
           devShells.default = config.devShells.rust;
         };
     };
