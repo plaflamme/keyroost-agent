@@ -77,7 +77,24 @@
             piv-vsmartcard = pkgs.testers.runNixOSTest {
               name = "piv-vsmartcard";
               nodes = {
-                host = { ... }: { };
+                host =
+                  { pkgs, ... }:
+                  {
+                    # The PC/SC stack: the resource manager plus the
+                    # VSmartCard reader driver, which listens on its default
+                    # port (35963) for a vpicc to connect to.
+                    services.pcscd.enable = true;
+                    services.vsmartcard-vpcd.enable = true;
+
+                    # The vpicc side: our PIV applet front end, which
+                    # connects to that listener and answers as a card.
+                    systemd.services.piv-vsmartcard = {
+                      wantedBy = [ "multi-user.target" ];
+                      serviceConfig = {
+                        ExecStart = "${config.packages.keyroost-piv-applet}/bin/piv-vsmartcard";
+                      };
+                    };
+                  };
               };
               testScript = ''
                 start_all()
