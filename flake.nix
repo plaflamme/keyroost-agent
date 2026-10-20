@@ -86,6 +86,9 @@
                     services.pcscd.enable = true;
                     services.vsmartcard-vpcd.enable = true;
 
+                    # A PC/SC client for the test to use.
+                    environment.systemPackages = [ pkgs.opensc ];
+
                     # The vpicc side: our PIV applet front end, which
                     # connects to that listener and answers as a card.
                     systemd.services.piv-vsmartcard = {
@@ -104,6 +107,11 @@
                 # first PC/SC client.
                 host.wait_for_unit("pcscd.socket")
                 host.wait_for_unit("piv-vsmartcard.service")
+
+                status, output = host.execute("opensc-tool --list-readers")
+                log.info(f"opensc-tool --list-readers:\n{output}")
+                assert status == 0, output
+                assert "Virtual PCD" in output, output
               '';
             };
           };
