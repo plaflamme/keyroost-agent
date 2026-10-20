@@ -673,7 +673,10 @@ impl PivApplet {
             // The proof value (the 0x81 challenge, or a 0x82 value) is
             // checked the way the card checks it — decrypted and compared —
             // and only when a witness did not just consume the challenge.
-            let proof = t.challenge.or(t.response).filter(|_| self.mgmt_challenge_valid);
+            let proof = t
+                .challenge
+                .or(t.response)
+                .filter(|_| self.mgmt_challenge_valid);
             if let Some(p) = proof {
                 if p.len() != bs {
                     return Response::sw(SW_WRONG_DATA);
@@ -1082,7 +1085,10 @@ impl PivApplet {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
         if self.pin.tries != 0 || self.puk.tries != 0 {
-            return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
+            // Yubico's documented answer for this precondition is 6985
+            // (conditions of use not satisfied); the host only recognises
+            // 6982/6983/6985 as "block the PIN and PUK first".
+            return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
         }
         self.set_management_key(MgmtAlg::TripleDes, &DEFAULT_MGMT_KEY);
         self.pin = Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES);
@@ -2213,11 +2219,11 @@ mod tests {
     fn reset_needs_both_counters_blocked() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.sw, keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
         block_pin(&mut applet);
         // PIN blocked, PUK not.
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.sw, keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(r.sw, SW_OK);

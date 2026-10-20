@@ -113,8 +113,38 @@
                 start_all()
                 host.wait_for_unit("pcscd.socket")
                 host.wait_for_unit("piv-vsmartcard.service")
+
+                # Read-only status: fingerprint, version, serial, PIN retries, slots.
+                host.succeed("keyroostctl piv info")
+
+                # PIN change: CHANGE REFERENCE verifies the old PIN.
                 host.succeed("OLD=123456 NEW=654321 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
                 host.succeed("OLD=654321 NEW=123456 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
+
+                # PUK change: the same command with the PUK reference.
+                host.succeed("OLD=12345678 NEW=87654321 keyroostctl piv puk change --puk env:OLD --new-puk env:NEW")
+                host.succeed("OLD=87654321 NEW=12345678 keyroostctl piv puk change --puk env:OLD --new-puk env:NEW")
+
+                # Block the PIN: five wrong old PINs, each burning one try.
+                host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
+                host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
+                host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
+                host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
+                host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
+
+                # Unblock with the PUK (RESET RETRY COUNTER), then restore the factory PIN.
+                host.succeed("PUK=12345678 NEW=654321 keyroostctl piv pin unblock --puk env:PUK --new-pin env:NEW")
+
+                # Set the retry counts (Yubico 0xFA): needs the management key and the
+                # verified PIN; also resets both credentials to factory values.
+                host.succeed("PIN=654321 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv retries set --pin-tries 2 --puk-tries 2 --pin env:PIN --mgmt-key env:MGMT --yes")
+
+                # Factory reset: the host burns the PIN and PUK counters itself, then sends RESET.
+                host.succeed("keyroostctl piv reset --yes")
+
+                # The card is back at factory state: the factory PIN and the factory
+                # management key work again.
+                host.succeed("PIN=123456 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv retries set --pin-tries 5 --puk-tries 3 --pin env:PIN --mgmt-key env:MGMT --yes")
               '';
             };
           };
