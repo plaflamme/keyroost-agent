@@ -98,6 +98,12 @@
               };
               testScript = ''
                 start_all()
+
+                # pcscd is socket-activated: the socket unit is what is
+                # active at boot; the service itself only starts on the
+                # first PC/SC client.
+                host.wait_for_unit("pcscd.socket")
+                host.wait_for_unit("piv-vsmartcard.service")
               '';
             };
           };
