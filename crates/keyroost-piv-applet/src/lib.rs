@@ -24,10 +24,11 @@
 //!
 //! The crate is currently **scaffolding**: [`PivApplet::process`] dispatches
 //! a received APDU to one handler per PIV instruction. SELECT (and its
-//! `61xx` / GET RESPONSE follow-up) is implemented; the remaining handlers
-//! are stubs answering `6D00` (instruction not supported) — GET DATA
-//! answers `6A82` (no objects yet). The card state (PIN/PUK, management key,
-//! key slots,
+//! `61xx` / GET RESPONSE follow-up) and GET SERIAL / GET VERSION are
+//! implemented; the remaining handlers are stubs answering `6D00` (instruction
+//! not supported)
+//! — GET DATA answers `6A82` (no objects yet). The card state (PIN/PUK,
+//! management key, key slots,
 //! certificates, CHUID, admin data) and the crypto it will carry (key
 //! generation, signing, ECDH, block ciphers for management-key auth) land
 //! with the command implementations; the RustCrypto dependencies they need
@@ -60,6 +61,14 @@ const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6900;
 /// SELECT P1: select by DF name (the AID). Anything else on a PIV card is
 /// a file select this applet has no answer for.
 const INS_SELECT_P1_BY_AID: u8 = 0x04;
+
+/// The default serial a factory-fresh applet presents: a placeholder until
+/// the virtual card has a real source of serial identity.
+pub const DEFAULT_SERIAL: u32 = 0x0102_0304;
+
+/// The applet version GET VERSION presents: `major.minor.patch`, tracking
+/// the Yubico PIV firmware line the behaviour is being reimplemented from.
+pub const VERSION: [u8; 3] = [0x04, 0x03, 0x07];
 
 /// The AID this applet is registered under: the NIST PIV card application
 /// AID, the 5-byte RID `A0 00 00 03 08` plus the PIX `00 00 10 00 01 00`.
@@ -120,6 +129,9 @@ impl Response {
 /// While the crate is wiring only the only state is the response tail; the
 /// rest of the card state lands with the command implementations.
 pub struct PivApplet {
+    /// The card serial GET SERIAL presents: a 32-bit value, big-endian on
+    /// the wire.
+    serial: u32,
     /// The tail of a response the previous command signalled with `61xx`
     /// because it did not fit in the requested `Le`, pending for a GET
     /// RESPONSE (0xC0). `None` when nothing is pending.
@@ -134,13 +146,22 @@ impl Default for PivApplet {
 
 impl PivApplet {
     /// A factory-fresh applet: default PIN/PUK with full retry counters, the
-    /// default management key, a freshly generated serial, empty key slots.
+    /// default management key, the [`DEFAULT_SERIAL`] serial, empty key
+    /// slots.
     ///
-    /// While the applet is wiring only there is nothing else to initialise:
-    /// the factory state lands with the state fields.
+    /// While the applet is wiring only the serial is the only state field
+    /// with a factory value; the rest lands with the state fields.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_serial(DEFAULT_SERIAL)
+    }
+
+    /// A factory-fresh applet with the given card serial, everything else as
+    /// in [`PivApplet::new`].
+    #[must_use]
+    pub fn with_serial(serial: u32) -> Self {
         Self {
+            serial,
             get_response_tail: None,
         }
     }
@@ -356,14 +377,42 @@ impl PivApplet {
         Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
-    /// GET VERSION (0xFD, Yubico extension): the 3-byte applet version.
-    fn process_get_version(&mut self, _apdu: &[u8]) -> Response {
-        Response::sw(SW_INS_NOT_SUPPORTED)
+    /// GET VERSION (0xFD, Yubico extension): the applet version as three
+    /// `major.minor.patch` bytes under `9000`.
+    ///
+    /// Like the other Yubico extensions this accepts both the ISO CLA and
+    /// the Yubico proprietary one (`0xFF`); anything else is
+    /// [`SW_CLA_NOT_SUPPORTED`]. A case-2 `Le` smaller than three re-enters
+    /// the usual `61xx` / GET RESPONSE continuation.
+    fn process_get_version(&mut self, apdu: &[u8]) -> Response {
+        let cla = apdu[0];
+        if cla != 0x00 && cla != 0xFF {
+            return Response::sw(SW_CLA_NOT_SUPPORTED);
+        }
+        let le = match apdu_le(&apdu[4..]) {
+            Ok(le) => le,
+            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
+        };
+        self.split_for_le(VERSION.to_vec(), le)
     }
 
-    /// GET SERIAL (0xF8, Yubico extension): the 4-byte card serial.
-    fn process_get_serial(&mut self, _apdu: &[u8]) -> Response {
-        Response::sw(SW_INS_NOT_SUPPORTED)
+    /// GET SERIAL (0xF8, Yubico extension): the card serial as four
+    /// big-endian bytes under `9000`.
+    ///
+    /// Like the other Yubico extensions this accepts both the ISO CLA and
+    /// the Yubico proprietary one (`0xFF`); anything else is
+    /// [`SW_CLA_NOT_SUPPORTED`]. A case-2 `Le` smaller than four re-enters
+    /// the usual `61xx` / GET RESPONSE continuation.
+    fn process_get_serial(&mut self, apdu: &[u8]) -> Response {
+        let cla = apdu[0];
+        if cla != 0x00 && cla != 0xFF {
+            return Response::sw(SW_CLA_NOT_SUPPORTED);
+        }
+        let le = match apdu_le(&apdu[4..]) {
+            Ok(le) => le,
+            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
+        };
+        self.split_for_le(self.serial.to_be_bytes().to_vec(), le)
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
@@ -553,6 +602,89 @@ mod tests {
         assert_eq!(first.sw, 0x610A); // 14 - 4 = 10 remain
         let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
         assert_eq!(rest.data, &YUBIKEY5_SELECT_BODY[9..]);
+        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_version_answers_4_3_7() {
+        let mut applet = PivApplet::new();
+        // The host's case-2 form: `00 FD 00 00 00`.
+        let resp = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x00]);
+        assert_eq!(resp.data, [0x04, 0x03, 0x07]);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_version_case1_and_yubico_cla() {
+        let mut applet = PivApplet::new();
+        for apdu in [[0x00u8, 0xFD, 0x00, 0x00], [0xFF, 0xFD, 0x00, 0x00]] {
+            let resp = applet.process(&apdu);
+            assert_eq!(resp.data, [0x04, 0x03, 0x07]);
+            assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        }
+    }
+
+    #[test]
+    fn get_version_rejects_other_clas() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&[0x40, 0xFD, 0x00, 0x00]);
+        assert_eq!(resp.data, Vec::new());
+        assert_eq!(resp.sw, SW_CLA_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn get_version_small_le_truncates_and_get_response_completes() {
+        let mut applet = PivApplet::new();
+        let first = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x02]);
+        assert_eq!(first.data, [0x04, 0x03]);
+        assert_eq!(first.sw, 0x6101);
+        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(rest.data, [0x07]);
+        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_serial_returns_the_serial_big_endian() {
+        let mut applet = PivApplet::with_serial(0x0240_8A1B);
+        // The host's case-2 form: `00 F8 00 00 00`.
+        let resp = applet.process(&[0x00, 0xF8, 0x00, 0x00, 0x00]);
+        assert_eq!(resp.data, [0x02, 0x40, 0x8A, 0x1B]);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_serial_default_applet_carries_the_default_serial() {
+        let mut applet = PivApplet::new();
+        // Case 1: no `Le` at all.
+        let resp = applet.process(&[0x00, 0xF8, 0x00, 0x00]);
+        assert_eq!(resp.data, DEFAULT_SERIAL.to_be_bytes().to_vec());
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_serial_accepts_the_yubico_cla() {
+        let mut applet = PivApplet::with_serial(7);
+        let resp = applet.process(&[0xFF, 0xF8, 0x00, 0x00]);
+        assert_eq!(resp.data, [0x00, 0x00, 0x00, 0x07]);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn get_serial_rejects_other_clas() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&[0x40, 0xF8, 0x00, 0x00]);
+        assert_eq!(resp.data, Vec::new());
+        assert_eq!(resp.sw, SW_CLA_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn get_serial_small_le_truncates_and_get_response_completes() {
+        let mut applet = PivApplet::with_serial(0xAABB_CCDD);
+        let first = applet.process(&[0x00, 0xF8, 0x00, 0x00, 0x02]);
+        assert_eq!(first.data, [0xAA, 0xBB]);
+        assert_eq!(first.sw, 0x6102);
+        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(rest.data, [0xCC, 0xDD]);
         assert_eq!(rest.sw, keyroost_piv::SW_OK);
     }
 }

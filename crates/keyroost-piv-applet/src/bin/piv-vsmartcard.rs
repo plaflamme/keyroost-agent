@@ -19,10 +19,9 @@
 //! * Every other message is a command APDU. The answer is the response
 //!   APDU: the response data, followed by the two-byte status word.
 //!
-//! The card is the applet instance created on power on / reset. While
-//! the applet is wiring only, most of its handlers still `todo!()`, so
-//! unimplemented APDUs panic this process; a service supervisor is
-//! expected to restart it, and the driver reconnects on demand.
+//! The card is the applet instance created on power on / reset. While the
+//! applet is wiring only, unimplemented APDUs are answered with a
+//! not-supported status word instead of panicking.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -35,9 +34,9 @@ use tracing_subscriber::EnvFilter;
 
 use keyroost_piv_applet::{PivApplet, Response};
 
-/// ATR of a YubiKey 4/5 PIV applet, so card drivers that match on the
-/// ATR (OpenSC's PIV support, GnuPG) bind to the virtual card.
-const DEFAULT_ATR: &str = "3B9813413F80018061CB0F0180416A308031806C";
+/// The ATR of a YubiKey 4, so card drivers that match on the ATR (OpenSC's
+/// PIV support, GnuPG) bind to the virtual card.
+const DEFAULT_ATR: &str = "3BF81300008131FE15597562696B657934D4";
 
 // VSmartCard control commands (driver → card, one-byte payload).
 const CTRL_POWER_OFF: u8 = 0x00;
