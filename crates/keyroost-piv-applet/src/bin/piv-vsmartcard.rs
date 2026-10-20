@@ -107,8 +107,9 @@ fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
     let mut stream = TcpStream::connect((host, port))?;
     info!("connected to vpcd at {host}:{port}");
 
-    // The card: the applet instance; `None` while powered off.
-    let mut applet: Option<PivApplet> = None;
+    // The card: the applet instance
+    let mut applet = PivApplet::new();
+    let mut power_on = false;
 
     loop {
         let Some(msg) = read_msg(&mut stream)? else {
@@ -120,11 +121,11 @@ fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
             // A control command: answered, at most, with an ATR.
             match msg[0] {
                 CTRL_POWER_OFF => {
-                    applet = None;
+                    power_on = false;
                     trace!("power off");
                 }
                 CTRL_POWER_ON | CTRL_RESET => {
-                    applet = Some(PivApplet::new());
+                    power_on = true;
                     trace!("power on (fresh applet)");
                 }
                 CTRL_GET_ATR => write_msg(&mut stream, atr)?,
@@ -132,21 +133,19 @@ fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
             }
             continue;
         }
-
         // A command APDU.
-        let response = match &mut applet {
-            Some(applet) if msg.len() >= 4 => applet.process(&msg),
-            Some(_) => {
-                warn!(
-                    "command APDU shorter than the 4-byte header ({} byte(s))",
-                    msg.len()
-                );
-                Response::sw(SW_WRONG_LENGTH)
-            }
-            None => {
-                warn!("command APDU while powered off");
-                Response::sw(SW_NOT_INITIALIZED)
-            }
+
+        let response = if !power_on {
+            warn!("command APDU while powered off");
+            Response::sw(SW_NOT_INITIALIZED)
+        } else if msg.len() < 4 {
+            warn!(
+                "command APDU shorter than the 4-byte header ({} byte(s))",
+                msg.len()
+            );
+            Response::sw(SW_WRONG_LENGTH)
+        } else {
+            applet.process(&msg)
         };
 
         trace!(
