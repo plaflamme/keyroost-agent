@@ -23,8 +23,9 @@
 //! # Scope (wiring only)
 //!
 //! The crate is currently **scaffolding**: [`PivApplet::process`] dispatches
-//! a received APDU to one handler per PIV instruction, and every handler
-//! body is a `todo!()`. The card state (PIN/PUK, management key, key slots,
+//! a received APDU to one handler per PIV instruction. SELECT (and its
+//! `61xx` / GET RESPONSE follow-up) is implemented; the remaining handler
+//! bodies are `todo!()`. The card state (PIN/PUK, management key, key slots,
 //! certificates, CHUID, admin data) and the crypto it will carry (key
 //! generation, signing, ECDH, block ciphers for management-key auth) land
 //! with the command implementations; the RustCrypto dependencies they need
@@ -47,6 +48,35 @@ pub const INS_IMPORT_ASYM: u8 = 0x86;
 
 /// ISO 7816-4 status word: instruction not supported.
 const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
+/// ISO 7816-4 status word: CLA not supported.
+const SW_CLA_NOT_SUPPORTED: u16 = 0x6400;
+/// ISO 7816-4 status word: conditions not satisfied — the standard form
+/// (a GET RESPONSE with nothing pending). Note `keyroost-piv` carries its
+/// own `SW_CONDITIONS_NOT_SATISFIED` = `0x6985`; this is the `0x6900` one.
+const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6900;
+
+/// SELECT P1: select by DF name (the AID). Anything else on a PIV card is
+/// a file select this applet has no answer for.
+const INS_SELECT_P1_BY_AID: u8 = 0x04;
+
+/// The AID this applet is registered under: the NIST PIV card application
+/// AID, the 5-byte RID `A0 00 00 03 08` plus the PIX `00 00 10 00 01 00`.
+/// The same constant `keyroost-piv`'s `select_full()` sends.
+pub const AID_FULL: [u8; 11] = [
+    0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+];
+
+/// The 5-byte RID/PIX prefix of [`AID_FULL`] — the shortest SELECT AID this
+/// applet accepts, and the whole of `keyroost-piv`'s `AID`.
+pub const AID_RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x08];
+
+/// TLV tag of the response wrapper the SELECT template is nested in.
+const TAG_61: u8 = 0x61;
+/// TLV tag of the application identifier (AID/PIX) object.
+const TAG_4F: u8 = 0x4F;
+/// TLV tag of the application identifier template (SP 800-73-4) carrying
+/// the RID form of the AID.
+const TAG_79: u8 = 0x79;
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
 /// status word that always terminates the answer.
@@ -85,9 +115,14 @@ impl Response {
 /// certificates, the CHUID, the admin data, and the applet version/serial —
 /// and answers host APDUs through [`PivApplet::process`].
 ///
-/// Deliberately empty while the crate is wiring only: the state fields land
-/// together with the command implementations.
-pub struct PivApplet;
+/// While the crate is wiring only the only state is the response tail; the
+/// rest of the card state lands with the command implementations.
+pub struct PivApplet {
+    /// The tail of a response the previous command signalled with `61xx`
+    /// because it did not fit in the requested `Le`, pending for a GET
+    /// RESPONSE (0xC0). `None` when nothing is pending.
+    get_response_tail: Option<Vec<u8>>,
+}
 
 impl Default for PivApplet {
     fn default() -> Self {
@@ -99,11 +134,13 @@ impl PivApplet {
     /// A factory-fresh applet: default PIN/PUK with full retry counters, the
     /// default management key, a freshly generated serial, empty key slots.
     ///
-    /// A no-op while the applet is wiring only: there are no state fields to
-    /// initialise yet; the factory state lands with them.
+    /// While the applet is wiring only there is nothing else to initialise:
+    /// the factory state lands with the state fields.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            get_response_tail: None,
+        }
     }
 
     /// The applet's entry point: dispatch a received host APDU to its
@@ -128,9 +165,7 @@ impl PivApplet {
             Some(Instruction::Verify) => self.process_verify(apdu),
             Some(Instruction::GetData) => self.process_get_data(apdu),
             Some(Instruction::GetResponse) => self.process_get_response(apdu),
-            Some(Instruction::GeneralAuthenticate) => {
-                self.process_general_authenticate(apdu)
-            }
+            Some(Instruction::GeneralAuthenticate) => self.process_general_authenticate(apdu),
             Some(Instruction::GenerateKeyPair) => self.process_generate_key_pair(apdu),
             Some(Instruction::PutData) => self.process_put_data(apdu),
             Some(Instruction::ChangeReference) => self.process_change_reference(apdu),
@@ -150,12 +185,101 @@ impl PivApplet {
         }
     }
 
-    /// SELECT (0xA4, P1=`04`): activate the applet by AID and answer with
-    /// the application property template — the AID plus the
-    /// supported-algorithms object (tag `0xAC`) advertising the slot
-    /// algorithms and any applet-specific extensions.
-    fn process_select(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+    /// SELECT (0xA4, P1=`04`): activate the applet by AID.
+    ///
+    /// The AID is matched the way a YubiKey matches: any prefix of
+    /// [`AID_FULL`] of at least [`AID_RID`] length selects the applet, so
+    /// the host's 11-byte `select_full()`, its 5-byte `select()`, and
+    /// OpenSC's 9-byte generic PIV AID all work. A different P1, a shorter
+    /// or non-matching AID answers [`keyroost_piv::SW_NOT_FOUND`].
+    ///
+    /// On success the answer is the application property template a
+    /// YubiKey 5 returns, byte for byte:
+    ///
+    /// ```text
+    /// 61 11
+    ///   4F 06 00 00 10 00 01 00   the AID after the RID
+    ///   79 07
+    ///     4F 05 A0 00 00 03 08   the RID
+    /// 90 00
+    /// ```
+    ///
+    /// A case-4 `Le` shorter than the template truncates the data and
+    /// switches the status word to `61xx` (the remaining count); the
+    /// overflow is stashed for a follow-up GET RESPONSE.
+    fn process_select(&mut self, apdu: &[u8]) -> Response {
+        let [cla, ..] = apdu else {
+            // `process` guarantees the 4-byte header.
+            unreachable!("process guarantees the 4-byte header");
+        };
+        if cla & 0x90 != 0 {
+            return Response::sw(SW_CLA_NOT_SUPPORTED);
+        }
+        if apdu[2] != INS_SELECT_P1_BY_AID {
+            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+        }
+        // Case-1/2 APDUs carry no length byte at all: no AID to match.
+        let (lc, body) = match apdu.get(4) {
+            Some(&lc) => (lc, &apdu[5..]),
+            None => (0, &apdu[4..]),
+        };
+        let aid = match body.get(..usize::from(lc)) {
+            Some(aid) => aid,
+            None => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
+        };
+        if !(aid.len() >= AID_RID.len() && AID_FULL.starts_with(aid)) {
+            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+        }
+        let le = match apdu_le(&body[aid.len()..]) {
+            Ok(le) => le,
+            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
+        };
+        self.split_for_le(Self::select_response(), le)
+    }
+
+    /// The application property template a SELECT answers with — the
+    /// YubiKey 5 response: a `61` wrapper holding the AID after the RID
+    /// (tag `4F`) and the RID itself (tag `4F` inside the `79`
+    /// application-identifier template).
+    fn select_response() -> Vec<u8> {
+        let suffix = &AID_FULL[AID_RID.len()..];
+        let mut body = Vec::with_capacity(suffix.len() + 2 + AID_RID.len() + 4);
+        body.push(TAG_4F);
+        body.push(suffix.len() as u8);
+        body.extend_from_slice(suffix);
+        body.push(TAG_79);
+        body.push(2 + AID_RID.len() as u8);
+        body.push(TAG_4F);
+        body.push(AID_RID.len() as u8);
+        body.extend_from_slice(&AID_RID);
+        let mut out = Vec::with_capacity(body.len() + 2);
+        out.push(TAG_61);
+        out.push(body.len() as u8);
+        out.append(&mut body);
+        out
+    }
+
+    /// Apply a case-4 `Le` cap to a full response: send it whole under
+    /// `9000` when it fits (or no length was requested), otherwise stash
+    /// the overflow for GET RESPONSE and answer with the first bytes under
+    /// a `61xx` status word carrying the remaining count.
+    fn split_for_le(&mut self, full: Vec<u8>, le: Option<u8>) -> Response {
+        let cap = match le {
+            None => None,
+            Some(0) => Some(256),
+            Some(n) => Some(usize::from(n)),
+        };
+        match cap {
+            Some(cap) if full.len() > cap => {
+                self.get_response_tail = Some(full[cap..].to_vec());
+                let remaining = u16::from((full.len() - cap).min(255) as u8);
+                Response {
+                    data: full[..cap].to_vec(),
+                    sw: (u16::from(keyroost_piv::SW_MORE_DATA) << 8) | remaining,
+                }
+            }
+            _ => Response::ok(full),
+        }
     }
 
     /// VERIFY (0x20): present the application PIN (P2=`80`) or PUK (P2=`81`)
@@ -172,11 +296,30 @@ impl PivApplet {
         todo!()
     }
 
-    /// GET RESPONSE (0xC0): fetch the next chunk of a response the applet
-    /// signalled with `61xx` (large objects such as certificates arrive this
-    /// way).
-    fn process_get_response(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+    /// GET RESPONSE (0xC0): fetch the tail of a response the previous
+    /// command signalled with `61xx` (large objects such as certificates
+    /// arrive this way; while the crate is wiring only, SELECT is the only
+    /// such producer). The stashed bytes come back under `9000`, re-capped
+    /// by this command's own `Le` when it carries one; a GET RESPONSE with
+    /// nothing pending answers [`SW_CONDITIONS_NOT_SATISFIED`].
+    fn process_get_response(&mut self, apdu: &[u8]) -> Response {
+        let [cla, ..] = apdu else {
+            // `process` guarantees the 4-byte header; there is nothing
+            // else to be malformed here.
+            unreachable!("process guarantees the 4-byte header");
+        };
+        if cla & 0x90 != 0 {
+            return Response::sw(SW_CLA_NOT_SUPPORTED);
+        }
+        let tail = match self.get_response_tail.take() {
+            Some(tail) => tail,
+            None => return Response::sw(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        let le = match apdu_le(&apdu[4..]) {
+            Ok(le) => le,
+            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
+        };
+        self.split_for_le(tail, le)
     }
 
     /// GENERAL AUTHENTICATE (0x87): the slot engine. Management-key (9B)
@@ -261,5 +404,153 @@ impl PivApplet {
     /// for a slot's key, proving on-card generation.
     fn process_attest(&mut self, _apdu: &[u8]) -> Response {
         todo!()
+    }
+}
+
+/// The case-4 `Le` in an APDU tail, the bytes after the command data:
+/// `Ok(None)` when the APDU carries no length (case 3 — the response is
+/// uncapped), `Ok(Some(le))` for the requested length byte, `Err(())` for a
+/// malformed tail (two or more bytes) the caller answers with
+/// [`keyroost_piv::SW_WRONG_LENGTH`].
+fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
+    match tail {
+        [] => Ok(None),
+        [le] => Ok(Some(*le)),
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact SELECT response a YubiKey 5 returns (body, no SW), as
+    /// captured on hardware: a `61` wrapper holding the AID after the RID
+    /// and the RID itself.
+    const YUBIKEY5_SELECT_BODY: [u8; 19] = [
+        0x61, 0x11, 0x4F, 0x06, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, 0x79, 0x07, 0x4F, 0x05, 0xA0,
+        0x00, 0x00, 0x03, 0x08,
+    ];
+
+    /// A case-3/4 SELECT-by-AID APDU with optional `Le` byte.
+    fn select_with_aid(aid: &[u8], le: Option<u8>) -> Vec<u8> {
+        let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, aid.len() as u8];
+        apdu.extend_from_slice(aid);
+        if let Some(le) = le {
+            apdu.push(le);
+        }
+        apdu
+    }
+
+    #[test]
+    fn select_full_aid_answers_the_yubico_template() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&AID_FULL, Some(0)));
+        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn select_rid_prefix_selects() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&AID_RID, Some(0)));
+        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn select_generic_nine_byte_aid_selects() {
+        // OpenSC's `piv_find_aid` probe: the 9-byte generic PIV AID.
+        let aid: [u8; 9] = AID_FULL[..9].try_into().unwrap();
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&aid, Some(0)));
+        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn select_case3_sends_the_whole_template() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&AID_FULL, None));
+        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+    }
+
+    #[test]
+    fn select_aid_shorter_than_rid_is_not_found() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&AID_FULL[..4], Some(0)));
+        assert_eq!(resp.data, Vec::new());
+        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+    }
+
+    #[test]
+    fn select_aid_longer_than_full_is_not_found() {
+        let mut long = AID_FULL.to_vec();
+        long.push(0x00);
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&long, Some(0)));
+        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+    }
+
+    #[test]
+    fn select_non_matching_aid_is_not_found() {
+        let aid = [0xA0, 0x00, 0x00, 0x03, 0x09];
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&select_with_aid(&aid, Some(0)));
+        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+    }
+
+    #[test]
+    fn select_not_by_aid_is_not_found() {
+        let mut applet = PivApplet::new();
+        let resp = applet.process(&[0x00, 0xA4, 0x00, 0x00]);
+        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+    }
+
+    #[test]
+    fn select_with_cla_bits_is_rejected() {
+        let mut applet = PivApplet::new();
+        for cla in [0x80u8, 0x10u8] {
+            let mut apdu = select_with_aid(&AID_FULL, Some(0));
+            apdu[0] = cla;
+            let resp = applet.process(&apdu);
+            assert_eq!(resp.sw, SW_CLA_NOT_SUPPORTED);
+        }
+    }
+
+    #[test]
+    fn select_lc_overrunning_the_apdu_is_wrong_length() {
+        let mut applet = PivApplet::new();
+        // Lc claims 11 bytes, only 5 AID bytes are present.
+        let resp = applet.process(&[0x00, 0xA4, 0x04, 0x00, 0x0B, 0xA0, 0x00, 0x00, 0x03, 0x08]);
+        assert_eq!(resp.sw, keyroost_piv::SW_WRONG_LENGTH);
+    }
+
+    #[test]
+    fn select_small_le_truncates_and_get_response_completes() {
+        let mut applet = PivApplet::new();
+        let first = applet.process(&select_with_aid(&AID_FULL, Some(5)));
+        assert_eq!(first.data, &YUBIKEY5_SELECT_BODY[..5]);
+        assert_eq!(first.sw, 0x610E); // 19 - 5 = 14 remain
+        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(rest.data, &YUBIKEY5_SELECT_BODY[5..]);
+        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+        // Nothing pending any more.
+        let none = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(none.data, Vec::new());
+        assert_eq!(none.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn get_response_with_own_le_re_caps_the_tail() {
+        let mut applet = PivApplet::new();
+        applet.process(&select_with_aid(&AID_FULL, Some(5)));
+        let first = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x04]);
+        assert_eq!(first.data, &YUBIKEY5_SELECT_BODY[5..9]);
+        assert_eq!(first.sw, 0x610A); // 14 - 4 = 10 remain
+        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(rest.data, &YUBIKEY5_SELECT_BODY[9..]);
+        assert_eq!(rest.sw, keyroost_piv::SW_OK);
     }
 }

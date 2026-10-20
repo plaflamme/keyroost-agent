@@ -138,7 +138,10 @@ fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
         let response = match &mut applet {
             Some(applet) if msg.len() >= 4 => applet.process(&msg),
             Some(_) => {
-                warn!("command APDU shorter than the 4-byte header ({} byte(s))", msg.len());
+                warn!(
+                    "command APDU shorter than the 4-byte header ({} byte(s))",
+                    msg.len()
+                );
                 Response::sw(SW_WRONG_LENGTH)
             }
             None => {
@@ -147,7 +150,11 @@ fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
             }
         };
 
-        trace!(apdu = hex(&msg), sw = format!("{:04X}", response.sw), "command APDU");
+        trace!(
+            apdu = hex(&msg),
+            sw = format!("{:04X}", response.sw),
+            "command APDU"
+        );
         let mut out = response.data;
         out.extend_from_slice(&response.sw.to_be_bytes());
         write_msg(&mut stream, &out)?;
@@ -186,10 +193,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for i in (0..bytes.len()).step_by(2) {
         let pair = &s[i..i + 2];
-        out.push(
-            u8::from_str_radix(pair, 16)
-                .map_err(|_| format!("invalid hex pair {pair:?}"))?,
-        );
+        out.push(u8::from_str_radix(pair, 16).map_err(|_| format!("invalid hex pair {pair:?}"))?);
     }
     Ok(out)
 }
