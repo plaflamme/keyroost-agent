@@ -46,26 +46,45 @@
         {
           rust-project = {
             crates = {
-              keyroost-agent = {
-                crane = {
-                  extraBuildArgs = {
-                    CARGO_PROFILE = "dev"; # TODO: how do we output both release and dev profiles?
-                  };
-                  args = {
-                    nativeBuildInputs = with pkgs; [
-                      pkg-config
-                    ];
-                    buildInputs = [ pkgs.pcsclite ];
+              # The workspace root package is not in `members`, so
+              # rust-flake does not find it on its own; point it at the
+              # workspace source explicitly.
+              keyroost-agent =
+                { rust-project, ... }:
+                {
+                  path = rust-project.src + "/";
+                  crane = {
+                    extraBuildArgs = {
+                      CARGO_PROFILE = "dev"; # TODO: how do we output both release and dev profiles?
+                    };
+                    args = {
+                      nativeBuildInputs = with pkgs; [
+                        pkg-config
+                      ];
+                      buildInputs = [ pkgs.pcsclite ];
+                    };
                   };
                 };
-              };
             };
           };
 
           packages = {
-            default = config.packages.keyroost-agent;
+            # default = config.packages.keyroost-agent;
             jcardengine = jcardengine;
           };
+
+          checks = {
+            piv-vsmartcard = pkgs.testers.runNixOSTest {
+              name = "piv-vsmartcard";
+              nodes = {
+                host = { ... }: { };
+              };
+              testScript = ''
+                start_all()
+              '';
+            };
+          };
+
           devShells.default = config.devShells.rust;
         };
     };

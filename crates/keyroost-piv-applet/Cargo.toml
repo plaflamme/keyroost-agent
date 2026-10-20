@@ -14,3 +14,7 @@ keyroost-proto = { version = "0.13.0" }
 # Secret card state (PIN/PUK, management key, private key material) lives in
 # Zeroizing containers once the state fields land.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# CLI and logging for the `piv-vsmartcard` front end.
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

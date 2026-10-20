@@ -8,7 +8,9 @@
 //! ISO 7816-4 status word. It performs **no I/O** — the card is this crate,
 //! driven by whatever embeds it (a reader front-end, a test harness, or a
 //! device firmware), the same way `keyroost-transport`'s `PivSession` drives
-//! a real card from the host side.
+//! a real card from the host side. A ready front end ships in this crate as
+//! the `piv-vsmartcard` binary: it hosts the applet on PC/SC through the
+//! VSmartCard protocol, behind the `vpcd` reader driver.
 //!
 //! # Reference
 //!
@@ -87,12 +89,21 @@ impl Response {
 /// together with the command implementations.
 pub struct PivApplet;
 
+impl Default for PivApplet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PivApplet {
     /// A factory-fresh applet: default PIN/PUK with full retry counters, the
     /// default management key, a freshly generated serial, empty key slots.
+    ///
+    /// A no-op while the applet is wiring only: there are no state fields to
+    /// initialise yet; the factory state lands with them.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self
     }
 
     /// The applet's entry point: dispatch a received host APDU to its
