@@ -723,7 +723,11 @@ dependencies = [
 name = "keyroost-piv-applet"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "cipher",
  "clap",
+ "des",
+ "getrandom",
  "keyroost-piv",
  "keyroost-proto",
  "tracing",

@@ -12,8 +12,16 @@ keyroost-piv = { version = "0.13.0" }
 # APDU and codec primitives (TLV read/write) the command handlers parse with.
 keyroost-proto = { version = "0.13.0" }
 # Secret card state (PIN/PUK, management key, private key material) lives in
-# Zeroizing containers once the state fields land.
+# Zeroizing containers.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The RustCrypto block-cipher line for the 9B management-key symmetric auth
+# (GENERAL AUTHENTICATE witness/challenge round) — the same crates the
+# host's keyroost-transport uses for its half of the exchange.
+aes = "0.8"
+cipher = "0.4"
+des = "0.8"
+# OsRng: the GA witness/challenge values.
+getrandom = "0.2"
 # CLI and logging for the `piv-vsmartcard` front end.
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
