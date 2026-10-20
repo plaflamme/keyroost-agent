@@ -36,7 +36,7 @@ use keyroost_piv_applet::{PivApplet, Response};
 
 /// The ATR of a YubiKey 4, so card drivers that match on the ATR (OpenSC's
 /// PIV support, GnuPG) bind to the virtual card.
-const DEFAULT_ATR: &str = "3BF81300008131FE15597562696B657934D4";
+const DEFAULT_ATR: &str = "3BFD1300008131FE158073C021C057597562694B657940";
 
 // VSmartCard control commands (driver → card, one-byte payload).
 const CTRL_POWER_OFF: u8 = 0x00;

@@ -112,7 +112,7 @@ pub const DEFAULT_SERIAL: u32 = 0x0102_0304;
 
 /// The applet version GET VERSION presents: `major.minor.patch`, tracking
 /// the Yubico PIV firmware line the behaviour is being reimplemented from.
-pub const VERSION: [u8; 3] = [0x04, 0x03, 0x07];
+pub const VERSION: [u8; 3] = [0x05, 0x07, 0x04];
 
 /// The AID this applet is registered under: the NIST PIV card application
 /// AID, the 5-byte RID `A0 00 00 03 08` plus the PIX `00 00 10 00 01 00`.
@@ -1409,11 +1409,11 @@ mod tests {
     }
 
     #[test]
-    fn get_version_answers_4_3_7() {
+    fn get_version_answers_5_7_4() {
         let mut applet = PivApplet::new();
         // The host's case-2 form: `00 FD 00 00 00`.
         let resp = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x00]);
-        assert_eq!(resp.data, [0x04, 0x03, 0x07]);
+        assert_eq!(resp.data, [0x05, 0x07, 0x04]);
         assert_eq!(resp.sw, keyroost_piv::SW_OK);
     }
 
@@ -1422,7 +1422,7 @@ mod tests {
         let mut applet = PivApplet::new();
         for apdu in [[0x00u8, 0xFD, 0x00, 0x00], [0xFF, 0xFD, 0x00, 0x00]] {
             let resp = applet.process(&apdu);
-            assert_eq!(resp.data, [0x04, 0x03, 0x07]);
+            assert_eq!(resp.data, [0x05, 0x07, 0x04]);
             assert_eq!(resp.sw, keyroost_piv::SW_OK);
         }
     }
@@ -1439,10 +1439,10 @@ mod tests {
     fn get_version_small_le_truncates_and_get_response_completes() {
         let mut applet = PivApplet::new();
         let first = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x02]);
-        assert_eq!(first.data, [0x04, 0x03]);
+        assert_eq!(first.data, [0x05, 0x07]);
         assert_eq!(first.sw, 0x6101);
         let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data, [0x07]);
+        assert_eq!(rest.data, [0x04]);
         assert_eq!(rest.sw, keyroost_piv::SW_OK);
     }
 
