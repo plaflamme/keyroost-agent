@@ -1,10 +1,11 @@
 //! VSmartCard front end: presents [`PivApplet`] as a PC/SC card.
 //!
 //! This binary is the `vpicc` (virtual ICC) side of the VSmartCard
-//! architecture: it connects to a `vpcd` listener — the PC/SC reader
-//! driver shipped by `pkgs.vsmartcard-vpcd` and registered with `pcscd`
-//! by the `services.vsmartcard-vpcd` NixOS module — and answers as a
-//! card for every PC/SC client that connects to that reader.
+//! architecture: it listens on a TCP port; the `vpcd` PC/SC reader driver
+//! (shipped by `pkgs.vsmartcard-vpcd`, registered with `pcscd` by the
+//! `services.vsmartcard-vpcd` NixOS module, and pointed at this host with
+//! that module's `hostname` option) connects to it, and it answers as a
+//! card for every PC/SC client that reaches the reader.
 //!
 //! # Wire protocol
 //!
@@ -24,9 +25,8 @@
 //! not-supported status word instead of panicking.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
 use tracing::{info, trace, warn};
@@ -55,11 +55,11 @@ const SW_NOT_INITIALIZED: u16 = 0x6985;
     about = "Present the keyroost PIV applet as a PC/SC card via VSmartCard"
 )]
 struct Args {
-    /// Host of the vpcd listener.
+    /// Host to bind the listener on.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Port of the vpcd listener.
+    /// Port to listen on.
     #[arg(long, default_value_t = 35963u16)]
     port: u16,
 
@@ -85,28 +85,33 @@ fn main() -> ExitCode {
         }
     };
 
-    // The driver may come up after us — pcscd loads it when the PC/SC
-    // stack starts — so keep retrying until it accepts.
-    loop {
-        match serve(&args.host, args.port, &atr) {
-            Ok(()) => info!("connection to vpcd closed; reconnecting"),
-            Err(e) => {
-                warn!(
-                    host = %args.host,
-                    port = args.port,
-                    "cannot reach vpcd: {e}"
-                )
-            }
+    // We are the vpicc listener: vpcd is configured in connect mode and
+    // dials us. The port is ours, so bind once — a failure here is a real
+    // error rather than something to retry.
+    let listener = match TcpListener::bind((args.host.as_str(), args.port)) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(host = %args.host, port = args.port, "cannot bind: {e}");
+            return ExitCode::FAILURE;
         }
-        std::thread::sleep(Duration::from_secs(1));
+    };
+    info!(host = %args.host, port = args.port, "listening for vpcd");
+
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                info!(%addr, "vpcd connected");
+                if let Err(e) = serve_connection(stream, &atr) {
+                    warn!("connection with {addr} failed: {e}");
+                }
+            }
+            Err(e) => warn!("accept failed: {e}"),
+        }
     }
 }
 
 /// Serve one vpcd connection until it drops.
-fn serve(host: &str, port: u16, atr: &[u8]) -> io::Result<()> {
-    let mut stream = TcpStream::connect((host, port))?;
-    info!("connected to vpcd at {host}:{port}");
-
+fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
     // The card: the applet instance
     let mut applet = PivApplet::new();
     let mut power_on = false;

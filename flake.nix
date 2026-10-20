@@ -84,10 +84,12 @@
                   { pkgs, ... }:
                   {
                     # The PC/SC stack: the resource manager plus the
-                    # VSmartCard reader driver, which listens on its default
-                    # port (35963) for a vpicc to connect to.
+                    # VSmartCard reader driver, which connects to the vpicc
+                    # listener at 127.0.0.1 on its default port (35963)
+                    # instead of listening itself.
                     services.pcscd.enable = true;
                     services.vsmartcard-vpcd.enable = true;
+                    services.vsmartcard-vpcd.hostname = "127.0.0.1";
 
                     # A PC/SC client for the test to use.
                     environment.systemPackages = [
@@ -96,7 +98,8 @@
                     ];
 
                     # The vpicc side: our PIV applet front end, which
-                    # connects to that listener and answers as a card.
+                    # listens on the default port (35963) and answers as a
+                    # card.
                     systemd.services.piv-vsmartcard = {
                       wantedBy = [ "multi-user.target" ];
                       serviceConfig = {
@@ -110,11 +113,8 @@
                 start_all()
                 host.wait_for_unit("pcscd.socket")
                 host.wait_for_unit("piv-vsmartcard.service")
-
-                status, output = host.execute("opensc-tool --list-readers")
-                log.info(f"opensc-tool --list-readers:\n{output}")
-                assert status == 0, output
-                assert "Virtual PCD" in output, output
+                host.succeed("OLD=123456 NEW=654321 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
+                host.succeed("OLD=654321 NEW=123456 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
               '';
             };
           };
