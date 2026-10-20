@@ -24,8 +24,10 @@
 //!
 //! The crate is currently **scaffolding**: [`PivApplet::process`] dispatches
 //! a received APDU to one handler per PIV instruction. SELECT (and its
-//! `61xx` / GET RESPONSE follow-up) is implemented; the remaining handler
-//! bodies are `todo!()`. The card state (PIN/PUK, management key, key slots,
+//! `61xx` / GET RESPONSE follow-up) is implemented; the remaining handlers
+//! are stubs answering `6D00` (instruction not supported) — GET DATA
+//! answers `6A82` (no objects yet). The card state (PIN/PUK, management key,
+//! key slots,
 //! certificates, CHUID, admin data) and the crypto it will carry (key
 //! generation, signing, ECDH, block ciphers for management-key auth) land
 //! with the command implementations; the RustCrypto dependencies they need
@@ -286,14 +288,14 @@ impl PivApplet {
     /// against the stored value. An empty body queries the retry counter
     /// without consuming a try (`63Cx` / `9000` / `6983`).
     fn process_verify(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// GET DATA (0xCB, P1P2=`3FFF`): read a data object by its
     /// `5C`-wrapped tag — a slot certificate, the CHUID, an admin object —
     /// and return it wrapped in the `53` data template.
     fn process_get_data(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(keyroost_piv::SW_NOT_FOUND)
     }
 
     /// GET RESPONSE (0xC0): fetch the tail of a response the previous
@@ -327,83 +329,83 @@ impl PivApplet {
     /// key agreement (RSA, ECDSA, ECDH) with the `7C` dynamic-authentication
     /// template.
     fn process_general_authenticate(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// GENERATE ASYMMETRIC KEY PAIR (0x47): create a private key on-card in
     /// a slot and return its public key in the `7F 49` template.
     fn process_generate_key_pair(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// PUT DATA (0xDB): write a data object — a slot certificate or another
     /// object — under its `5C`-wrapped tag.
     fn process_put_data(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// CHANGE REFERENCE DATA (0x24): change the application PIN (P2=`80`)
     /// or PUK (P2=`81`), old value first.
     fn process_change_reference(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// RESET RETRY COUNTER (0x2C): unblock a blocked PIN using the PUK and
     /// set the new PIN.
     fn process_reset_retry_counter(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// GET VERSION (0xFD, Yubico extension): the 3-byte applet version.
     fn process_get_version(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// GET SERIAL (0xF8, Yubico extension): the 4-byte card serial.
     fn process_get_serial(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
     /// (algorithm, origin, policy, retries) for the P2 reference.
     fn process_get_metadata(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// IMPORT ASYMMETRIC KEY (0x86, Yubico extension, [`INS_IMPORT_ASYM`]):
     /// import a full key pair into a slot.
     fn process_import_key(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// MOVE KEY (0xF6, Yubico extension): move a slot's key to another slot;
     /// `P1 = 0xFF` deletes the key instead.
     fn process_move_key(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// SET MANAGEMENT KEY (0xFF, Yubico extension): replace the 9B key
     /// (authenticated by the current one) and set its touch requirement.
     fn process_set_management_key(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// SET PIN RETRIES (0xFA, Yubico extension): set the PIN/PUK retry
     /// limits.
     fn process_set_pin_retries(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// RESET (0xFB, Yubico extension): factory-reset the applet; allowed
     /// only when PIN and PUK are both blocked.
     fn process_reset(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 
     /// ATTEST (0xF9, Yubico extension): self-signed attestation certificate
     /// for a slot's key, proving on-card generation.
     fn process_attest(&mut self, _apdu: &[u8]) -> Response {
-        todo!()
+        Response::sw(SW_INS_NOT_SUPPORTED)
     }
 }
 
