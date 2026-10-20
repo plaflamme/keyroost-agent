@@ -100,6 +100,7 @@
                     systemd.services.piv-vsmartcard = {
                       wantedBy = [ "multi-user.target" ];
                       serviceConfig = {
+                        Environment = "RUST_LOG=trace";
                         ExecStart = "${config.packages.keyroost-piv-applet}/bin/piv-vsmartcard";
                       };
                     };
