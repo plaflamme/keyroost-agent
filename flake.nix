@@ -17,10 +17,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
+    keyroost.url = "github:framefilter/keyroost/v0.13.0";
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
+    inputs@{ flake-parts, keyroost, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
 
       systems = [
@@ -37,6 +38,7 @@
       perSystem =
         {
           config,
+          system,
           pkgs,
           ...
         }:
@@ -88,7 +90,10 @@
                     services.vsmartcard-vpcd.enable = true;
 
                     # A PC/SC client for the test to use.
-                    environment.systemPackages = [ pkgs.opensc ];
+                    environment.systemPackages = [
+                      pkgs.opensc
+                      keyroost.packages.${system}.keyroostctl
+                    ];
 
                     # The vpicc side: our PIV applet front end, which
                     # connects to that listener and answers as a card.
