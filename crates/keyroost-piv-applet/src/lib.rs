@@ -48,6 +48,7 @@
 #![forbid(unsafe_code)]
 
 mod constants;
+mod state;
 
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
 // The remaining constants are crate-private; the glob keeps lib.rs's own
@@ -57,6 +58,7 @@ use constants::*;
 
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use keyroost_piv::{Instruction, KEY_REF_MANAGEMENT, MgmtAlg, PIN_REF_APPLICATION, PIN_REF_PUK};
+use state::Pin;
 use zeroize::{Zeroize, Zeroizing};
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
@@ -89,68 +91,6 @@ impl Response {
     }
 }
 
-/// One PIV reference-data secret — the application PIN or the PUK — as the
-/// card's JavaCard `OwnerPIN` objects model it: the stored 8-byte value, the
-/// tries-remaining counter, and the session-verified flag.
-///
-/// The value and the counter live for the applet's life; `verified` lives
-/// only as long as the session — set by a successful check, cleared by the
-/// card's reset points (an unverify, an unblock, a fresh instance) — and is
-/// what the card's security-status sync consults when the key slots land.
-struct Pin {
-    /// The stored value: six ASCII digits plus two 0xFF padding bytes (the
-    /// eight-character PUK has no padding).
-    value: Zeroizing<[u8; 8]>,
-    /// The retry limit the factory (or SET PIN RETRIES) configured.
-    max_tries: u8,
-    /// Tries remaining; 0 means blocked.
-    tries: u8,
-    /// Session-verified: set by a successful check, cleared by the card's
-    /// reset points.
-    verified: bool,
-}
-
-impl Pin {
-    /// Factory-fresh state: the stored value, the counter at its limit, not
-    /// verified.
-    fn factory(value: [u8; 8], max_tries: u8) -> Self {
-        Self {
-            value: Zeroizing::new(value),
-            max_tries,
-            tries: max_tries,
-            verified: false,
-        }
-    }
-
-    /// JavaCard `OwnerPIN.check`: compare `presented` to the stored value in
-    /// constant time. A correct value sets `verified` and restores the
-    /// counter to its limit; a wrong one burns a try and leaves `verified`
-    /// untouched. Callers must not call this while blocked.
-    fn check(&mut self, presented: &[u8]) -> bool {
-        let ok = ct_eq(presented, &self.value[..]);
-        if ok {
-            self.verified = true;
-            self.tries = self.max_tries;
-        } else {
-            self.tries -= 1;
-        }
-        ok
-    }
-
-    /// JavaCard `OwnerPIN.reset` / `resetAndUnblock`: the counter back to
-    /// its limit, `verified` cleared.
-    fn reset(&mut self) {
-        self.tries = self.max_tries;
-        self.verified = false;
-    }
-
-    /// JavaCard `OwnerPIN.update`: replace the stored value; the counter and
-    /// `verified` are untouched.
-    fn set_value(&mut self, value: [u8; 8]) {
-        *self.value = value;
-    }
-}
-
 /// A PIV applet instance: the card side of NIST SP 800-73-4.
 ///
 /// Owns the card's state — the application PIN and PUK with their retry
@@ -166,29 +106,30 @@ impl Pin {
 pub struct PivApplet {
     /// The card serial GET SERIAL presents: a 32-bit value, big-endian on
     /// the wire.
-    serial: u32,
+    pub(crate) serial: u32,
     /// The tail of a response the previous command signalled with `61xx`
     /// because it did not fit in the requested `Le`, pending for a GET
     /// RESPONSE (0xC0). `None` when nothing is pending.
-    get_response_tail: Option<Vec<u8>>,
+    pub(crate) get_response_tail: Option<Vec<u8>>,
     /// The application PIN (reference `80`).
-    pin: Pin,
+    pub(crate) pin: Pin,
     /// The PUK (reference `81`).
-    puk: Pin,
+    pub(crate) puk: Pin,
     /// The 9B management key as stored: the cipher algorithm plus the key
     /// material, zero-padded into the fixed 32-byte array. Factory state is
     /// 3DES with the Yubico default key.
-    mgmt_alg: MgmtAlg,
-    mgmt_key: Zeroizing<[u8; 32]>,
+    pub(crate) mgmt_alg: MgmtAlg,
+    pub(crate) mgmt_key: Zeroizing<[u8; 32]>,
+
     /// The last witness/challenge issued for a 9B symmetric GA, plus whether
     /// it is still valid — a new issuance invalidates the old one, the
     /// card's single-challenge-transient model.
-    mgmt_challenge: [u8; 16],
-    mgmt_challenge_valid: bool,
+    pub(crate) mgmt_challenge: [u8; 16],
+    pub(crate) mgmt_challenge_valid: bool,
     /// The 9B slot's GA security status: set by a successful witness or
     /// response verification, retained until the session ends, and never
     /// cleared by RESET (the reference keeps `F_UNLOCKED` through it too).
-    mgmt_unlocked: bool,
+    pub(crate) mgmt_unlocked: bool,
 }
 
 impl Default for PivApplet {
@@ -1188,13 +1129,6 @@ fn tries_sw(tries: u8) -> u16 {
 fn is_valid_pin(value: &[u8; 8]) -> bool {
     value[0..6].iter().all(|b| b.is_ascii_digit())
         && value[6..].iter().all(|b| *b == 0xFF || b.is_ascii_digit())
-}
-
-/// Byte-wise equality, constant time over the input — the same fold the
-/// transport layer uses, so a wrong reference leaks neither which byte
-/// differs nor how far the match ran.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
