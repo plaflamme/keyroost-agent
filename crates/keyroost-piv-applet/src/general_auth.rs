@@ -1,8 +1,6 @@
 //! GENERAL AUTHENTICATE (0x87) — the 9B management-key dynamic-auth half of
-//! the SP 800-73-4 exchange — and the management key's storage and
-//! block-cipher helpers.
+//! the SP 800-73-4 exchange.
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 
 use crate::constants::{
@@ -11,7 +9,6 @@ use crate::constants::{
     SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 use crate::{PivApplet, Response, apdu_lc_body};
-use zeroize::Zeroize;
 
 impl PivApplet {
     /// GENERAL AUTHENTICATE (0x87): the SP 800-73-4 dynamic-authentication
@@ -104,7 +101,7 @@ impl PivApplet {
     /// The symmetric 9B dynamic-auth exchange (the card's
     /// `processGenAuthSym`), once the template is parsed.
     fn ga_sym(&mut self, alg: MgmtAlg, t: GaTemplate) -> Response {
-        if self.mgmt_alg != alg {
+        if self.mgmt.alg() != alg {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         let bs = alg.block_size();
@@ -126,32 +123,31 @@ impl PivApplet {
         if t.witness.is_some() || t.challenge.is_some() || t.response.is_some() {
             let mut comp = false;
             if let Some(w) = t.witness {
-                if w.len() != bs || !self.mgmt_challenge_valid {
+                if w.len() != bs {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                comp = w == &self.mgmt_challenge[..bs];
+                match self.mgmt.check_witness(w) {
+                    None => return Response::sw(SW_WRONG_DATA),
+                    Some(matched) => comp = matched,
+                }
                 // The witness consumes the challenge — a proof value in the
                 // same body is never checked, so the host's raw 0x81
                 // challenge passes through to the 0x82 response undecrypted.
-                self.mgmt_challenge_valid = false;
             }
             // The proof value (the 0x81 challenge, or a 0x82 value) is
             // checked the way the card checks it — decrypted and compared —
             // and only when a witness did not just consume the challenge.
-            let proof = t
-                .challenge
-                .or(t.response)
-                .filter(|_| self.mgmt_challenge_valid);
+            let proof = t.challenge.or(t.response);
             if let Some(p) = proof {
                 if p.len() != bs {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                let dec = self.mgmt_decrypt(p);
-                comp = dec == self.mgmt_challenge[..bs];
-                self.mgmt_challenge_valid = false;
+                if let Some(matched) = self.mgmt.check_proof(p) {
+                    comp = matched;
+                }
             }
             if comp {
-                self.mgmt_unlocked = true;
+                self.mgmt.unlock();
             } else {
                 return Response::sw(SW_WRONG_DATA);
             }
@@ -162,19 +158,24 @@ impl PivApplet {
 
         match wanted {
             Some(GA_TAG_WITNESS) => {
-                self.mgmt_issue_challenge();
-                let enc = self.mgmt_encrypt(&self.mgmt_challenge[..bs]);
+                self.mgmt.issue_challenge();
+                let enc = self
+                    .mgmt
+                    .encrypt(self.mgmt.challenge().expect("just issued"));
                 Response::ok(ga_response(GA_TAG_WITNESS, &enc))
             }
             Some(GA_TAG_CHALLENGE) => {
-                self.mgmt_issue_challenge();
-                Response::ok(ga_response(GA_TAG_CHALLENGE, &self.mgmt_challenge[..bs]))
+                self.mgmt.issue_challenge();
+                Response::ok(ga_response(
+                    GA_TAG_CHALLENGE,
+                    self.mgmt.challenge().expect("just issued"),
+                ))
             }
             Some(GA_TAG_RESPONSE) => {
                 if !t.has_challenge {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                if !self.mgmt_unlocked {
+                if !self.mgmt.unlocked() {
                     return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
                 }
                 let Some(host_chal) = t.challenge else {
@@ -186,103 +187,11 @@ impl PivApplet {
                 {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                let enc = self.mgmt_encrypt(host_chal);
+                let enc = self.mgmt.encrypt(host_chal);
                 Response::ok(ga_response(GA_TAG_RESPONSE, &enc))
             }
             _ => Response::sw(SW_WRONG_DATA),
         }
-    }
-
-    /// Replace the stored 9B management key: the algorithm and the key
-    /// material, zero-padded into the 32-byte array. The old material is
-    /// zeroed before the copy.
-    pub(crate) fn set_management_key(&mut self, alg: MgmtAlg, key: &[u8]) {
-        let len = alg.key_len();
-        self.mgmt_alg = alg;
-        self.mgmt_key.zeroize();
-        self.mgmt_key[..len].copy_from_slice(key);
-    }
-
-    /// Issue a fresh witness/challenge value of the current algorithm's
-    /// block size: random bytes stored as the pending GA challenge, the
-    /// previous one (if any) invalidated.
-    fn mgmt_issue_challenge(&mut self) {
-        let bs = self.mgmt_alg.block_size();
-        let mut buf = [0u8; 16];
-        getrandom::getrandom(&mut buf).expect("OsRng failure");
-        self.mgmt_challenge[..bs].copy_from_slice(&buf[..bs]);
-        self.mgmt_challenge_valid = true;
-    }
-
-    /// Encrypt `data` (a whole number of cipher blocks) with the stored
-    /// management key — one-shot ECB blocks. The card's `Cipher` is
-    /// initialized with a zero-initialized transient IV, which is
-    /// byte-identical to ECB for the block-by-block use GA makes of it.
-    fn mgmt_encrypt(&self, data: &[u8]) -> Vec<u8> {
-        let key = &self.mgmt_key[..self.mgmt_alg.key_len()];
-        match self.mgmt_alg {
-            MgmtAlg::TripleDes => {
-                let c = des::TdesEde3::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 8, false)
-            }
-            MgmtAlg::Aes128 => {
-                let c = aes::Aes128::new_from_slice(key).expect("16-byte key");
-                Self::run_blocks(&c, data, 16, false)
-            }
-            MgmtAlg::Aes192 => {
-                let c = aes::Aes192::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 16, false)
-            }
-            MgmtAlg::Aes256 => {
-                let c = aes::Aes256::new_from_slice(key).expect("32-byte key");
-                Self::run_blocks(&c, data, 16, false)
-            }
-        }
-    }
-
-    /// Decrypt `data` (a whole number of cipher blocks) with the stored
-    /// management key — the [`PivApplet::mgmt_encrypt`] inverse.
-    fn mgmt_decrypt(&self, data: &[u8]) -> Vec<u8> {
-        let key = &self.mgmt_key[..self.mgmt_alg.key_len()];
-        match self.mgmt_alg {
-            MgmtAlg::TripleDes => {
-                let c = des::TdesEde3::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 8, true)
-            }
-            MgmtAlg::Aes128 => {
-                let c = aes::Aes128::new_from_slice(key).expect("16-byte key");
-                Self::run_blocks(&c, data, 16, true)
-            }
-            MgmtAlg::Aes192 => {
-                let c = aes::Aes192::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 16, true)
-            }
-            MgmtAlg::Aes256 => {
-                let c = aes::Aes256::new_from_slice(key).expect("32-byte key");
-                Self::run_blocks(&c, data, 16, true)
-            }
-        }
-    }
-
-    /// Block-by-block encrypt/decrypt, the card's `Cipher` use in one pass.
-    fn run_blocks<C: BlockEncrypt + BlockDecrypt>(
-        c: &C,
-        data: &[u8],
-        bs: usize,
-        decrypt: bool,
-    ) -> Vec<u8> {
-        use cipher::generic_array::GenericArray;
-        let mut out = Vec::with_capacity(data.len());
-        for chunk in data.chunks(bs) {
-            let mut block = GenericArray::clone_from_slice(chunk);
-            if decrypt {
-                c.decrypt_block(&mut block);
-            } else {
-                c.encrypt_block(&mut block);
-            }
-            out.extend_from_slice(&block);
-        }
-        out
     }
 }
 
@@ -422,6 +331,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::constants::{DEFAULT_MGMT_KEY, DEFAULT_PUK_TRIES, SW_OK};
     use crate::tries_sw;
+    use aes::cipher::{BlockDecrypt, KeyInit};
 
     /// The GA dynamic-auth body: `7C` wrapping the given tagged members.
     pub(crate) fn ga_body(members: &[&[u8]]) -> Vec<u8> {

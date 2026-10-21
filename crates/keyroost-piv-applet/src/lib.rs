@@ -59,13 +59,12 @@ mod state;
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
 
 use constants::{
-    DEFAULT_MGMT_KEY, DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
+    DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
     SW_INS_NOT_SUPPORTED,
 };
-
-use keyroost_piv::{Instruction, MgmtAlg};
+use keyroost_piv::Instruction;
+use management::MgmtKey;
 use state::Pin;
-use zeroize::Zeroizing;
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
 /// status word that always terminates the answer.
@@ -121,21 +120,11 @@ pub struct PivApplet {
     pub(crate) pin: Pin,
     /// The PUK (reference `81`).
     pub(crate) puk: Pin,
-    /// The 9B management key as stored: the cipher algorithm plus the key
-    /// material, zero-padded into the fixed 32-byte array. Factory state is
-    /// 3DES with the Yubico default key.
-    pub(crate) mgmt_alg: MgmtAlg,
-    pub(crate) mgmt_key: Zeroizing<[u8; 32]>,
-
-    /// The last witness/challenge issued for a 9B symmetric GA, plus whether
-    /// it is still valid — a new issuance invalidates the old one, the
-    /// card's single-challenge-transient model.
-    pub(crate) mgmt_challenge: [u8; 16],
-    pub(crate) mgmt_challenge_valid: bool,
-    /// The 9B slot's GA security status: set by a successful witness or
-    /// response verification, retained until the session ends, and never
-    /// cleared by RESET (the reference keeps `F_UNLOCKED` through it too).
-    pub(crate) mgmt_unlocked: bool,
+    /// The 9B management key and its session state: the stored cipher
+    /// algorithm and key material (factory: 3DES with the Yubico default
+    /// key), the pending GA witness/challenge, and the slot's unlocked
+    /// status.
+    pub(crate) mgmt: MgmtKey,
 }
 
 impl Default for PivApplet {
@@ -156,18 +145,12 @@ impl PivApplet {
     /// in [`PivApplet::new`].
     #[must_use]
     pub fn with_serial(serial: u32) -> Self {
-        let mut mgmt_key = [0u8; 32];
-        mgmt_key[..24].copy_from_slice(&DEFAULT_MGMT_KEY);
         Self {
             serial,
             get_response_tail: None,
             pin: Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES),
             puk: Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES),
-            mgmt_alg: MgmtAlg::TripleDes,
-            mgmt_key: Zeroizing::new(mgmt_key),
-            mgmt_challenge: [0u8; 16],
-            mgmt_challenge_valid: false,
-            mgmt_unlocked: false,
+            mgmt: MgmtKey::default(),
         }
     }
 
