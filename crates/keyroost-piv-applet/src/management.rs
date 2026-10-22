@@ -12,28 +12,42 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 use zeroize::{Zeroize, Zeroizing};
 
+/// The 9B GA challenge state — the card's challenge transient and unlock
+/// flag as one machine. Only the first `block_size` bytes of a `Challenged`
+/// array are live; the stale tail is never returned or encrypted.
+pub(crate) enum GaState {
+    /// No challenge pending, slot locked — the initial state, and the
+    /// outcome of a mismatched check.
+    Locked,
+    /// A challenge is pending — issued, not yet checked.
+    Challenged([u8; 16]),
+    /// The slot is management-authenticated in this session.
+    Unlocked,
+}
+
+/// Why a GA check could not complete — both surface as `SW_WRONG_DATA`.
+pub(crate) enum GaError {
+    /// No challenge was pending — the check neither unlocked nor consumed.
+    NoPendingChallenge,
+    /// The value did not match the pending challenge, which was consumed.
+    WrongValue,
+}
+
 /// The 9B management key and its session state: the stored cipher algorithm
-/// and key material, the pending GA witness/challenge, and the slot's
-/// unlocked status.
+/// and key material, and the slot's GA challenge state.
 ///
-/// The pending-challenge model is the card's single-challenge transient:
-/// `challenge` holds the last witness/challenge issued, and a witness or
-/// response check consumes it (a mismatch still consumes — the card's
-/// `invalidateChallenge` runs on both outcomes). The methods that check a
-/// value take the stored challenge by ownership and return `None` when
-/// nothing was pending, so a caller cannot forget to consume it.
+/// All cryptography is encapsulated here: `issue` returns the challenge's
+/// encryption, and `check` takes the decrypted witness and returns the
+/// host challenge's encryption. Callers never see the raw challenge and
+/// never call the ciphers.
 pub(crate) struct MgmtKey {
     /// The stored cipher algorithm.
     alg: MgmtAlg,
     /// The stored key material, zero-padded into the fixed 32-byte array.
     key: Zeroizing<[u8; 32]>,
-    /// The pending GA witness/challenge, if any — only the first
-    /// `block_size` bytes of the array are live.
-    challenge: Option<[u8; 16]>,
-    /// The slot's GA security status: set by a correct witness or response
-    /// check, retained until the session ends, and never cleared by RESET
-    /// (the reference keeps `F_UNLOCKED` through it too).
-    unlocked: bool,
+    /// The slot's GA challenge state — the card's challenge transient and
+    /// unlock flag as one machine.
+    state: GaState,
 }
 
 impl Default for MgmtKey {
@@ -43,8 +57,7 @@ impl Default for MgmtKey {
         Self {
             alg: MgmtAlg::TripleDes,
             key: Zeroizing::new(key),
-            challenge: None,
-            unlocked: false,
+            state: GaState::Locked,
         }
     }
 }
@@ -58,12 +71,7 @@ impl MgmtKey {
     /// Whether the slot is unlocked (management-authenticated in this
     /// session).
     pub(crate) fn unlocked(&self) -> bool {
-        self.unlocked
-    }
-
-    /// Unlock the slot — set by a correct witness or response.
-    pub(crate) fn unlock(&mut self) {
-        self.unlocked = true;
+        matches!(self.state, GaState::Unlocked)
     }
 
     /// Replace the stored key: the algorithm and the key material,
@@ -77,49 +85,52 @@ impl MgmtKey {
         self.key[..len].copy_from_slice(key);
     }
 
-    /// Issue a fresh witness/challenge value: random bytes replacing any
-    /// pending challenge — a new issuance invalidates the old one.
-    pub(crate) fn issue_challenge(&mut self) {
+    /// Issue a fresh challenge: 16 random bytes (the card's
+    /// `generateChallenge`), replacing whatever state was there — a new
+    /// issuance invalidates the old challenge and re-locks an unlocked
+    /// slot. Returns the challenge's encryption under the stored key —
+    /// the card's `0x80` witness payload — the live block-size bytes only,
+    /// never the stale tail.
+    pub(crate) fn issue(&mut self) -> Vec<u8> {
         let mut buf = [0u8; 16];
         getrandom::getrandom(&mut buf).expect("OsRng failure");
-        self.challenge = Some(buf);
+        self.state = GaState::Challenged(buf);
+        self.encrypt(&buf[..self.alg.block_size()])
     }
 
-    /// The pending challenge, if any — only the first `block_size` bytes
-    /// are live.
-    pub(crate) fn challenge(&self) -> Option<&[u8]> {
-        self.challenge.as_ref().map(|c| &c[..self.alg.block_size()])
-    }
-
-    /// Compare a witness (the challenge in the clear) against the pending
-    /// challenge and consume it. Returns `None` when no challenge was
-    /// pending; otherwise whether the witness matched — a mismatch still
-    /// consumes the challenge, the card's behaviour. The witness must be
-    /// exactly the algorithm's block size; the caller checks that first.
-    pub(crate) fn check_witness(&mut self, witness: &[u8]) -> Option<bool> {
-        let challenge = self.challenge.take()?;
+    /// Verify a witness — the card's challenge in the clear, which the
+    /// host only has because it decrypted the card's ciphertext with the
+    /// management key — against the pending challenge, and consume it.
+    ///
+    /// On a match the slot unlocks and, if the host offered a challenge,
+    /// it is encrypted under the stored key and returned — the card's
+    /// `0x82` response payload. A mismatch still consumes the challenge
+    /// (the card's `invalidateChallenge` runs on both outcomes) and leaves
+    /// the slot locked. The witness must be exactly the algorithm's block
+    /// size, and the host challenge a whole number of blocks, both checked
+    /// by the caller first.
+    pub(crate) fn check(
+        &mut self,
+        witness: &[u8],
+        host_challenge: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, GaError> {
+        let GaState::Challenged(cc) = self.state else {
+            return Err(GaError::NoPendingChallenge);
+        };
         let bs = self.alg.block_size();
-        Some(witness == &challenge[..bs])
-    }
-
-    /// Decrypt a proof value with the stored key, compare it against the
-    /// pending challenge, and consume the challenge. Returns `None` when no
-    /// challenge was pending (the proof is then never checked, as on the
-    /// card); otherwise whether the decrypted value matched — a mismatch
-    /// still consumes the challenge. The proof must be exactly the
-    /// algorithm's block size; the caller checks that first.
-    pub(crate) fn check_proof(&mut self, proof: &[u8]) -> Option<bool> {
-        let challenge = self.challenge.take()?;
-        let bs = self.alg.block_size();
-        let dec = self.decrypt(proof);
-        Some(dec == challenge[..bs])
+        if witness != &cc[..bs] {
+            self.state = GaState::Locked;
+            return Err(GaError::WrongValue);
+        }
+        self.state = GaState::Unlocked;
+        Ok(host_challenge.map(|hc| self.encrypt(hc)))
     }
 
     /// Encrypt `data` (a whole number of cipher blocks) with the stored
     /// key — one-shot ECB blocks. The card's `Cipher` is initialized with a
     /// zero-initialized transient IV, which is byte-identical to ECB for
     /// the block-by-block use GA makes of it.
-    pub(crate) fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+    fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         let key = &self.key[..self.alg.key_len()];
         match self.alg {
             MgmtAlg::TripleDes => {
@@ -137,30 +148,6 @@ impl MgmtKey {
             MgmtAlg::Aes256 => {
                 let c = aes::Aes256::new_from_slice(key).expect("32-byte key");
                 Self::run_blocks(&c, data, 16, false)
-            }
-        }
-    }
-
-    /// Decrypt `data` (a whole number of cipher blocks) with the stored
-    /// key — one-shot ECB blocks, the mirror of [`MgmtKey::encrypt`].
-    pub(crate) fn decrypt(&self, data: &[u8]) -> Vec<u8> {
-        let key = &self.key[..self.alg.key_len()];
-        match self.alg {
-            MgmtAlg::TripleDes => {
-                let c = des::TdesEde3::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 8, true)
-            }
-            MgmtAlg::Aes128 => {
-                let c = aes::Aes128::new_from_slice(key).expect("16-byte key");
-                Self::run_blocks(&c, data, 16, true)
-            }
-            MgmtAlg::Aes192 => {
-                let c = aes::Aes192::new_from_slice(key).expect("24-byte key");
-                Self::run_blocks(&c, data, 16, true)
-            }
-            MgmtAlg::Aes256 => {
-                let c = aes::Aes256::new_from_slice(key).expect("32-byte key");
-                Self::run_blocks(&c, data, 16, true)
             }
         }
     }

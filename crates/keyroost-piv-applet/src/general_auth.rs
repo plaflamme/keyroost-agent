@@ -22,21 +22,21 @@ impl PivApplet {
     ///
     /// - `6B00` when P1 is not the stored management algorithm, when P2 is
     ///   not a slot reference the applet knows, or — with an asymmetric P1
-    ///   (`06`/`07`/`11`/`14`) — when the template has the signing shape
-    ///   (a challenge offered for a response) and the slot has no key.
-    /// - A non-empty witness (`80`) must be the current challenge encrypted
-    ///   with the management key (a re-issued witness invalidates the
-    ///   pending one); a non-empty response (`82`) must decrypt to it. A
-    ///   correct verification sets the slot's unlocked status. A wrong
-    ///   value — or the challenge no longer valid — is `6A86`.
-    /// - Wanted `80` (witness): the applet issues a fresh challenge and
-    ///   answers `7C 80 <n> <encrypted challenge>`. Wanted `81`:
-    ///   `7C 81 <n> <challenge>` in the clear. Wanted `82` (response): the
-    ///   body's challenge is encrypted and answered `7C 82 <n> <encrypted>`
-    ///   — `6A86` without a challenge, `6986` while the slot is still
-    ///   locked. A no-empty-tag body with a challenge (the yubico-piv-tool
-    ///   shape) wants a response; a fully empty body answers `9000` with no
-    ///   data.
+    ///   (`06`/`07`/`11`/`14`) — whenever: the slot holds no key.
+    /// - The body is either an empty witness tag (`80`) — a witness
+    ///   request — or a non-empty witness (`80`): the current challenge
+    ///   encrypted with the management key (a re-issued witness invalidates
+    ///   the pending one), optionally with the host's challenge under `81`.
+    ///   Any other member or shape is refused `6B00`: the reference's
+    ///   `81`/`82` shapes prove nothing to the applet.
+    /// - A witness request issues a fresh challenge and answers
+    ///   `7C 80 <n> <encrypted challenge>`. A correct witness sets the
+    ///   slot's unlocked status and answers `9000` with no data, or
+    ///   `7C 82 <n> <encrypted host challenge>` when one was offered;
+    ///   a wrong witness — or one after the challenge was already
+    ///   consumed — is `6A86`. Issue and check both re-lock the slot,
+    ///   so a witness request after a successful handshake demands a
+    ///   full mutual auth again.
     ///
     /// P2=`9A`/`9C`/`9D` (and the `82`–`8C` history slots) need the PIN
     /// verified in this session — `6986` until it is — then answer `6B00`
@@ -86,15 +86,9 @@ impl PivApplet {
         };
         match MgmtAlg::from_id(p1) {
             Some(alg) => self.ga_sym(alg, tmpl),
-            // Asymmetric (or unknown) algorithm: the reference allows only
-            // the signing shape, then fails on the missing key.
-            None => {
-                if tmpl.is_sign_shape() {
-                    Response::sw(SW_INCORRECT_P1P2)
-                } else {
-                    Response::sw(SW_WRONG_DATA)
-                }
-            }
+            // Asymmetric (or unknown) algorithm: no key slot, so no
+            // exchange — the reference fails on the missing key.
+            None => Response::sw(SW_INCORRECT_P1P2),
         }
     }
 
@@ -105,92 +99,39 @@ impl PivApplet {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         let bs = alg.block_size();
-        // The reference's special case: a body with a challenge and no
-        // empty tag wants a response.
-        let mut wanted = t.wanted;
-        if wanted.is_none() && t.has_challenge {
-            wanted = Some(GA_TAG_RESPONSE);
+        // The witness flow is the only supported symmetric exchange: a
+        // witness request (an empty `80`) or a witness value, optionally
+        // with the host's challenge under `81`. The reference's other
+        // shapes prove nothing — a `82` value is a replay of the card's
+        // own ciphertext, a clear `81` challenge would let any observer
+        // forge the witness, a wanted `81` hands the clear challenge to
+        // whoever holds it — so they are refused.
+        if t.response.is_some() {
+            return Response::sw(SW_INCORRECT_P1P2);
         }
-
-        // Witness/response verification — the card's `comp` pass. The
-        // witness (0x80) is the challenge in the clear: the host only
-        // knows it because it decrypted the card's ciphertext with the
-        // management key. The proof value (the 0x81 challenge, or a 0x82
-        // value) is checked the way the card checks it — decrypted and
-        // compared — and only when the witness did not already consume
-        // the challenge, which is also why a host that presents both
-        // gets its 0x81 taken raw, never decrypted.
-        if t.witness.is_some() || t.challenge.is_some() || t.response.is_some() {
-            let mut comp = false;
-            if let Some(w) = t.witness {
+        match (t.wanted, t.witness, t.challenge) {
+            (Some(GA_TAG_WITNESS), None, None) => {
+                let enc = self.mgmt.issue();
+                Response::ok(ga_response(GA_TAG_WITNESS, &enc))
+            }
+            (None, Some(w), host_chal) => {
                 if w.len() != bs {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                match self.mgmt.check_witness(w) {
-                    None => return Response::sw(SW_WRONG_DATA),
-                    Some(matched) => comp = matched,
-                }
-                // The witness consumes the challenge — a proof value in the
-                // same body is never checked, so the host's raw 0x81
-                // challenge passes through to the 0x82 response undecrypted.
-            }
-            // The proof value (the 0x81 challenge, or a 0x82 value) is
-            // checked the way the card checks it — decrypted and compared —
-            // and only when a witness did not just consume the challenge.
-            let proof = t.challenge.or(t.response);
-            if let Some(p) = proof {
-                if p.len() != bs {
+                if host_chal.is_some_and(|hc| {
+                    hc.is_empty() || hc.len() > GA_MAX_CHALLENGE || hc.len() % bs != 0
+                }) {
                     return Response::sw(SW_WRONG_DATA);
                 }
-                if let Some(matched) = self.mgmt.check_proof(p) {
-                    comp = matched;
+                match self.mgmt.check(w, host_chal) {
+                    Ok(resp) => Response::ok(match resp {
+                        Some(enc) => ga_response(GA_TAG_RESPONSE, &enc),
+                        None => Vec::new(),
+                    }),
+                    Err(_) => Response::sw(SW_WRONG_DATA),
                 }
             }
-            if comp {
-                self.mgmt.unlock();
-            } else {
-                return Response::sw(SW_WRONG_DATA);
-            }
-            if wanted.is_none() {
-                return Response::ok(Vec::new());
-            }
-        }
-
-        match wanted {
-            Some(GA_TAG_WITNESS) => {
-                self.mgmt.issue_challenge();
-                let enc = self
-                    .mgmt
-                    .encrypt(self.mgmt.challenge().expect("just issued"));
-                Response::ok(ga_response(GA_TAG_WITNESS, &enc))
-            }
-            Some(GA_TAG_CHALLENGE) => {
-                self.mgmt.issue_challenge();
-                Response::ok(ga_response(
-                    GA_TAG_CHALLENGE,
-                    self.mgmt.challenge().expect("just issued"),
-                ))
-            }
-            Some(GA_TAG_RESPONSE) => {
-                if !t.has_challenge {
-                    return Response::sw(SW_WRONG_DATA);
-                }
-                if !self.mgmt.unlocked() {
-                    return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
-                }
-                let Some(host_chal) = t.challenge else {
-                    return Response::sw(SW_WRONG_DATA);
-                };
-                if host_chal.is_empty()
-                    || host_chal.len() > GA_MAX_CHALLENGE
-                    || host_chal.len() % bs != 0
-                {
-                    return Response::sw(SW_WRONG_DATA);
-                }
-                let enc = self.mgmt.encrypt(host_chal);
-                Response::ok(ga_response(GA_TAG_RESPONSE, &enc))
-            }
-            _ => Response::sw(SW_WRONG_DATA),
+            _ => Response::sw(SW_INCORRECT_P1P2),
         }
     }
 }
@@ -209,17 +150,6 @@ struct GaTemplate<'a> {
     response: Option<&'a [u8]>,
     /// Whether a non-empty challenge or exponent was present.
     has_challenge: bool,
-}
-
-impl<'a> GaTemplate<'a> {
-    /// The reference's asymmetric-only shape: a challenge offered for a
-    /// response, nothing else.
-    fn is_sign_shape(&self) -> bool {
-        self.has_challenge
-            && self.witness.is_none()
-            && self.response.is_none()
-            && self.wanted == Some(GA_TAG_RESPONSE)
-    }
 }
 
 /// Build the card's GA answer: the `7C` wrapper around one tagged value.
@@ -417,16 +347,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ga_challenge_round_answers_the_clear_challenge() {
-        let mut applet = PivApplet::new();
-        let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x81, 0x00]])));
-        assert_eq!(r.sw, SW_OK);
-        assert_eq!(r.data[0], 0x7C);
-        assert_eq!(r.data[2], 0x81);
-        assert_eq!(r.data.len(), 12);
-    }
-
-    #[test]
     fn ga_full_handshake_unlocks_and_responds() {
         let mut applet = PivApplet::new();
         let (data, challenge) = mgmt_handshake(&mut applet);
@@ -434,45 +354,50 @@ pub(crate) mod tests {
         assert_eq!(des_decrypt(&data[4..12]), challenge);
     }
 
-    #[test]
-    fn ga_response_proof_without_a_witness_unlocks() {
-        let mut applet = PivApplet::new();
-        let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.sw, SW_OK);
-        // No witness: the proof is the card's challenge re-encrypted, offered
-        // under 0x82 — the card decrypts and compares it to the challenge.
-        let mut body = vec![0x82, 0x08];
-        body.extend_from_slice(&r1.data[4..12]);
-        let r = applet.process(&ga_apdu(0x03, &ga_body(&[&body])));
-        assert_eq!(r.sw, SW_OK, "decrypted proof: {r:?}");
-        assert!(r.data.is_empty());
-        // The session is unlocked: a management write goes through.
+    /// A management write, the way the set-management-key command sends
+    /// it: the 9B key reference, the 24-byte 3DES length, a zero key.
+    fn set_mgmt_key_apdu() -> Vec<u8> {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, 27];
         apdu.extend_from_slice(&[0x03, KEY_REF_MANAGEMENT, 0x18]);
         apdu.extend_from_slice(&[0u8; 24]);
-        let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_OK, "unlocked session: {r:?}");
+        apdu
     }
 
     #[test]
-    fn ga_challenged_body_without_a_valid_challenge_is_wrong_data() {
+    fn ga_witness_request_re_locks_the_slot() {
         let mut applet = PivApplet::new();
-        // Only a non-empty challenge, no witness round before it — the card
-        // has no valid challenge to check the proof against, so the `comp`
-        // pass fails before the response is considered.
+        mgmt_handshake(&mut applet);
+        // The session is unlocked: a management write goes through.
+        let apdu = set_mgmt_key_apdu();
+        let r = applet.process(&apdu);
+        assert_eq!(r.sw, SW_OK, "unlocked session: {r:?}");
+        // A witness request re-locks the slot (issue() clears the flag)...
+        let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
+        assert_eq!(r.sw, SW_OK);
+        // ...so the same write now fails until a full mutual auth again.
+        let r = applet.process(&apdu);
+        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED, "re-locked: {r:?}");
+    }
+
+    #[test]
+    fn ga_challenged_body_without_a_witness_is_incorrect_p1p2() {
+        let mut applet = PivApplet::new();
+        // Only a non-empty challenge, no witness: the shape is refused
+        // outright — there is nothing to check it against, and a clear
+        // challenge proves nothing.
         let r = applet.process(&ga_apdu(
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
-        // After a handshake the challenge is spent, so the same APDU still
-        // refuses.
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        // After a handshake the answer is the same — the shape, not the
+        // state, is what is refused.
         mgmt_handshake(&mut applet);
         let r = applet.process(&ga_apdu(
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -508,16 +433,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ga_response_of_wrong_length_is_wrong_data() {
+    fn ga_response_member_is_incorrect_p1p2() {
         let mut applet = PivApplet::new();
-        // A witness round first, so the challenge is valid and the length
-        // check — not a spent challenge — is what fires.
-        let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_OK);
-        // A 4-byte response where the 3DES block size is 8.
+        // A 0x82 member is refused outright — a replay of the card's own
+        // ciphertext proves nothing, so its length is never even looked at.
         let body = ga_body(&[&[0x82, 4, 0, 1, 2, 3]]);
         let r = applet.process(&ga_apdu(0x03, &body));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
     }
 
     #[test]
