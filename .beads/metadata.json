@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "keyroost_agent",
+  "project_id": "fda9c32a-c8c9-4589-80ac-c465ad2a6df1"
+}
