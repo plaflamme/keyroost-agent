@@ -139,6 +139,7 @@ impl PivApplet {
 /// One parsed SP 800-73-4 dynamic-auth template: the empty member the host
 /// wants (if any), and the values of the non-empty members — the first of
 /// each, as the card's rescan would find them.
+#[derive(Default)]
 struct GaTemplate<'a> {
     /// The single empty tag (`80`/`81`/`82`), if the host named one.
     wanted: Option<u8>,
@@ -148,8 +149,8 @@ struct GaTemplate<'a> {
     challenge: Option<&'a [u8]>,
     /// The first non-empty response (`82`), if any.
     response: Option<&'a [u8]>,
-    /// Whether a non-empty challenge or exponent was present.
-    has_challenge: bool,
+    /// The first non-empty exponent (`85`), if any.
+    exponent: Option<&'a [u8]>,
 }
 
 /// Build the card's GA answer: the `7C` wrapper around one tagged value.
@@ -181,13 +182,7 @@ fn parse_ga_template<'a>(body: &'a [u8]) -> Result<GaTemplate<'a>, u16> {
     if rest.len() < after_header + declared {
         return Err(SW_DATA_INVALID);
     }
-    let mut t = GaTemplate {
-        wanted: None,
-        witness: None,
-        challenge: None,
-        response: None,
-        has_challenge: false,
-    };
+    let mut t = GaTemplate::default();
     // The scan region: everything after the 7C header — the reference's
     // stream ends at the APDU body's end, whatever the 7C length said.
     let mut rest = &body[1 + after_header..];
@@ -223,12 +218,15 @@ fn parse_ga_template<'a>(body: &'a [u8]) -> Result<GaTemplate<'a>, u16> {
                     }
                 }
                 GA_TAG_CHALLENGE => {
-                    t.has_challenge = true;
                     if t.challenge.is_none() {
                         t.challenge = Some(value);
                     }
                 }
-                GA_TAG_EXP => t.has_challenge = true,
+                GA_TAG_EXP => {
+                    if t.exponent.is_none() {
+                        t.exponent = Some(value);
+                    }
+                }
                 _ => return Err(SW_WRONG_DATA),
             }
         }
