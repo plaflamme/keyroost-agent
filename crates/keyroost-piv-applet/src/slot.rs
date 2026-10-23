@@ -112,6 +112,18 @@ pub(crate) const fn factory_slots() -> [Slot; 24] {
     ]
 }
 
+/// The factory PIN policy of the slot at `index`: `ALWAYS` for 9C (index 1),
+/// `NEVER` for 9E (index 3) and `ONCE` for every other slot — the per-slot
+/// column of [`factory_slots`], exposed so GET METADATA can report whether a
+/// slot still holds its factory policies.
+pub(crate) const fn factory_pin_policy(index: usize) -> PinPolicy {
+    match index {
+        1 => PinPolicy::Always,
+        3 => PinPolicy::Never,
+        _ => PinPolicy::Once,
+    }
+}
+
 /// Map a key reference to its table index.
 ///
 /// `9A`/`9C`/`9D`/`9E` are table indices `0`..=`3`; retired `n` (key ref
@@ -218,6 +230,14 @@ mod tests {
         // All 20 retired slots: once.
         for slot in &applet.slots[4..] {
             assert_eq!(slot.pin_policy, PinPolicy::Once);
+        }
+    }
+
+    #[test]
+    fn factory_pin_policy_matches_the_table() {
+        let slots = factory_slots();
+        for (index, slot) in slots.iter().enumerate() {
+            assert_eq!(slot.pin_policy, factory_pin_policy(index));
         }
     }
 

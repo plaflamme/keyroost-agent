@@ -209,7 +209,7 @@ fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
         Err(_) => return Response::sw(SW_WRONG_DATA),
     };
     let shared =
-        p256::elliptic_curve::ecdh::diffie_hellman(&secret.to_nonzero_scalar(), peer.as_affine());
+        p256::elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
 }
 

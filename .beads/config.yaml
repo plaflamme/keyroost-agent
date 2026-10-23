@@ -73,3 +73,5 @@
 
 sync:
     remote: "git+ssh://git@github.com/plaflamme/keyroost-agent.git"
+
+events-journal: false
