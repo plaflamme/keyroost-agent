@@ -610,4 +610,21 @@ mod tests {
         let sig: p256::ecdsa::Signature = sk.sign_prehash(&digest).expect("an ECDSA signature");
         vk.verify_prehash(&digest, &sig).expect("a valid signature");
     }
+
+    #[test]
+    fn imported_key_signs_in_the_ga_path() {
+        let mut app = PivApplet::new();
+        mgmt_handshake(&mut app);
+        let scalar = fixed_scalar();
+        assert_eq!(
+            app.process(&import_apdu(0x11, 0x9E, &ec_body(&scalar, None, None))).sw,
+            SW_OK
+        );
+        // 9E is `NEVER` at the factory, so no VERIFY is needed: the GA
+        // signing path signs the prehashed digest with the imported
+        // scalar, verified under the point that scalar derives.
+        let sk = SigningKey::from_slice(&scalar).expect("a valid scalar");
+        let point = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        crate::general_auth::tests::card_signature(&mut app, 0x9E, &point, &[0x2B; 32]);
+    }
 }

@@ -623,7 +623,7 @@ pub(crate) mod tests {
 
     /// Run the host's signing GA against the slot and verify the card's
     /// DER signature under the point the card announced.
-    fn card_signature(applet: &mut PivApplet, key_ref: u8, point: &[u8], digest: &[u8; 32]) {
+    pub(crate) fn card_signature(applet: &mut PivApplet, key_ref: u8, point: &[u8], digest: &[u8; 32]) {
         use p256::ecdsa::signature::hazmat::PrehashVerifier;
         let r = applet.process(&keyroost_piv::general_auth_sign(
             keyroost_piv::KeyAlg::EccP256.id(),
