@@ -54,16 +54,18 @@ mod general_auth;
 mod identity;
 mod management;
 mod select;
+mod slot;
 mod state;
 
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
 
 use constants::{
     DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
-    SW_INS_NOT_SUPPORTED,
+    SW_INS_NOT_SUPPORTED, SW_OK,
 };
 use keyroost_piv::Instruction;
 use management::MgmtKey;
+use slot::{Slot, factory_slots};
 use state::Pin;
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
@@ -125,6 +127,14 @@ pub struct PivApplet {
     /// key), the pending GA witness/challenge, and the slot's unlocked
     /// status.
     pub(crate) mgmt: MgmtKey,
+    /// The 24 key slots in table order: `9A`, `9C`, `9D`, `9E`, then
+    /// retired `1..=20` (key refs `82`..=`95`). `9B` (management) and `F9`
+    /// (attestation) are not slots.
+    pub(crate) slots: [Slot; 24],
+    /// The PIN/ALWAYS latch: set by a successful VERIFY, consumed by the
+    /// next non-chained APDU — an `ALWAYS`-policy slot operation must be
+    /// the APDU right after the VERIFY that armed it.
+    pub(crate) pin_always_armed: bool,
 }
 
 impl Default for PivApplet {
@@ -151,6 +161,8 @@ impl PivApplet {
             pin: Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES),
             puk: Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES),
             mgmt: MgmtKey::default(),
+            slots: factory_slots(),
+            pin_always_armed: false,
         }
     }
 
@@ -171,7 +183,22 @@ impl PivApplet {
                 apdu.len()
             );
         };
-        match Instruction::from_code(*ins) {
+        // A GET RESPONSE with a pending tail is a chained continuation of
+        // its parent APDU: it inherits the parent's gate results, so it
+        // does not consume the PIN/ALWAYS latch. Any other APDU — including
+        // a stray GET RESPONSE with nothing pending — is a new command and
+        // consumes the latch: an `ALWAYS`-policy slot operation must be the
+        // APDU right after a successful VERIFY.
+        let chained = *ins == keyroost_piv::Instruction::GetResponse as u8
+            && self.get_response_tail.is_some();
+        // A VERIFY carrying an 8-byte body is a real PIN presentation —
+        // the status query (no body) is not, even though both can answer
+        // 9000. Only a presentation that the card accepts re-arms the
+        // PIN/ALWAYS latch.
+        let pin_presentation = *ins == keyroost_piv::Instruction::Verify as u8
+            && apdu.get(2) == Some(&0x00)
+            && matches!(apdu_lc_body(apdu), Ok((_, body)) if body.len() == 8);
+        let response = match Instruction::from_code(*ins) {
             Some(Instruction::Select) => self.process_select(apdu),
             Some(Instruction::Verify) => self.process_verify(apdu),
             Some(Instruction::GetData) => self.process_get_data(apdu),
@@ -193,7 +220,16 @@ impl PivApplet {
             // it yet, so `from_code` cannot name it.
             None if *ins == INS_IMPORT_ASYM => self.process_import_key(apdu),
             _ => Response::sw(SW_INS_NOT_SUPPORTED),
+        };
+        // The PIN/ALWAYS latch is consumed by the APDU after the one that
+        // armed it. A successful PIN presentation is the one APDU that arms
+        // it — and it must not consume the arm it just set: the arm survives
+        // until the next command.
+        let armed_this_apdu = pin_presentation && response.sw == SW_OK;
+        if !chained && !armed_this_apdu {
+            self.pin_always_armed = false;
         }
+        response
     }
 
     /// Apply a case-4 `Le` cap to a full response: send it whole under

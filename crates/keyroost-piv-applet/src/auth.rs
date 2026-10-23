@@ -68,10 +68,15 @@ impl PivApplet {
             return Response::sw(SW_WRONG_DATA);
         }
         if pin.check(body) {
+            // A successful VERIFY arms the PIN/ALWAYS latch: an
+            // `ALWAYS`-policy slot operation must follow it immediately.
+            // The latch is consumed by the next non-chained APDU — cleared
+            // in `process`, where the APDU that armed it survives intact.
+            self.pin_always_armed = true;
             Response::sw(keyroost_piv::SW_OK)
         } else {
             // The card would also wipe the key slots here if this try
-            // blocked both PIN and PUK; this applet has no key slots yet.
+            // blocked both PIN and PUK; the applet has no key slots yet.
             Response::sw(tries_sw(pin.tries))
         }
     }

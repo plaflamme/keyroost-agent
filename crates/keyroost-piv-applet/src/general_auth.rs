@@ -5,9 +5,10 @@ use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 
 use crate::constants::{
     GA_MAX_CHALLENGE, GA_TAG_CHALLENGE, GA_TAG_DYN_AUTH, GA_TAG_EXP, GA_TAG_RESPONSE,
-    GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2,
-    SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA, SW_WRONG_LENGTH,
+    GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
+    SW_WRONG_LENGTH,
 };
+use crate::slot::slot_index;
 use crate::{PivApplet, Response, apdu_lc_body};
 
 impl PivApplet {
@@ -38,13 +39,16 @@ impl PivApplet {
     ///   so a witness request after a successful handshake demands a
     ///   full mutual auth again.
     ///
-    /// P2=`9A`/`9C`/`9D` (and the `82`–`8C` history slots) need the PIN
-    /// verified in this session — `6986` until it is — then answer `6B00`
-    /// (the applet holds no key material for them yet). Every other P2 —
-    /// `9E`, `9F`, `58`–`5A`, … — answers `6B00` outright.
+    /// Every slot reference (9A/9C/9D/9E and the retired slots
+    /// `82`–`95`) goes through the slot path: the slot's PIN policy is
+    /// enforced (`6986` while it is not satisfied) and a policy-satisfying
+    /// command is answered `6B00` because the applet holds no key material
+    /// for the slot yet. `9B` is the management key; every other P2 —
+    /// `9F`, `58`–`5A`, the vendor-extension references, … — answers
+    /// `6B00` outright.
     ///
-    /// The per-slot signing / key agreement half (the `58`–`82`/`9E`/`9F`
-    /// slots' RSA and ECDSA operations) lands with the key slots.
+    /// The per-slot signing / key agreement half (the slots' ECDSA and
+    /// ECDH operations) lands with the key slots.
     pub(crate) fn process_general_authenticate(&mut self, apdu: &[u8]) -> Response {
         let [cla, _, p1, p2, ..] = apdu else {
             // `process` guarantees the 4-byte header.
@@ -53,22 +57,25 @@ impl PivApplet {
         if cla & 0x90 != 0 {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        match *p2 {
-            KEY_REF_MANAGEMENT => self.ga_management(*p1, apdu_lc_body(apdu)),
-            0x9A | 0x9C | 0x9D => self.ga_gated_slot(),
-            0x82..=0x8C => self.ga_gated_slot(),
-            _ => Response::sw(SW_INCORRECT_P1P2),
+        // P2 is the key reference: a slot reference goes to the slot path,
+        // `9B` is the management key, everything else is refused.
+        match slot_index(*p2) {
+            Some(index) => self.ga_slot(index),
+            None => match *p2 {
+                KEY_REF_MANAGEMENT => self.ga_management(*p1, apdu_lc_body(apdu)),
+                _ => Response::sw(SW_INCORRECT_P1P2),
+            },
         }
     }
 
-    /// The PIN-gated slot references (`9A`/`9C`/`9D`, history `82`–`8C`):
-    /// `6986` until the PIN is verified in this session, `6B00` after (the
-    /// applet holds no key material for them yet).
-    fn ga_gated_slot(&self) -> Response {
-        if self.pin.verified {
-            Response::sw(SW_INCORRECT_P1P2)
-        } else {
-            Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED)
+    /// The slot half of GENERAL AUTHENTICATE (9A/9C/9D/9E and the retired
+    /// slots): the slot's PIN policy is enforced, then the command is
+    /// refused `6B00` because the applet holds no key material for the
+    /// slot yet. The sign/ECDH payload parsing lands with the key slots.
+    fn ga_slot(&self, index: usize) -> Response {
+        match self.slot_pin_gate(&self.slots[index]) {
+            Ok(()) => Response::sw(SW_INCORRECT_P1P2),
+            Err(sw) => Response::sw(sw),
         }
     }
 
@@ -257,7 +264,9 @@ fn read_tlv_length(buf: &[u8]) -> Result<(usize, usize), u16> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::constants::{DEFAULT_MGMT_KEY, DEFAULT_PUK_TRIES, SW_OK};
+    use crate::constants::{
+        DEFAULT_MGMT_KEY, DEFAULT_PUK_TRIES, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED,
+    };
     use crate::tries_sw;
     use aes::cipher::{BlockDecrypt, KeyInit};
 
@@ -454,22 +463,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ga_unknown_p2_is_incorrect_p1p2_and_pin_gated_slots_need_the_pin() {
+    fn ga_slot_refs_are_policy_gated_and_non_slot_p2s_refused() {
         let mut applet = PivApplet::new();
-        // 9E is not a slot reference the applet knows.
-        for p2 in [0x9Eu8, 0x58u8, 0x00u8] {
+        // Non-slot P2s: `6B00` outright.
+        for p2 in [0x58u8, 0x00u8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
             assert_eq!(r.sw, SW_INCORRECT_P1P2);
         }
-        // 9A/9C/9D and the history slots: PIN-gated — locked first.
+        // 9E is a slot (factory NEVER) — ungated, refused for the missing
+        // key.
+        let r = applet.process(&ga_apdu_for_p2(0x9E));
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        // 9A/9C/9D and the retired slots: PIN-gated — locked first.
         for p2 in [0x9Au8, 0x9Cu8, 0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
             assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        // After the PIN is verified the applet has no key material for them.
+        // After the PIN is verified the applet has no key material for
+        // them. The ONCE slots pass on the session flag; the ALWAYS latch
+        // is consumed by the first slot APDU, so the 9C GA that does not
+        // follow the VERIFY is gated again.
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
         assert_eq!(r.sw, SW_OK);
-        for p2 in [0x9Au8, 0x9Cu8, 0x9Du8, 0x82u8, 0x8Cu8] {
+        let r = applet.process(&ga_apdu_for_p2(0x9A));
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        let r = applet.process(&ga_apdu_for_p2(0x9C));
+        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        for p2 in [0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
             assert_eq!(r.sw, SW_INCORRECT_P1P2);
         }
