@@ -1,5 +1,6 @@
-//! GENERAL AUTHENTICATE (0x87) — the 9B management-key dynamic-auth half of
-//! the SP 800-73-4 exchange.
+//! GENERAL AUTHENTICATE (0x87) — the SP 800-73-4 dynamic-auth half: the 9B
+//! management-key witness / challenge exchange and the one-shot per-slot
+//! ECDSA signing and ECDH key agreement of the P-256 slots.
 
 use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 
@@ -8,7 +9,7 @@ use crate::constants::{
     GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
     SW_WRONG_LENGTH,
 };
-use crate::slot::slot_index;
+use crate::slot::{slot_index, SlotKey};
 use crate::{PivApplet, Response, apdu_lc_body};
 
 impl PivApplet {
@@ -41,14 +42,15 @@ impl PivApplet {
     ///
     /// Every slot reference (9A/9C/9D/9E and the retired slots
     /// `82`–`95`) goes through the slot path: the slot's PIN policy is
-    /// enforced (`6986` while it is not satisfied) and a policy-satisfying
-    /// command is answered `6B00` because the applet holds no key material
-    /// for the slot yet. `9B` is the management key; every other P2 —
-    /// `9F`, `58`–`5A`, the vendor-extension references, … — answers
-    /// `6B00` outright.
-    ///
-    /// The per-slot signing / key agreement half (the slots' ECDSA and
-    /// ECDH operations) lands with the key slots.
+    /// enforced (`6986` while it is not satisfied), the slot must hold a
+    /// key and P1 must be the slot's algorithm byte (`6B00` otherwise),
+    /// and the body is the one-shot dynamic-auth template — an empty `82`
+    /// plus exactly one data member: a 32-byte digest under `81` (ECDSA
+    /// signing — the applet signs the host's pre-hashed digest) or a
+    /// 65-byte uncompressed peer point under `85` (ECDH — the applet
+    /// answers the shared secret's x-coordinate). `9B` is the management
+    /// key; every other P2 — `9F`, `58`–`5A`, the vendor-extension
+    /// references, … — answers `6B00` outright.
     pub(crate) fn process_general_authenticate(&mut self, apdu: &[u8]) -> Response {
         let [cla, _, p1, p2, ..] = apdu else {
             // `process` guarantees the 4-byte header.
@@ -60,7 +62,7 @@ impl PivApplet {
         // P2 is the key reference: a slot reference goes to the slot path,
         // `9B` is the management key, everything else is refused.
         match slot_index(*p2) {
-            Some(index) => self.ga_slot(index),
+            Some(index) => self.ga_slot(index, *p1, apdu_lc_body(apdu)),
             None => match *p2 {
                 KEY_REF_MANAGEMENT => self.ga_management(*p1, apdu_lc_body(apdu)),
                 _ => Response::sw(SW_INCORRECT_P1P2),
@@ -69,13 +71,48 @@ impl PivApplet {
     }
 
     /// The slot half of GENERAL AUTHENTICATE (9A/9C/9D/9E and the retired
-    /// slots): the slot's PIN policy is enforced, then the command is
-    /// refused `6B00` because the applet holds no key material for the
-    /// slot yet. The sign/ECDH payload parsing lands with the key slots.
-    fn ga_slot(&self, index: usize) -> Response {
-        match self.slot_pin_gate(&self.slots[index]) {
-            Ok(()) => Response::sw(SW_INCORRECT_P1P2),
-            Err(sw) => Response::sw(sw),
+    /// slots): the slot's PIN policy is enforced, the slot must hold a
+    /// key, P1 must be the slot's algorithm byte, and the body is the
+    /// one-shot dynamic-auth template — an empty `82` plus exactly one
+    /// data member. The applet answers the signature or shared secret
+    /// under `82`.
+    fn ga_slot(&self, index: usize, p1: u8, lc_body: Result<(u8, &[u8]), ()>) -> Response {
+        if let Err(sw) = self.slot_pin_gate(&self.slots[index]) {
+            return Response::sw(sw);
+        }
+        let Some(key) = self.slots[index].key.as_ref() else {
+            return Response::sw(SW_INCORRECT_P1P2);
+        };
+        if p1 != key.alg.id() {
+            return Response::sw(SW_INCORRECT_P1P2);
+        }
+        let (_lc, body) = match lc_body {
+            Ok(pair) => pair,
+            Err(()) => return Response::sw(SW_WRONG_LENGTH),
+        };
+        let t = match parse_ga_template(body) {
+            Ok(t) => t,
+            Err(sw) => return Response::sw(sw),
+        };
+        // The one-shot slot shape: an empty `82` plus a single data
+        // member. Anything else is a wrong member.
+        if t.wanted != Some(GA_TAG_RESPONSE) || t.response.is_some() || t.witness.is_some() {
+            return Response::sw(SW_INCORRECT_P1P2);
+        }
+        match (t.challenge, t.exponent) {
+            (Some(digest), None) => {
+                if digest.len() != 32 {
+                    return Response::sw(SW_WRONG_DATA);
+                }
+                slot_sign(key, digest)
+            }
+            (None, Some(peer)) => {
+                if peer.len() != 65 {
+                    return Response::sw(SW_WRONG_DATA);
+                }
+                slot_ecdh(key, peer)
+            }
+            _ => Response::sw(SW_INCORRECT_P1P2),
         }
     }
 
@@ -141,6 +178,39 @@ impl PivApplet {
             _ => Response::sw(SW_INCORRECT_P1P2),
         }
     }
+}
+
+/// The ECDSA half of the slot GA: the applet signs the host's pre-hashed
+/// digest (P-256 — the host hashes with SHA-256) and answers the
+/// DER-encoded signature under `82`.
+fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    let signing = match p256::ecdsa::SigningKey::from_slice(&key.secret[..]) {
+        Ok(signing) => signing,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
+    let sig: p256::ecdsa::Signature = match signing.sign_prehash(digest) {
+        Ok(sig) => sig,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
+    Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
+}
+
+/// The ECDH half of the slot GA: the peer's 65-byte uncompressed point is
+/// checked on the curve and the applet answers the shared secret — the
+/// x-coordinate of the P-256 product — as the raw 32-byte value under `82`.
+fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
+    let secret = match p256::SecretKey::from_slice(&key.secret[..]) {
+        Ok(secret) => secret,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
+    let peer = match p256::PublicKey::from_sec1_bytes(peer) {
+        Ok(peer) => peer,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
+    let shared =
+        p256::elliptic_curve::ecdh::diffie_hellman(&secret.to_nonzero_scalar(), peer.as_affine());
+    Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
 }
 
 /// One parsed SP 800-73-4 dynamic-auth template: the empty member the host
@@ -532,5 +602,200 @@ pub(crate) mod tests {
         apdu[0] = 0x80;
         let r = applet.process(&apdu);
         assert_eq!(r.sw, SW_CLA_NOT_SUPPORTED);
+    }
+
+    /// Management unlock plus a P-256 key in `slot`; returns the 65-byte
+    /// uncompressed public point the card announced.
+    fn slot_with_p256(applet: &mut PivApplet, slot: keyroost_piv::Slot) -> Vec<u8> {
+        mgmt_handshake(applet);
+        let r = applet.process(&keyroost_piv::generate_key(
+            slot,
+            keyroost_piv::KeyAlg::EccP256.id(),
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
+        ));
+        assert_eq!(r.sw, SW_OK);
+        match keyroost_piv::parse_public_key(&r.data).expect("a well-formed public-key template") {
+            keyroost_piv::PublicKey::Ecc { point } => point,
+            other => panic!("expected an EC point, got {other:?}"),
+        }
+    }
+
+    /// Run the host's signing GA against the slot and verify the card's
+    /// DER signature under the point the card announced.
+    fn card_signature(applet: &mut PivApplet, key_ref: u8, point: &[u8], digest: &[u8; 32]) {
+        use p256::ecdsa::signature::hazmat::PrehashVerifier;
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            key_ref,
+            digest,
+        ));
+        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point).expect("the announced point");
+        let sig = p256::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
+        vk.verify_prehash(digest, &sig).expect("a valid signature");
+    }
+
+    #[test]
+    fn ga_slot_signs_the_hosts_prehashed_digest() {
+        let mut applet = PivApplet::new();
+        let point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication); // 9A: ONCE
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        card_signature(&mut applet, 0x9A, &point, &[0x2B; 32]);
+    }
+
+    #[test]
+    fn ga_slot_ecdh_answers_the_shared_x_coordinate() {
+        let mut applet = PivApplet::new();
+        let point = slot_with_p256(&mut applet, keyroost_piv::Slot::CardAuthentication); // 9E: NEVER
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let mut rng = rand_core::OsRng;
+        let peer = p256::ecdh::EphemeralSecret::random(&mut rng);
+        let r = applet.process(&keyroost_piv::general_auth_key_agree(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9E,
+            peer.public_key().to_encoded_point(false).as_bytes(),
+        ));
+        assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
+        let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(z.len(), 32);
+        let card_pub = p256::PublicKey::from_sec1_bytes(&point).expect("the announced point");
+        let expected = peer.diffie_hellman(&card_pub);
+        assert_eq!(z, expected.raw_secret_bytes().as_slice());
+    }
+
+    #[test]
+    fn ga_slot_always_policy_tracks_the_verify() {
+        let mut applet = PivApplet::new();
+        let point = slot_with_p256(&mut applet, keyroost_piv::Slot::Signature); // 9C: ALWAYS
+        let digest = [0x5A; 32];
+        // No VERIFY: gated.
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9C,
+            &digest,
+        ));
+        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        // A VERIFY followed by another APDU consumes the latch: gated again.
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        assert_eq!(applet.process(&keyroost_piv::select_full()).sw, SW_OK);
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9C,
+            &digest,
+        ));
+        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        // A VERIFY immediately followed by the GA: the signature verifies
+        // under the announced point.
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        card_signature(&mut applet, 0x9C, &point, &digest);
+    }
+
+    #[test]
+    fn ga_slot_refuses_a_p1_that_is_not_the_slots_algorithm() {
+        let mut applet = PivApplet::new();
+        let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP384.id(),
+            0x9A,
+            &[0x2B; 32],
+        ));
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+    }
+
+    #[test]
+    fn ga_to_the_attest_slot_is_not_dispatched() {
+        let mut applet = PivApplet::new();
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0xF9,
+            &[0x2B; 32],
+        ));
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+    }
+
+    #[test]
+    fn ga_slot_sign_wants_exactly_a_32_byte_digest() {
+        let mut applet = PivApplet::new();
+        let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9A,
+            &[0x2B; 20],
+        ));
+        assert_eq!(r.sw, SW_WRONG_DATA);
+    }
+
+    #[test]
+    fn ga_slot_ecdh_wants_a_65_byte_point_on_the_curve() {
+        let mut applet = PivApplet::new();
+        let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::CardAuthentication);
+        // 64 bytes: not a point encoding.
+        let r = applet.process(&keyroost_piv::general_auth_key_agree(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9E,
+            &[0x04; 64],
+        ));
+        assert_eq!(r.sw, SW_WRONG_DATA);
+        // 65 bytes but off the curve.
+        let mut off_curve = [0x11; 65];
+        off_curve[0] = 0x04;
+        let r = applet.process(&keyroost_piv::general_auth_key_agree(
+            keyroost_piv::KeyAlg::EccP256.id(),
+            0x9E,
+            &off_curve,
+        ));
+        assert_eq!(r.sw, SW_WRONG_DATA);
+    }
+
+    #[test]
+    fn ga_slot_refuses_wrong_member_shapes() {
+        let mut applet = PivApplet::new();
+        let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        let digest = [0x2B; 32];
+        // A non-empty 82 member: not the one-shot slot shape.
+        let mut body = vec![0x7C, 3 + 4 + 34, 0x82, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x81, 0x20];
+        body.extend_from_slice(&digest);
+        let mut apdu = vec![0x00, 0x87, 0x11, 0x9A, body.len() as u8];
+        apdu.extend_from_slice(&body);
+        apdu.push(0x00);
+        let r = applet.process(&apdu);
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        // Both an 81 and an 85 member: not the one-shot slot shape.
+        let mut body = vec![0x7C, 3 + 34 + 2 + 65, 0x81, 0x20];
+        body.extend_from_slice(&digest);
+        body.extend_from_slice(&[0x85, 0x41, 0x04]);
+        body.extend_from_slice(&[0x02; 64]);
+        let mut apdu = vec![0x00, 0x87, 0x11, 0x9A, body.len() as u8];
+        apdu.extend_from_slice(&body);
+        apdu.push(0x00);
+        let r = applet.process(&apdu);
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        // A lone empty 82 (no data member at all): not the one-shot slot
+        // shape.
+        let r = applet.process(&[0x00, 0x87, 0x11, 0x9A, 0x04, 0x7C, 0x02, 0x82, 0x00, 0x00]);
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
     }
 }
