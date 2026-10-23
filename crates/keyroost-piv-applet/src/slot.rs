@@ -136,8 +136,8 @@ impl PivApplet {
     /// — the 9B exchange itself stays in GENERAL AUTHENTICATE. Answers
     /// [`SW_SECURITY_NOT_SATISFIED`].
     ///
-    /// Consulted by PUT DATA and the key-slot commands, which land with
-    /// them (T2+).
+    /// Consulted by the key-slot commands (GENERATE, IMPORT, MOVE KEY) and
+    /// PUT DATA.
     pub(crate) fn management_unlocked(&self) -> Result<(), u16> {
         if self.mgmt.unlocked() {
             Ok(())
@@ -166,6 +166,17 @@ impl PivApplet {
             Ok(())
         } else {
             Err(SW_SECURITY_STATUS_NOT_SATISFIED)
+        }
+    }
+
+    /// The factory PIN policy of the slot at `index`: `NEVER` for 9E,
+    /// `ALWAYS` for 9C, `ONCE` for every other slot — the same table
+    /// `factory_slots` lays out.
+    pub(crate) const fn factory_pin_policy(index: usize) -> PinPolicy {
+        match index {
+            3 => PinPolicy::Never,
+            1 => PinPolicy::Always,
+            _ => PinPolicy::Once,
         }
     }
 }

@@ -53,6 +53,7 @@ mod data;
 mod extensions;
 mod general_auth;
 mod identity;
+mod keygen;
 mod management;
 mod select;
 mod slot;

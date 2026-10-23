@@ -11,6 +11,10 @@ description = "Pure-Rust PIV (NIST SP 800-73-4 / FIPS 201) card-side applet: hos
 keyroost-piv = { version = "0.13.0" }
 # APDU and codec primitives (TLV read/write) the command handlers parse with.
 keyroost-proto = { version = "0.13.0" }
+# The P-256 key material the key-slot commands generate, import and will
+# sign with: the same crates (and feature paths) the root host crate uses.
+p256 = { version = "0.13.0" }
+ecdsa = { version = "0.16.0" }
 # Secret card state (PIN/PUK, management key, private key material) lives in
 # Zeroizing containers.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
@@ -20,7 +24,9 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 aes = "0.8"
 cipher = "0.4"
 des = "0.8"
-# OsRng: the GA witness/challenge values.
+# The CSPRNG feeding p256's key generation (`rand_core::OsRng`); the same
+# pairing the GA witness/challenge values use.
+rand_core = { version = "0.6", features = ["getrandom"] }
 getrandom = "0.2"
 # CLI and logging for the `piv-vsmartcard` front end.
 clap = { version = "4", features = ["derive"] }
