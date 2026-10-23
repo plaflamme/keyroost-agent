@@ -145,6 +145,49 @@
                 # The card is back at factory state: the factory PIN and the factory
                 # management key work again.
                 host.succeed("PIN=123456 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv retries set --pin-tries 5 --puk-tries 3 --pin env:PIN --mgmt-key env:MGMT --yes")
+
+                # --- Slot section (plan-06 T8): the end-to-end key-material pass. ---
+                # The card is at factory state from the reset above: factory PIN,
+                # factory management key, no keys, no certificates, no CHUID.
+
+                # Empty card: slot 9A reports no key.
+                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
+
+                # Generate a P-256 key pair in 9A (management key only, no PIN).
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv key generate --slot 9a --mgmt-key env:MGMT --yes")
+
+                # Key present, no certificate yet.
+                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'key present, no certificate'")
+
+                # Mint a self-signed certificate on the card from the public key
+                # read through GET METADATA (9A's PIN policy is once, so the
+                # on-card sign takes the PIN). Then the import/export round trip:
+                # re-import the exported file and byte-compare the two exports.
+                host.succeed("PIN=123456 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv cert generate --slot 9a --subject 'CN=VM-Test' --mgmt-key env:MGMT --pin env:PIN --yes")
+                host.succeed("keyroostctl piv cert export --slot 9a --out /tmp/cert1.pem --overwrite")
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv cert import --slot 9a --in /tmp/cert1.pem --mgmt-key env:MGMT --yes")
+                host.succeed("keyroostctl piv cert export --slot 9a --out /tmp/cert2.pem --overwrite")
+                host.succeed("cmp /tmp/cert1.pem /tmp/cert2.pem")
+
+                # The stored certificate is readable and its public key matches
+                # the card's key: piv test signs on the card and verifies.
+                host.succeed("PIN=123456 keyroostctl piv test --slot 9a --pin env:PIN")
+
+                # CHUID: write one, then see it in the status.
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv chuid generate --mgmt-key env:MGMT")
+                host.succeed("keyroostctl piv info | grep -q 'FASC-N'")
+
+                # Move the key to 9C: the key and its policies move, the
+                # certificate stays in 9A.
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv key move --from 9a --to 9c --mgmt-key env:MGMT")
+                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'cert present'")
+                host.succeed("keyroostctl piv info | grep -F 'signature (9C)' | grep -q 'key present, no certificate'")
+
+                # Delete the moved key and the certificate: both slots empty again.
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv key delete --slot 9c --mgmt-key env:MGMT --yes")
+                host.succeed("MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv cert delete --slot 9a --mgmt-key env:MGMT --yes")
+                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
+                host.succeed("keyroostctl piv info | grep -F 'signature (9C)' | grep -q 'empty'")
               '';
             };
           };
