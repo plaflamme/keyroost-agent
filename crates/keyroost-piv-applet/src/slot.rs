@@ -10,8 +10,8 @@
 //!
 //! Every slot carries its PIN policy (the factory values: `ONCE` for 9A,
 //! `ALWAYS` for 9C, `ONCE` for 9D, `NEVER` for 9E and for every retired
-//! slot) and — until the key-generation commands land — no key material,
-//! no certificate and no touch policy. The two gates:
+//! slot), its touch policy (`0` at the factory) and, once a key lands, the
+//! key itself and its certificate data object. The two gates:
 //!
 //! - [`PivApplet::management_unlocked`] — the 9B session must be unlocked
 //!   ([`SW_SECURITY_NOT_SATISFIED`] otherwise); a read-only consultation
@@ -35,23 +35,22 @@ use crate::constants::{SW_SECURITY_NOT_SATISFIED, SW_SECURITY_STATUS_NOT_SATISFI
 /// and MOVE KEY.
 pub(crate) struct Slot {
     /// The slot's key, or `None` for an empty slot.
-    #[allow(dead_code)] // read and written by the key-slot commands (T2+).
+    #[allow(dead_code)] // read by slot GA (T3) and GET METADATA (T5).
     pub(crate) key: Option<SlotKey>,
     /// The PIN policy GENERATE KEY (re)sets for this slot; the factory
     /// value per slot.
     pub(crate) pin_policy: PinPolicy,
     /// The touch policy GENERATE KEY (re)sets for this slot: a raw
     /// [`keyroost_piv::TouchPolicy`] id, `0` (default) at the factory.
-    #[allow(dead_code)] // read and written with GENERATE (T2) and GET METADATA (T5).
+    #[allow(dead_code)] // (re)set by GENERATE/IMPORT/MOVE, read by GET METADATA (T5).
     pub(crate) touch_policy: u8,
     /// Whether the current key was imported by the host (`true`, origin
     /// `0x02`) or generated on the card (`false`, origin `0x01`).
-    #[allow(dead_code)] // set by IMPORT (T6) and MOVE (T7), read by GET METADATA (T5).
+    #[allow(dead_code)] // set by GENERATE/IMPORT/MOVE, read by GET METADATA (T5).
     pub(crate) imported: bool,
     /// The slot's certificate as stored under its data object (the `53`-
     /// wrapped value GET DATA returns verbatim), or `None` when the slot
     /// holds no certificate.
-    #[allow(dead_code)] // read and written by GET/PUT DATA (T4).
     pub(crate) cert: Option<Vec<u8>>,
 }
 
@@ -60,7 +59,7 @@ pub(crate) struct Slot {
 /// The material is the P-256 private scalar — a 32-byte zeroized value —
 /// the point the first key type lands with; the wider P-384/P-521 scalars
 /// widen this field when they arrive.
-#[allow(dead_code)] // constructed by the key-generation commands (T2+).
+#[allow(dead_code)] // read by slot GA (T3) and GET METADATA (T5).
 pub(crate) struct SlotKey {
     /// The key's algorithm — the slot's key-algorithm id on the wire.
     pub(crate) alg: KeyAlg,
@@ -137,8 +136,8 @@ impl PivApplet {
     /// — the 9B exchange itself stays in GENERAL AUTHENTICATE. Answers
     /// [`SW_SECURITY_NOT_SATISFIED`].
     ///
-    /// Consulted by the key-slot commands, which land with them (T2+).
-    #[allow(dead_code)]
+    /// Consulted by PUT DATA and the key-slot commands, which land with
+    /// them (T2+).
     pub(crate) fn management_unlocked(&self) -> Result<(), u16> {
         if self.mgmt.unlocked() {
             Ok(())

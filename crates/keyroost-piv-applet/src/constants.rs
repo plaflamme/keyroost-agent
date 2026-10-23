@@ -30,9 +30,6 @@ pub(crate) const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6986;
 /// `0x6982` word the slot key commands answer when the 9B management
 /// session is not unlocked. Same value as the host crate's
 /// [`keyroost_piv::SW_SECURITY_NOT_SATISFIED`].
-// The first non-test reader lands with the key-slot commands (T2); until
-// then only the gate's unit tests read it.
-#[allow(dead_code)]
 pub(crate) const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 /// ISO 7816-4 status word: success — the card's `9000`.
 pub(crate) const SW_OK: u16 = 0x9000;

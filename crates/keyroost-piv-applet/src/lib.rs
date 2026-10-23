@@ -49,6 +49,7 @@
 
 mod auth;
 mod constants;
+mod data;
 mod extensions;
 mod general_auth;
 mod identity;
@@ -63,6 +64,7 @@ use constants::{
     DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
     SW_INS_NOT_SUPPORTED, SW_OK,
 };
+use data::PivData;
 use keyroost_piv::Instruction;
 use management::MgmtKey;
 use slot::{Slot, factory_slots};
@@ -131,6 +133,9 @@ pub struct PivApplet {
     /// retired `1..=20` (key refs `82`..=`95`). `9B` (management) and `F9`
     /// (attestation) are not slots.
     pub(crate) slots: [Slot; 24],
+    /// The non-slot data objects — CHUID, PIN-protected, Yubico admin —
+    /// none stored at the factory.
+    pub(crate) data: PivData,
     /// The PIN/ALWAYS latch: set by a successful VERIFY, consumed by the
     /// next non-chained APDU — an `ALWAYS`-policy slot operation must be
     /// the APDU right after the VERIFY that armed it.
@@ -162,6 +167,7 @@ impl PivApplet {
             puk: Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES),
             mgmt: MgmtKey::default(),
             slots: factory_slots(),
+            data: PivData::default(),
             pin_always_armed: false,
         }
     }
