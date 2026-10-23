@@ -114,12 +114,16 @@ impl PivApplet {
         body.extend_from_slice(&[0x02, 0x02, slot.pin_policy.id(), slot.touch_policy]);
         body.extend_from_slice(&[0x03, 0x01, if slot.imported { 0x02 } else { 0x01 }]);
         // The `7F49` inner TLVs: the `86` EC point, unwrapped from its
-        // template exactly as the GENERATE response carries it.
+        // template exactly as the GENERATE response carries it. The
+        // lengths are BER-encoded — the P-521 point (133 bytes) does not
+        // fit in a short-form length byte.
+        let mut inner = Vec::with_capacity(3 + point.len());
+        inner.push(0x86);
+        push_ber_len(&mut inner, point.len());
+        inner.extend_from_slice(&point);
         body.push(0x04);
-        body.push((2 + point.len()) as u8);
-        body.push(0x86);
-        body.push(point.len() as u8);
-        body.extend_from_slice(&point);
+        push_ber_len(&mut body, inner.len());
+        body.extend_from_slice(&inner);
         body.extend_from_slice(&[0x05, 0x01, u8::from(is_default)]);
         Some(body)
     }
@@ -140,15 +144,39 @@ impl PivApplet {
     }
 }
 
+/// Append a BER length: the short form to `0x7F`, otherwise the one-byte
+/// `0x81` long form. The metadata values never reach the two-byte form —
+/// the largest point is the P-521's 133 bytes.
+fn push_ber_len(out: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        out.push(0x81);
+        out.push(len as u8);
+    }
+}
+
 /// The uncompressed point of the slot key: the `86` TLV content the GENERATE
-/// response and the metadata `04` member carry.
+/// response and the metadata `04` member carry. `None` for a key family
+/// GET METADATA does not yet report (T10's RSA keys). The `32`/`48`/`66`-
+/// byte scalar is the head of the slot's uniform `66`-byte buffer.
 fn ec_point(key: &SlotKey) -> Option<Vec<u8>> {
     match key.alg {
         KeyAlg::EccP256 => {
-            let signing = p256::ecdsa::SigningKey::from_slice(&key.secret[..]).ok()?;
+            let signing =
+                ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]).ok()?;
             Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
         }
-        // P-384/P-521 land with T9, the RSA keys with T10.
+        KeyAlg::EccP384 => {
+            let signing =
+                ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]).ok()?;
+            Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
+        }
+        KeyAlg::EccP521 => {
+            let signing =
+                ecdsa::SigningKey::<p521::NistP521>::from_slice(&key.secret[..]).ok()?;
+            Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
+        }
         _ => None,
     }
 }
@@ -355,6 +383,60 @@ mod tests {
             .chain(announced.iter().copied())
             .collect();
         assert_eq!(md.public_key, Some(expected));
+    }
+
+    #[test]
+    fn metadata_reports_generated_p521_and_p384_keys() {
+        let mut applet = unlocked();
+        let generated = applet.process(&generate_key(
+            Slot::KeyManagement,
+            KeyAlg::EccP521.id(),
+            PinPolicy::Default,
+            TouchPolicy::Default,
+        ));
+        assert_eq!(generated.sw, keyroost_piv::SW_OK);
+        let announced = match parse_public_key(&generated.data).expect("the announced public key") {
+            keyroost_piv::PublicKey::Ecc { point } => point,
+            other => panic!("expected an EC point, got {other:?}"),
+        };
+        assert_eq!(announced.len(), 133);
+        p521::ecdsa::VerifyingKey::from_sec1_bytes(&announced).expect("a P-521 point");
+        let md = metadata(&mut applet, 0x9D);
+        assert_eq!(md.algorithm, Some(KeyAlg::EccP521.id()));
+        assert_eq!(md.origin, Some(1));
+        let expected: Vec<u8> = [0x86, 0x81, 0x85]
+            .iter()
+            .copied()
+            .chain(announced.iter().copied())
+            .collect();
+        assert_eq!(md.public_key, Some(expected));
+
+        // And P-384 on the other active slot.
+        let generated = applet.process(&generate_key(
+            Slot::Signature,
+            KeyAlg::EccP384.id(),
+            PinPolicy::Default,
+            TouchPolicy::Default,
+        ));
+        assert_eq!(generated.sw, keyroost_piv::SW_OK);
+        let announced = match parse_public_key(&generated.data).expect("the announced public key") {
+            keyroost_piv::PublicKey::Ecc { point } => point,
+            other => panic!("expected an EC point, got {other:?}"),
+        };
+        assert_eq!(announced.len(), 97);
+        p384::ecdsa::VerifyingKey::from_sec1_bytes(&announced).expect("a P-384 point");
+        let md = metadata(&mut applet, 0x9C);
+        assert_eq!(md.algorithm, Some(KeyAlg::EccP384.id()));
+        assert_eq!(
+            md.public_key,
+            Some(
+                [0x86, 97]
+                    .iter()
+                    .copied()
+                    .chain(announced.iter().copied())
+                    .collect::<Vec<_>>()
+            ),
+        );
     }
 
     #[test]

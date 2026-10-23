@@ -1,6 +1,6 @@
 //! The key-slot key commands: GENERATE ASYMMETRIC KEY PAIR (`0x47`),
-//! IMPORT ASYMMETRIC KEY (`0x86`) and MOVE KEY / DELETE (`0xF6`), the first
-//! two P-256.
+//! IMPORT ASYMMETRIC KEY (`0x86`) and MOVE KEY / DELETE (`0xF6`), the
+//! first two for the NIST curves P-256, P-384 and P-521.
 //!
 //! Both commands need the 9B management session unlocked and both replace
 //! what the slot holds: the key is overwritten, the requested policies
@@ -20,8 +20,7 @@
 //! structure or an unknown or repeated member refusing the command with
 //! `6A86`.
 
-use p256::SecretKey;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use elliptic_curve::{FieldBytes, PrimeCurve};
 use zeroize::Zeroizing;
 
 use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
@@ -32,12 +31,42 @@ use crate::data::push_tlv;
 use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, apdu_lc_body};
 
-/// The P-256 group order `n`, big endian. The largest scalar the IMPORT
-/// command will accept is `n - 1`.
+/// The NIST group orders `n`, big endian. The largest scalar the IMPORT
+/// command will accept is `n - 1`. Taken from the `p256`, `p384` and
+/// `p521` crates' own `ORDER` constants.
 const P256_ORDER: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF4, 0xB9, 0xF2, 0xF1, 0x3B, 0xD3, 0xB2, 0xDC,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
 ];
+
+const P384_ORDER: [u8; 48] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC7, 0x63, 0x4D, 0x81, 0xF4, 0x37, 0x2D, 0xDF,
+    0x58, 0x1A, 0x0D, 0xB2, 0x48, 0xB0, 0xA7, 0x7A, 0xEC, 0xEC, 0x19, 0x6A, 0xCC, 0xC5, 0x29, 0x73
+];
+
+const P521_ORDER: [u8; 66] = [
+    0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFA, 0x51, 0x86, 0x87, 0x83, 0xBF, 0x2F, 0x96, 0x6B, 0x7F, 0xCC, 0x01, 0x48, 0xF7, 0x09,
+    0xA5, 0xD0, 0x3B, 0xB5, 0xC9, 0xB8, 0x89, 0x9C, 0x47, 0xAE, 0xBB, 0x6F, 0xB7, 0x1E, 0x91, 0x38,
+    0x64, 0x09
+];
+
+/// An imported scalar checked for one NIST curve: the zeroized canonical
+/// big-endian secret, `None` when the bytes are not a valid `1..=n-1`
+/// field element for the curve.
+fn imported_secret<C>(scalar: &[u8]) -> Option<Zeroizing<Vec<u8>>>
+where
+    C: PrimeCurve,
+{
+    // The caller checked the scalar is exactly the curve's field size.
+    use elliptic_curve::generic_array::typenum::Unsigned;
+    debug_assert_eq!(scalar.len(), C::FieldBytesSize::to_usize());
+    let bytes = FieldBytes::<C>::from_slice(scalar);
+    let key = elliptic_curve::SecretKey::<C>::from_bytes(bytes).ok()?;
+    Some(Zeroizing::new(key.to_bytes().to_vec()))
+}
 
 impl PivApplet {
     /// GENERATE ASYMMETRIC KEY PAIR (`0x47`): the host's `generate_key`
@@ -78,17 +107,32 @@ impl PivApplet {
             Ok(parsed) => parsed,
             Err(()) => return Response::sw(SW_WRONG_DATA),
         };
-        if alg != KeyAlg::EccP256 {
-            return Response::sw(SW_WRONG_DATA);
-        }
-
-        let key = SecretKey::random(&mut rand_core::OsRng);
-        let point = key.public_key().to_encoded_point(false);
-        let secret = Zeroizing::new(key.to_bytes().into());
-        self.commit_slot_key(index, secret, false, pin_policy, touch_policy);
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let (secret, point) = match alg {
+            KeyAlg::EccP256 => {
+                let key =
+                    elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng);
+                let point = key.public_key().to_encoded_point(false);
+                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+            }
+            KeyAlg::EccP384 => {
+                let key =
+                    elliptic_curve::SecretKey::<p384::NistP384>::random(&mut rand_core::OsRng);
+                let point = key.public_key().to_encoded_point(false);
+                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+            }
+            KeyAlg::EccP521 => {
+                let key =
+                    elliptic_curve::SecretKey::<p521::NistP521>::random(&mut rand_core::OsRng);
+                let point = key.public_key().to_encoded_point(false);
+                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+            }
+            _ => return Response::sw(SW_WRONG_DATA),
+        };
+        self.commit_slot_key(index, secret, alg, false, pin_policy, touch_policy);
 
         let mut inner = Vec::with_capacity(2 + 65);
-        push_tlv(&mut inner, &[0x86], point.as_bytes());
+        push_tlv(&mut inner, &[0x86], &point);
         let mut data = Vec::with_capacity(3 + inner.len());
         push_tlv(&mut data, &[0x7F, 0x49], &inner);
         Response::ok(data)
@@ -116,9 +160,10 @@ impl PivApplet {
             Some(index) => index,
             None => return Response::sw(SW_INCORRECT_P1P2),
         };
-        if KeyAlg::from_id(*p1) != Some(KeyAlg::EccP256) {
-            return Response::sw(SW_WRONG_DATA);
-        }
+        let alg = match KeyAlg::from_id(*p1) {
+            Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
+            _ => return Response::sw(SW_WRONG_DATA),
+        };
         let body = match apdu_lc_body(apdu) {
             Ok((_, body)) => body,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
@@ -129,17 +174,33 @@ impl PivApplet {
         };
 
         // The scalar must be the big-endian encoding of a value in
-        // 1..=n-1. The range check precedes `from_bytes` — it would reduce
-        // `n` and above modulo `n` instead of refusing them.
-        if import.scalar == [0u8; 32] || import.scalar >= P256_ORDER {
+        // 1..=n-1 for the requested curve: the curve's field length,
+        // non-zero, below the group order. The range check precedes
+        // `from_bytes` — it would reduce `n` and above modulo `n` instead
+        // of refusing them.
+        let order: &[u8] = match alg {
+            KeyAlg::EccP256 => &P256_ORDER,
+            KeyAlg::EccP384 => &P384_ORDER,
+            KeyAlg::EccP521 => &P521_ORDER,
+            _ => unreachable!("alg is one of the NIST curves"),
+        };
+        if import.scalar.len() != order.len()
+            || import.scalar.iter().all(|byte| *byte == 0)
+            || import.scalar.as_slice() >= order
+        {
             return Response::sw(SW_WRONG_DATA);
         }
-        let key = match SecretKey::from_bytes(&import.scalar.into()) {
-            Ok(key) => key,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
+        let secret = match alg {
+            KeyAlg::EccP256 => imported_secret::<p256::NistP256>(&import.scalar),
+            KeyAlg::EccP384 => imported_secret::<p384::NistP384>(&import.scalar),
+            KeyAlg::EccP521 => imported_secret::<p521::NistP521>(&import.scalar),
+            _ => unreachable!("alg is one of the NIST curves"),
         };
-        let secret = Zeroizing::new(key.to_bytes().into());
-        self.commit_slot_key(index, secret, true, import.pin_policy, import.touch_policy);
+        let secret = match secret {
+            Some(secret) => secret,
+            None => return Response::sw(SW_WRONG_DATA),
+        };
+        self.commit_slot_key(index, secret, alg, true, import.pin_policy, import.touch_policy);
         Response::sw(SW_OK)
     }
 
@@ -245,7 +306,7 @@ fn parse_import(body: &[u8]) -> Result<ImportKey, ()> {
 }
 
 struct ImportKey {
-    scalar: [u8; 32],
+    scalar: Vec<u8>,
     pin_policy: Option<PinPolicy>,
     touch_policy: Option<TouchPolicy>,
 }
@@ -299,31 +360,33 @@ fn parse_touch_policy(value: &[u8]) -> Result<TouchPolicy, ()> {
     TouchPolicy::from_id(*id).ok_or(())
 }
 
-/// A `06 20 <scalar>` member: exactly the 32-byte big-endian secret.
-fn parse_scalar(value: &[u8]) -> Result<[u8; 32], ()> {
-    value.try_into().map_err(|_| ())
+/// A `06 <len> <scalar>` member: exactly the 32/48/66-byte big-endian
+/// secret of one of the NIST curves.
+fn parse_scalar(value: &[u8]) -> Result<Vec<u8>, ()> {
+    match value.len() {
+        32 | 48 | 66 => Ok(value.to_vec()),
+        _ => Err(()),
+    }
 }
 
 impl PivApplet {
-    /// Commit a freshly generated or imported P-256 key to the slot at
-    /// `index`: replace the key material, record the origin, apply the
-    /// requested policies (a `DEFAULT` pin policy restores the slot's
+    /// Commit a freshly generated or imported key to the slot at `index`:
+    /// replace the key material, record the algorithm and origin, apply
+    /// the requested policies (a `DEFAULT` pin policy restores the slot's
     /// factory policy, an absent request keeps what the slot had) and
     /// clear the slot certificate (the R5 decision: a replaced key
     /// invalidates the old certificate).
     fn commit_slot_key(
         &mut self,
         index: usize,
-        secret: Zeroizing<[u8; 32]>,
+        secret: Zeroizing<Vec<u8>>,
+        alg: KeyAlg,
         imported: bool,
         pin_policy: Option<PinPolicy>,
         touch_policy: Option<TouchPolicy>,
     ) {
         let slot = &mut self.slots[index];
-        slot.key = Some(SlotKey {
-            alg: KeyAlg::EccP256,
-            secret,
-        });
+        slot.key = Some(SlotKey { alg, secret });
         slot.imported = imported;
         slot.pin_policy = match pin_policy {
             Some(PinPolicy::Default) => Self::factory_pin_policy(index),
@@ -391,9 +454,9 @@ mod tests {
         vec![0x00, 0x47, 0x00, p2, 0x06, 0x80, 0x01, 0x11, 0x00]
     }
 
-    /// An IMPORT body: `06 20 <scalar>` plus optional `AA`/`AB` members.
-    fn ec_body(scalar: &[u8; 32], pin: Option<u8>, touch: Option<u8>) -> Vec<u8> {
-        let mut body = vec![0x06, 0x20];
+    /// An IMPORT body: `06 <len> <scalar>` plus optional `AA`/`AB` members.
+    fn ec_body(scalar: &[u8], pin: Option<u8>, touch: Option<u8>) -> Vec<u8> {
+        let mut body = vec![0x06, scalar.len() as u8];
         body.extend_from_slice(scalar);
         if let Some(pin) = pin {
             body.extend_from_slice(&[0xAA, 0x01, pin]);
@@ -728,7 +791,7 @@ mod tests {
         let source = &app.slots[slot_index(0x9C).expect("9C")];
         let dest = &app.slots[slot_index(0x82).expect("retired 1")];
         assert!(source.key.is_none(), "the source keeps no key");
-        assert_eq!(dest.key.as_ref().expect("the key moved").secret.as_ref(), &scalar);
+        assert_eq!(dest.key.as_ref().expect("the key moved").secret.as_slice(), &scalar);
         assert_eq!(dest.pin_policy, PinPolicy::Once);
         assert_eq!(dest.touch_policy, 0x02);
         assert!(dest.imported);
@@ -838,9 +901,135 @@ mod tests {
         let source = &app.slots[slot_index(0x9C).expect("9C")];
         let dest = &app.slots[slot_index(0x9D).expect("9D")];
         assert_eq!(
-            source.key.as_ref().expect("still there").secret.as_ref(),
+            source.key.as_ref().expect("still there").secret.as_slice(),
             &scalar
         );
-        assert_eq!(dest.key.as_ref().expect("still there").secret.as_ref(), &other);
+        assert_eq!(dest.key.as_ref().expect("still there").secret.as_slice(), &other);
+    }
+
+    /// A GENERATE APDU for a specific algorithm and slot: the host's own
+    /// builder, so the test rides the exact wire shape.
+    fn gen_apdu_for(slot: keyroost_piv::Slot, alg: KeyAlg) -> Vec<u8> {
+        keyroost_piv::generate_key(slot, alg.id(), PinPolicy::Default, TouchPolicy::Default)
+    }
+
+    #[test]
+    fn generate_produces_each_nist_curve() {
+        let mut app = unlocked();
+        // 9C: P-384, a 97-byte point on the curve.
+        let r = app.process(&gen_apdu_for(keyroost_piv::Slot::Signature, KeyAlg::EccP384));
+        assert_eq!(r.sw, SW_OK);
+        let point = point_of(&r);
+        assert_eq!(point.len(), 97);
+        p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-384 point");
+        assert_eq!(app.slots[1].key.as_ref().expect("a key").alg, KeyAlg::EccP384);
+
+        // 9D: P-521, a 133-byte point on the curve.
+        let r = app.process(&gen_apdu_for(keyroost_piv::Slot::KeyManagement, KeyAlg::EccP521));
+        assert_eq!(r.sw, SW_OK);
+        let point = point_of(&r);
+        assert_eq!(point.len(), 133);
+        p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-521 point");
+        assert_eq!(app.slots[2].key.as_ref().expect("a key").alg, KeyAlg::EccP521);
+    }
+
+    #[test]
+    fn import_accepts_p384_and_p521_scalars() {
+        let mut app = unlocked();
+        // P-384 into 9A: the slot then signs with the imported scalar —
+        // verify the signature against the point of that scalar.
+        let scalar: Vec<u8> = {
+            let mut v = vec![0x2B; 48];
+            v[47] = 0x01;
+            v
+        };
+        let body = ec_body(&scalar, None, None);
+        assert_eq!(app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9A, &body)).sw, SW_OK);
+        assert_eq!(app.slots[0].key.as_ref().expect("a key").alg, KeyAlg::EccP384);
+        assert!(app.slots[0].imported);
+        use p384::ecdsa::signature::hazmat::PrehashVerifier;
+        use p384::elliptic_curve::sec1::ToEncodedPoint;
+        let expected_point = p384::SecretKey::from_slice(&scalar)
+            .expect("a valid scalar")
+            .public_key()
+            .to_encoded_point(false);
+        let expected_point = expected_point.as_bytes();
+        assert_eq!(
+            app.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        let digest = [0x2C; 48];
+        let r = app.process(&keyroost_piv::general_auth_sign(
+            KeyAlg::EccP384.id(),
+            0x9A,
+            &digest,
+        ));
+        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(expected_point).expect("the point");
+        let sig = p384::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
+        vk.verify_prehash(&digest, &sig).expect("a valid signature");
+
+        // P-521 into the first retired slot. The scalar must sit below
+        // the group order, whose leading byte is `0x01`.
+        let scalar: Vec<u8> = {
+            let mut v = vec![0x01; 66];
+            v[65] = 0x01;
+            v
+        };
+        let body = ec_body(&scalar, None, None);
+        assert_eq!(app.process(&import_apdu(KeyAlg::EccP521.id(), 0x82, &body)).sw, SW_OK);
+        assert_eq!(app.slots[4].key.as_ref().expect("a key").alg, KeyAlg::EccP521);
+        assert!(app.slots[4].imported);
+    }
+
+    #[test]
+    fn import_refuses_wrong_length_and_out_of_range_scalars() {
+        let mut app = unlocked();
+        // A length mismatch for the requested curve: 48 bytes for P-256,
+        // 32 bytes for P-384, 48 bytes for P-521.
+        let long: Vec<u8> = vec![0x2B; 48];
+        let short = [0x2B; 32];
+        let mid: Vec<u8> = vec![0x2B; 48];
+        assert_eq!(
+            app.process(&import_apdu(KeyAlg::EccP256.id(), 0x9C, &ec_body(&long, None, None)))
+                .sw,
+            SW_WRONG_DATA
+        );
+        assert_eq!(
+            app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9C, &ec_body(&short, None, None)))
+                .sw,
+            SW_WRONG_DATA
+        );
+        assert_eq!(
+            app.process(&import_apdu(KeyAlg::EccP521.id(), 0x9C, &ec_body(&mid, None, None)))
+                .sw,
+            SW_WRONG_DATA
+        );
+        // Zero scalars and group orders, per curve: the range check refuses
+        // them before the field conversion.
+        for (alg, size) in [
+            (KeyAlg::EccP256, 32usize),
+            (KeyAlg::EccP384, 48usize),
+            (KeyAlg::EccP521, 66usize),
+        ] {
+            let zero = vec![0u8; size];
+            assert_eq!(
+                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&zero, None, None))).sw,
+                SW_WRONG_DATA
+            );
+            let order = match alg {
+                KeyAlg::EccP256 => P256_ORDER.to_vec(),
+                KeyAlg::EccP384 => P384_ORDER.to_vec(),
+                KeyAlg::EccP521 => P521_ORDER.to_vec(),
+                _ => unreachable!("a NIST curve"),
+            };
+            assert_eq!(
+                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&order, None, None))).sw,
+                SW_WRONG_DATA
+            );
+        }
+        // Nothing landed in 9C.
+        assert!(app.slots[1].key.is_none());
     }
 }

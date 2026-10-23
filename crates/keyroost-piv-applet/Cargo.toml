@@ -16,6 +16,12 @@ keyroost-proto = { version = "0.13.0" }
 # `ecdh` feature adds the shared-secret computation the slot key-agreement
 # half of GENERAL AUTHENTICATE answers.
 p256 = { version = "0.13.0", features = ["ecdh"] }
+# The P-384 and P-521 slots (T9): the same curve-crate family as p256.
+p384 = { version = "0.13.0", features = ["ecdh"] }
+p521 = { version = "0.13.0", features = ["ecdh"] }
+# The generic secret-key / prime-curve API the three NIST curves share
+# (the same elliptic-curve major the 0.13 curve crates are built on).
+elliptic-curve = "0.13"
 ecdsa = { version = "0.16.0" }
 # Secret card state (PIN/PUK, management key, private key material) lives in
 # Zeroizing containers.

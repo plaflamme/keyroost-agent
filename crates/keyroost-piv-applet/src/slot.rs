@@ -56,15 +56,16 @@ pub(crate) struct Slot {
 
 /// A key held in a slot.
 ///
-/// The material is the P-256 private scalar — a 32-byte zeroized value —
-/// the point the first key type lands with; the wider P-384/P-521 scalars
-/// widen this field when they arrive.
+/// The material is the curve's private scalar — a zeroized big-endian
+/// value, 32 bytes (P-256), 48 (P-384) or 66 (P-521) — the RSA CRT
+/// component set replaces this field with its own representation when T10
+/// lands.
 #[allow(dead_code)] // read by slot GA (T3) and GET METADATA (T5).
 pub(crate) struct SlotKey {
     /// The key's algorithm — the slot's key-algorithm id on the wire.
     pub(crate) alg: KeyAlg,
     /// The private scalar, zeroized on drop.
-    pub(crate) secret: Zeroizing<[u8; 32]>,
+    pub(crate) secret: Zeroizing<Vec<u8>>,
 }
 
 impl Slot {
