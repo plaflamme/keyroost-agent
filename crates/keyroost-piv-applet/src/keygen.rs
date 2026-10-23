@@ -1,5 +1,6 @@
-//! The key-slot key commands: GENERATE ASYMMETRIC KEY PAIR (`0x47`) and
-//! IMPORT ASYMMETRIC KEY (`0x86`), both P-256.
+//! The key-slot key commands: GENERATE ASYMMETRIC KEY PAIR (`0x47`),
+//! IMPORT ASYMMETRIC KEY (`0x86`) and MOVE KEY / DELETE (`0xF6`), the first
+//! two P-256.
 //!
 //! Both commands need the 9B management session unlocked and both replace
 //! what the slot holds: the key is overwritten, the requested policies
@@ -26,9 +27,7 @@ use zeroize::Zeroizing;
 use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 
 use crate::Response;
-use crate::constants::{
-    SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH,
-};
+use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH};
 use crate::data::push_tlv;
 use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, apdu_lc_body};
@@ -141,6 +140,63 @@ impl PivApplet {
         };
         let secret = Zeroizing::new(key.to_bytes().into());
         self.commit_slot_key(index, secret, true, import.pin_policy, import.touch_policy);
+        Response::sw(SW_OK)
+    }
+
+    /// MOVE KEY (`0xF6`, Yubico extension): the host's `move_key` /
+    /// `delete_key` APDU, `00 F6 <dest key_ref | 0xFF> <src key_ref>` —
+    /// case 2, no body and no `Le`.
+    ///
+    /// A move relocates the source slot's key material and policies to the
+    /// destination slot; the certificate objects are left untouched (the
+    /// host contract — the host manages certificates through PUT DATA). The
+    /// `0xFF` sentinel deletes the source key; policies and certificate are
+    /// likewise left untouched.
+    ///
+    /// Refusals: locked `6982`; a non-slot reference in P1 (other than the
+    /// `0xFF` delete sentinel) or P2 `6B00`; a source without a key `6A82`;
+    /// a move into an occupied destination — the source itself included —
+    /// `6A86` (R1: no silent key loss; the host pre-checks occupancy, so
+    /// only an out-of-band tool can reach this answer).
+    pub(crate) fn process_move_key(&mut self, apdu: &[u8]) -> Response {
+        let [cla, _ins, p1, p2, _rest @ ..] = apdu else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
+        if cla & 0x90 != 0 {
+            return Response::sw(SW_CLA_NOT_SUPPORTED);
+        }
+        if let Err(sw) = self.management_unlocked() {
+            return Response::sw(sw);
+        }
+        let source = match slot_index(*p2) {
+            Some(index) => index,
+            None => return Response::sw(SW_INCORRECT_P1P2),
+        };
+        let dest = match *p1 {
+            0xFF => None,
+            reference => match slot_index(reference) {
+                Some(index) => Some(index),
+                None => return Response::sw(SW_INCORRECT_P1P2),
+            },
+        };
+        if self.slots[source].key.is_none() {
+            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+        }
+        if let Some(dest) = dest
+            && self.slots[dest].key.is_some()
+        {
+            return Response::sw(SW_WRONG_DATA);
+        }
+
+        let key = self.slots[source].key.take().expect("checked above");
+        let (pin_policy, touch_policy, imported) =
+            (self.slots[source].pin_policy, self.slots[source].touch_policy, self.slots[source].imported);
+        if let Some(dest) = dest {
+            self.slots[dest].key = Some(key);
+            self.slots[dest].pin_policy = pin_policy;
+            self.slots[dest].touch_policy = touch_policy;
+            self.slots[dest].imported = imported;
+        }
         Response::sw(SW_OK)
     }
 }
@@ -626,5 +682,165 @@ mod tests {
         let sk = SigningKey::from_slice(&scalar).expect("a valid scalar");
         let point = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
         crate::general_auth::tests::card_signature(&mut app, 0x9E, &point, &[0x2B; 32]);
+    }
+
+    /// Read an object back through the host's GET DATA builder; the test
+    /// values are all small, so no `61xx` continuation is expected.
+    fn read_object(app: &mut PivApplet, tag: &[u8]) -> Vec<u8> {
+        let r = app.process(&keyroost_piv::get_data(tag));
+        assert_eq!(r.sw, SW_OK, "GET DATA {tag:?}");
+        keyroost_piv::unwrap_data_object(&r.data)
+            .expect("a well-formed 53 template")
+            .to_vec()
+    }
+
+    #[test]
+    fn move_carries_key_and_policies_and_leaves_certs() {
+        let mut app = PivApplet::new();
+        mgmt_handshake(&mut app);
+        let scalar = fixed_scalar();
+        assert_eq!(
+            app
+                .process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, Some(0x02), Some(0x02))))
+                .sw,
+            SW_OK
+        );
+        let cert_a = b"source-cert";
+        let cert_b = b"dest-cert";
+        assert_eq!(
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0A], cert_a)).sw,
+            SW_OK
+        );
+        assert_eq!(
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0D], cert_b)).sw,
+            SW_OK
+        );
+
+        assert_eq!(
+            app.process(&keyroost_piv::move_key(
+                keyroost_piv::Slot::Signature,
+                keyroost_piv::Slot::retired(1).expect("retired 1"),
+            ))
+            .sw,
+            SW_OK,
+            "move"
+        );
+        let source = &app.slots[slot_index(0x9C).expect("9C")];
+        let dest = &app.slots[slot_index(0x82).expect("retired 1")];
+        assert!(source.key.is_none(), "the source keeps no key");
+        assert_eq!(dest.key.as_ref().expect("the key moved").secret.as_ref(), &scalar);
+        assert_eq!(dest.pin_policy, PinPolicy::Once);
+        assert_eq!(dest.touch_policy, 0x02);
+        assert!(dest.imported);
+        // The certificate objects are left untouched (host contract).
+        assert_eq!(read_object(&mut app, &[0x5F, 0xC1, 0x0A]), cert_a);
+        assert_eq!(read_object(&mut app, &[0x5F, 0xC1, 0x0D]), cert_b);
+    }
+
+    #[test]
+    fn delete_removes_only_the_key() {
+        let mut app = PivApplet::new();
+        mgmt_handshake(&mut app);
+        let scalar = fixed_scalar();
+        assert_eq!(
+            app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None))).sw,
+            SW_OK
+        );
+        assert_eq!(
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x05], b"auth-cert")).sw,
+            SW_OK
+        );
+
+        assert_eq!(
+            app
+                .process(&keyroost_piv::delete_key(keyroost_piv::Slot::Authentication))
+                .sw,
+            SW_OK,
+            "delete"
+        );
+        let slot = &app.slots[slot_index(0x9A).expect("9A")];
+        assert!(slot.key.is_none());
+        assert_eq!(slot.pin_policy, PinPolicy::Once, "the policy is untouched");
+        assert!(slot.cert.is_some(), "the certificate is untouched");
+        assert_eq!(
+            app.process(&keyroost_piv::get_metadata(0x9A)).sw,
+            keyroost_piv::SW_REFERENCE_NOT_FOUND,
+            "no key, so metadata reports the slot empty"
+        );
+    }
+
+    #[test]
+    fn move_and_delete_refuse_an_empty_source() {
+        let mut app = PivApplet::new();
+        mgmt_handshake(&mut app);
+        // 9D is empty at the factory.
+        assert_eq!(
+            app.process(&keyroost_piv::move_key(
+                keyroost_piv::Slot::KeyManagement,
+                keyroost_piv::Slot::Authentication,
+            ))
+            .sw,
+            SW_NOT_FOUND
+        );
+        assert_eq!(
+            app
+                .process(&keyroost_piv::delete_key(keyroost_piv::Slot::KeyManagement))
+                .sw,
+            SW_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn move_key_refusals() {
+        let mut app = PivApplet::new();
+        assert_eq!(app.process(&[0x00, 0xF6, 0x9C, 0x9A]).sw, SW_SECURITY_NOT_SATISFIED);
+        mgmt_handshake(&mut app);
+        // F9 is not in the slot table, in either position; neither is 9B.
+        assert_eq!(app.process(&[0x00, 0xF6, 0xF9, 0x9A]).sw, SW_INCORRECT_P1P2);
+        assert_eq!(app.process(&[0x00, 0xF6, 0x9C, 0xF9]).sw, SW_INCORRECT_P1P2);
+        assert_eq!(app.process(&[0x00, 0xF6, 0x9B, 0x9A]).sw, SW_INCORRECT_P1P2);
+        assert_eq!(app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).sw, SW_CLA_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn move_into_an_occupied_destination_is_refused() {
+        let mut app = PivApplet::new();
+        mgmt_handshake(&mut app);
+        let scalar = fixed_scalar();
+        let other = [0x5E; 32];
+        assert_eq!(
+            app.process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, None, None))).sw,
+            SW_OK
+        );
+        assert_eq!(
+            app.process(&import_apdu(0x11, 0x9D, &ec_body(&other, None, None))).sw,
+            SW_OK
+        );
+
+        // R1: an occupied destination (the source itself included) is
+        // refused and nothing moves.
+        assert_eq!(
+            app.process(&keyroost_piv::move_key(
+                keyroost_piv::Slot::Signature,
+                keyroost_piv::Slot::KeyManagement,
+            ))
+            .sw,
+            SW_WRONG_DATA
+        );
+        assert_eq!(
+            app.process(&keyroost_piv::move_key(
+                keyroost_piv::Slot::Signature,
+                keyroost_piv::Slot::Signature,
+            ))
+            .sw,
+            SW_WRONG_DATA
+        );
+        let source = &app.slots[slot_index(0x9C).expect("9C")];
+        let dest = &app.slots[slot_index(0x9D).expect("9D")];
+        assert_eq!(
+            source.key.as_ref().expect("still there").secret.as_ref(),
+            &scalar
+        );
+        assert_eq!(dest.key.as_ref().expect("still there").secret.as_ref(), &other);
     }
 }
