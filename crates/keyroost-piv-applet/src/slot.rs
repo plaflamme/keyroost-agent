@@ -22,6 +22,9 @@
 
 use elliptic_curve::sec1::ToEncodedPoint;
 use keyroost_piv::{KeyAlg, PinPolicy};
+use pkcs1::DecodeRsaPrivateKey;
+use rsa::RsaPrivateKey;
+use rsa::traits::PublicKeyParts;
 use zeroize::Zeroizing;
 
 use crate::PivApplet;
@@ -55,45 +58,22 @@ pub(crate) struct Slot {
     pub(crate) cert: Option<Vec<u8>>,
 }
 
-/// The RSA CRT private-key components, each zeroized on drop and stored
-/// big-endian: the modulus `n` (the `05`/`PQ` wire member) with its prime
-/// factors `p` and `q`, the CRT exponents `dP1`/`dQ1` (`d` reduced modulo
-/// `p - 1` / `q - 1`) and the public exponent `e` (65537 — the card never
-/// re-derives it, so it is stored and served verbatim).
-///
-/// The set is the reference's IMPORT member set (`01`/`02`/`03`/`04`/`05`)
-/// plus the exponent GENERATE answers under `82`. Signing never reconstructs
-/// the full `d`: the raw operation is the two `mod_pow` halves recombined
-/// through the CRT (see `general_auth::slot_rsa_raw`).
-pub(crate) struct RsaCrt {
-    /// Prime factor `p` (`01`), half the modulus size.
-    pub(crate) p: Zeroizing<Vec<u8>>,
-    /// Prime factor `q` (`02`), half the modulus size.
-    pub(crate) q: Zeroizing<Vec<u8>>,
-    /// `d mod (p - 1)` (`03`), at most half the modulus size.
-    pub(crate) dp: Zeroizing<Vec<u8>>,
-    /// `d mod (q - 1)` (`04`), at most half the modulus size.
-    pub(crate) dq: Zeroizing<Vec<u8>>,
-    /// The modulus `n = p * q` (`05`), the full modulus size.
-    pub(crate) n: Zeroizing<Vec<u8>>,
-    /// The public exponent `e` (65537), big-endian, unpadded.
-    pub(crate) e: Zeroizing<Vec<u8>>,
-}
-
 /// A key held in a slot.
 ///
 /// An EC key's material is the curve's private scalar — a zeroized
 /// big-endian value, 32 bytes (P-256), 48 (P-384) or 66 (P-521), in
-/// `secret`. An RSA key's material is the CRT component set in `crt`; its
-/// `secret` stays empty so the EC code paths read it unchanged.
+/// `secret`. An RSA key's material is the key's PKCS#1 ("RSAPrivateKey")
+/// DER encoding — the `rsa` crate's `RsaPrivateKey` via `to_pkcs1_der`,
+/// modulus, private exponent and the prime factors — and the card keeps
+/// only that byte string, deserializing it for each use (the raw GA sign
+/// and `public_inner` both read it).
 #[allow(dead_code)] // read by slot GA (T3) and GET METADATA (T5).
 pub(crate) struct SlotKey {
     /// The key's algorithm — the slot's key-algorithm id on the wire.
     pub(crate) alg: KeyAlg,
-    /// The EC private scalar, zeroized on drop; empty for RSA keys.
+    /// The key's secret material, zeroized on drop: the EC private
+    /// scalar, or — for RSA slots — the key's PKCS#1 DER encoding.
     pub(crate) secret: Zeroizing<Vec<u8>>,
-    /// The RSA CRT components, present exactly for `Rsa*` keys.
-    pub(crate) crt: Option<RsaCrt>,
 }
 
 impl SlotKey {
@@ -139,10 +119,17 @@ impl SlotKey {
                 Some(inner)
             }
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-                let crt = self.crt.as_ref()?;
-                let mut inner = Vec::with_capacity(2 + crt.n.len() + 5);
-                crate::data::push_tlv(&mut inner, &[0x81], crt.n.as_slice());
-                crate::data::push_tlv(&mut inner, &[0x82], crt.e.as_slice());
+                // The slot key's PKCS#1 encoding: serve the modulus under
+                // `81` and the public exponent under `82`, as the
+                // reference applet's `getKeyDetails` does.
+                let key = match RsaPrivateKey::from_pkcs1_der(self.secret.as_slice()) {
+                    Ok(key) => key,
+                    Err(_) => return None,
+                };
+                let (n, e) = (key.n().to_bytes_be(), key.e().to_bytes_be());
+                let mut inner = Vec::with_capacity(2 + n.len() + 5);
+                crate::data::push_tlv(&mut inner, &[0x81], &n);
+                crate::data::push_tlv(&mut inner, &[0x82], &e);
                 Some(inner)
             }
             _ => None,

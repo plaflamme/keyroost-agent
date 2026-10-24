@@ -249,43 +249,39 @@ fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
 /// modulus size, numerically below `n` — and the applet answers the
 /// zero-extended raw signature block under `82`; the card applies no
 /// padding, so a block that is not below `n` is refused rather than
-/// mangled. The operation is the CRT form: `x1 = m^dp mod p`,
-/// `x2 = m^dq mod q`, `h = ((x1 - x2) mod p) * qinv mod p`,
-/// `m^d mod n = (q * h + x2) mod n` — the full `d` never exists on the
-/// card.
+/// mangled. The slot's PKCS#1 key is deserialized and the raw operation
+/// runs through the `rsa` crate's hazmat `rsa_decrypt` — no blinding
+/// (`rng = None`), no check — which works the key's CRT exponents when
+/// they are present and falls back to `c^d mod n` otherwise.
 fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
-    use num_bigint_dig::{BigUint, ModInverse};
+    use num_bigint_dig::BigUint;
+    use pkcs1::DecodeRsaPrivateKey;
+    use rsa::hazmat::rsa_decrypt;
+    use rsa::RsaPrivateKey;
+    use rsa::traits::PublicKeyParts;
 
-    let crt = key.crt.as_ref().expect("RSA slot keys carry the CRT set");
-    if block.len() != crt.n.len() {
+    let key = match RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) {
+        Ok(key) => key,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
+    let n = key.n().to_bytes_be();
+    if block.len() != n.len() {
         return Response::sw(SW_WRONG_DATA);
     }
-    let n = BigUint::from_bytes_be(crt.n.as_slice());
-    let m = BigUint::from_bytes_be(block);
-    if m >= n {
+    let c = BigUint::from_bytes_be(block);
+    if &c >= key.n() {
         return Response::sw(SW_WRONG_DATA);
     }
-    let p = BigUint::from_bytes_be(crt.p.as_slice());
-    let q = BigUint::from_bytes_be(crt.q.as_slice());
-    let dp = BigUint::from_bytes_be(crt.dp.as_slice());
-    let dq = BigUint::from_bytes_be(crt.dq.as_slice());
-    let x1 = m.modpow(&dp, &p);
-    let x2 = m.modpow(&dq, &q);
-    // `x1 - x2 (mod p)`: reduce `x2` modulo `p` first, then the `+ p`
-    // keeps the subtraction in the non-negative range BigUint requires.
-    let x2_mod_p = &x2 % &p;
-    let h = (&x1 + &p - &x2_mod_p) % &p;
-    // The inverse of `q` modulo `p` (the `BigInt` the trait returns is
-    // reduced into the positive range).
-    let qinv = q.clone().mod_inverse(&p).expect("p and q are distinct primes");
-    let h = (&h * &qinv).to_biguint().expect("a positive residue") % &p;
-    let s = (&q * &h + &x2) % &n;
+    let m = match rsa_decrypt::<rand_core::OsRng>(None, &key, &c) {
+        Ok(m) => m,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
 
     // Zero-extend the residue to the full modulus size.
-    let s_be = s.to_bytes_be();
-    let mut out = vec![0u8; crt.n.len()];
-    let offset = out.len() - s_be.len();
-    out[offset..].copy_from_slice(&s_be);
+    let m_be = m.to_bytes_be();
+    let mut out = vec![0u8; n.len()];
+    let offset = n.len() - m_be.len();
+    out[offset..].copy_from_slice(&m_be);
     Response::ok(ga_response(GA_TAG_RESPONSE, &out))
 }
 
@@ -422,13 +418,24 @@ struct GaTemplate<'a> {
 
 /// Build the card's GA answer: the `7C` wrapper around one tagged value.
 fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut data = vec![
-        GA_TAG_DYN_AUTH,
-        value.len() as u8 + 2,
-        tag,
-        value.len() as u8,
-    ];
-    data.extend_from_slice(value);
+    fn length(data: &mut Vec<u8>, len: usize) {
+        if len <= 127 {
+            data.push(len as u8);
+        } else if len < 256 {
+            data.push(0x81);
+            data.push(len as u8);
+        } else {
+            data.push(0x82);
+            data.push((len >> 8) as u8);
+            data.push(len as u8);
+        }
+    }
+    let mut inner = vec![tag];
+    length(&mut inner, value.len());
+    inner.extend_from_slice(value);
+    let mut data = vec![GA_TAG_DYN_AUTH];
+    length(&mut data, inner.len());
+    data.extend_from_slice(&inner);
     data
 }
 
@@ -961,6 +968,56 @@ pub(crate) mod tests {
             &[0x2B; 32],
         ));
         assert_eq!(r.sw, SW_INCORRECT_P1P2);
+    }
+
+    #[test]
+    fn ga_slot_rsa_signs_the_hosts_preencoded_block() {
+        let mut applet = PivApplet::new();
+        mgmt_handshake(&mut applet);
+        // 9E is `NEVER` at the factory: the sign round trip needs no VERIFY.
+        let r = applet.process(&keyroost_piv::generate_key(
+            keyroost_piv::Slot::CardAuthentication,
+            keyroost_piv::KeyAlg::Rsa1024.id(),
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
+        ));
+        assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
+        let (n, e) = match keyroost_piv::parse_public_key(&r.data).expect("a template") {
+            keyroost_piv::PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
+            other => panic!("expected an RSA modulus, got {other:?}"),
+        };
+        // The host's pre-encoded DigestInfo block — exactly the modulus size.
+        let mut block = vec![0u8; n.len()];
+        block[n.len() - 1] = 0x2B;
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::Rsa1024.id(),
+            0x9E,
+            &block,
+        ));
+        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
+        let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(s.len(), n.len(), "the answer is zero-extended to the modulus size");
+        use num_bigint_dig::BigUint;
+        assert_eq!(
+            BigUint::from_bytes_be(s)
+                .modpow(&BigUint::from_bytes_be(&e), &BigUint::from_bytes_be(&n)),
+            BigUint::from(0x2Bu8),
+            "s^e == m (mod n)"
+        );
+        // A short block is the wrong length, whatever it says.
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::Rsa1024.id(),
+            0x9E,
+            &block[..block.len() - 1],
+        ));
+        assert_eq!(r.sw, SW_WRONG_DATA);
+        // A block >= n is not a valid residue.
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::Rsa1024.id(),
+            0x9E,
+            &n,
+        ));
+        assert_eq!(r.sw, SW_WRONG_DATA);
     }
 
     #[test]

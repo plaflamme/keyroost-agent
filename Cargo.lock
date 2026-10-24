@@ -738,6 +738,7 @@ dependencies = [
  "p256",
  "p384",
  "p521",
+ "pkcs1",
  "rand_core",
  "rsa",
  "serde",

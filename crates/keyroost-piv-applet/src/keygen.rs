@@ -24,6 +24,7 @@ use elliptic_curve::{FieldBytes, PrimeCurve};
 use num_bigint_dig::BigUint;
 use num_integer::Integer;
 use num_traits::{One, Zero};
+use pkcs1::EncodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
@@ -31,15 +32,17 @@ use zeroize::Zeroizing;
 use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 
 use crate::Response;
-use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH};
+use crate::constants::{
+    SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH,
+};
 use crate::data::push_tlv;
-use crate::slot::{SlotKey, RsaCrt, rsa_modulus_len, slot_index};
+use crate::slot::{SlotKey, rsa_modulus_len, slot_index};
 use crate::{PivApplet, apdu_lc_body};
 
 /// The public exponent every PIV RSA key carries: `0x01 0x00 0x01` (65537).
-/// GENERATE reads it off the generated key; IMPORT assumes it, exactly as
-/// the reference applet does (the import body carries only the CRT
-/// components, never the exponent).
+/// GENERATE keys use it because `RsaPrivateKey::new` fixes it; IMPORT
+/// assumes it, exactly as the reference applet does (the import body
+/// carries only the CRT components, never the exponent).
 const RSA_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
 
 /// The NIST group orders `n`, big endian. The largest scalar the IMPORT
@@ -47,13 +50,13 @@ const RSA_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
 /// `p521` crates' own `ORDER` constants.
 const P256_ORDER: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
 
 const P384_ORDER: [u8; 48] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC7, 0x63, 0x4D, 0x81, 0xF4, 0x37, 0x2D, 0xDF,
-    0x58, 0x1A, 0x0D, 0xB2, 0x48, 0xB0, 0xA7, 0x7A, 0xEC, 0xEC, 0x19, 0x6A, 0xCC, 0xC5, 0x29, 0x73
+    0x58, 0x1A, 0x0D, 0xB2, 0x48, 0xB0, 0xA7, 0x7A, 0xEC, 0xEC, 0x19, 0x6A, 0xCC, 0xC5, 0x29, 0x73,
 ];
 
 const P521_ORDER: [u8; 66] = [
@@ -61,7 +64,7 @@ const P521_ORDER: [u8; 66] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xFF, 0xFA, 0x51, 0x86, 0x87, 0x83, 0xBF, 0x2F, 0x96, 0x6B, 0x7F, 0xCC, 0x01, 0x48, 0xF7, 0x09,
     0xA5, 0xD0, 0x3B, 0xB5, 0xC9, 0xB8, 0x89, 0x9C, 0x47, 0xAE, 0xBB, 0x6F, 0xB7, 0x1E, 0x91, 0x38,
-    0x64, 0x09
+    0x64, 0x09,
 ];
 
 /// An imported scalar checked for one NIST curve: the zeroized canonical
@@ -79,41 +82,33 @@ where
     Some(Zeroizing::new(key.to_bytes().to_vec()))
 }
 
-/// The CRT storage form of a freshly generated RSA key: `p`, `q`,
-/// `d mod (p-1)`, `d mod (q-1)`, the modulus `n` and the public exponent
-/// `e`, each in canonical big-endian bytes and zeroized. `dp` and `dq` are
-/// derived from `d` directly rather than read from the crate's
-/// precomputation (it is best-effort and may be `None`).
-fn generated_rsa_crt(key: &RsaPrivateKey) -> RsaCrt {
-    let (n, e, d) = (key.n().clone(), key.e().clone(), key.d().clone());
-    let (p, q) = (key.primes()[0].clone(), key.primes()[1].clone());
-    let one = BigUint::from(1u32);
-    let (dp, dq) = (&d % &(&p - &one), &d % &(&q - &one));
-    RsaCrt {
-        p: Zeroizing::new(p.to_bytes_be()),
-        q: Zeroizing::new(q.to_bytes_be()),
-        dp: Zeroizing::new(dp.to_bytes_be()),
-        dq: Zeroizing::new(dq.to_bytes_be()),
-        n: Zeroizing::new(n.to_bytes_be()),
-        e: Zeroizing::new(e.to_bytes_be()),
-    }
-}
-
-/// An imported RSA key validated against its modulus size: every component
-/// present, `p`/`q` exactly half the modulus size, `n` the full size, `dp`/
-/// `dq` non-zero and at most half the size, `p`/`q`/`n` odd and greater
-/// than 1, `p != q` and `p * q == n` (checked numerically with `BigUint`).
-/// Stricter than the reference applet, which does none of this — a broken
-/// CRT set would otherwise be stored and fail on first use. The exponent is
-/// assumed to be the PIV standard 65537 (see `RSA_EXPONENT`).
-fn imported_rsa_crt(
+/// An imported RSA key validated against its modulus size and rebuilt as
+/// the card's PKCS#1 storage form. The on-wire set is the reference
+/// applet's CRT member set — `01 p`, `02 q`, `03 dP`, `04 dQ`, `05 n`:
+/// every component present, `p`/`q` exactly half the modulus size, `n`
+/// the full size, `dP`/`dQ` non-zero and at most half the size,
+/// `p`/`q`/`n` odd and greater than 1, `p != q` and `p * q == n` (checked
+/// numerically with `BigUint`). Stricter than the reference applet, which
+/// does none of this — a broken CRT set would otherwise be stored and fail
+/// on first use. The exponent is assumed to be the PIV standard 65537
+/// (see `RSA_EXPONENT`).
+///
+/// The wire carries the CRT halves but the card stores the full key, so
+/// the private exponent is rebuilt from the primes instead:
+/// `RsaPrivateKey::from_p_q` derives `d = e^{-1} mod lcm(p-1, q-1)`
+/// (NIST SP 800-56B 6.2.1) and the modulus `n = p * q` itself, validates
+/// the full key (`d * e ≡ 1` modulo both prime orders) and precomputes the
+/// CRT exponents `to_pkcs1_der` needs. The on-wire `dP`/`dQ` are then only
+/// checked for consistency with the derived `d` (`d ≡ dP (mod p-1)`,
+/// `d ≡ dQ (mod q-1)`) — a mismatched set is refused, never stored.
+fn imported_rsa_secret(
     p: &[u8],
     q: &[u8],
     dp: &[u8],
     dq: &[u8],
     n: &[u8],
     modulus_len: usize,
-) -> Option<RsaCrt> {
+) -> Option<Vec<u8>> {
     let half = modulus_len / 2;
     if p.len() != half
         || q.len() != half
@@ -131,22 +126,22 @@ fn imported_rsa_crt(
             return None;
         }
     }
-    let (p, q, n) = (
-        BigUint::from_bytes_be(p),
-        BigUint::from_bytes_be(q),
-        BigUint::from_bytes_be(n),
-    );
-    if p == q || &p * &q != n {
+    let (p, q) = (BigUint::from_bytes_be(p), BigUint::from_bytes_be(q));
+
+    let mut key = RsaPrivateKey::from_p_q(p, q, BigUint::from_bytes_be(&RSA_EXPONENT)).ok()?;
+
+    if key.n() != &BigUint::from_bytes_be(n) {
         return None;
     }
-    Some(RsaCrt {
-        p: Zeroizing::new(p.to_bytes_be()),
-        q: Zeroizing::new(q.to_bytes_be()),
-        dp: Zeroizing::new(dp.to_vec()),
-        dq: Zeroizing::new(dq.to_vec()),
-        n: Zeroizing::new(n.to_bytes_be()),
-        e: Zeroizing::new(RSA_EXPONENT.to_vec()),
-    })
+
+    key.precompute().ok()?;
+    if key.dp()? != &BigUint::from_bytes_be(dp) {
+        return None;
+    }
+    if key.dq()? != &BigUint::from_bytes_be(dq) {
+        return None;
+    }
+    Some(key.to_pkcs1_der().ok()?.as_bytes().to_vec())
 }
 
 impl PivApplet {
@@ -188,21 +183,21 @@ impl PivApplet {
             Ok(parsed) => parsed,
             Err(()) => return Response::sw(SW_WRONG_DATA),
         };
-        let (secret, crt) = match alg {
+        let secret = match alg {
             KeyAlg::EccP256 => {
                 let key =
                     elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng);
-                (Zeroizing::new(key.to_bytes().to_vec()), None)
+                Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::EccP384 => {
                 let key =
                     elliptic_curve::SecretKey::<p384::NistP384>::random(&mut rand_core::OsRng);
-                (Zeroizing::new(key.to_bytes().to_vec()), None)
+                Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::EccP521 => {
                 let key =
                     elliptic_curve::SecretKey::<p521::NistP521>::random(&mut rand_core::OsRng);
-                (Zeroizing::new(key.to_bytes().to_vec()), None)
+                Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
                 let bits = match alg {
@@ -216,11 +211,18 @@ impl PivApplet {
                     Ok(key) => key,
                     Err(_) => return Response::sw(SW_WRONG_DATA),
                 };
-                (Zeroizing::new(Vec::new()), Some(generated_rsa_crt(&key)))
+                // The card's storage form: the key's PKCS#1 encoding,
+                // zeroized on drop. `new` always precomputes the CRT
+                // exponents, which `to_pkcs1_der` needs for its
+                // `crtCoefficient` field.
+                match key.to_pkcs1_der() {
+                    Ok(doc) => Zeroizing::new(doc.as_bytes().to_vec()),
+                    Err(_) => return Response::sw(SW_WRONG_DATA),
+                }
             }
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let key = SlotKey { alg, secret, crt };
+        let key = SlotKey { alg, secret };
         let inner = match key.public_inner() {
             Some(inner) => inner,
             None => return Response::sw(SW_WRONG_DATA),
@@ -256,20 +258,25 @@ impl PivApplet {
         };
         let alg = match KeyAlg::from_id(*p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
-            Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => alg,
+            Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
+                alg
+            }
             _ => return Response::sw(SW_WRONG_DATA),
         };
         let body = match apdu_lc_body(apdu) {
             Ok((_, body, _)) => body,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
-        let rsa = matches!(alg, KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096);
+        let rsa = matches!(
+            alg,
+            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096
+        );
         let import = match parse_import(body, rsa) {
             Ok(import) => import,
             Err(()) => return Response::sw(SW_WRONG_DATA),
         };
 
-        let (secret, crt) = match alg {
+        let secret = match alg {
             KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
                 // The scalar must be the big-endian encoding of a value in
                 // 1..=n-1 for the requested curve: the curve's field
@@ -298,11 +305,10 @@ impl PivApplet {
                     KeyAlg::EccP521 => imported_secret::<p521::NistP521>(scalar),
                     _ => unreachable!("alg is one of the NIST curves"),
                 };
-                let secret = match secret {
+                match secret {
                     Some(secret) => secret,
                     None => return Response::sw(SW_WRONG_DATA),
-                };
-                (secret, None)
+                }
             }
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
                 // The CRT component set: every member present, sizes
@@ -313,15 +319,14 @@ impl PivApplet {
                     return Response::sw(SW_WRONG_DATA);
                 };
                 let modulus_len = rsa_modulus_len(alg).expect("alg is an RSA key size");
-                let crt = match imported_rsa_crt(p, q, dp, dq, n, modulus_len) {
-                    Some(crt) => crt,
+                match imported_rsa_secret(p, q, dp, dq, n, modulus_len) {
+                    Some(secret) => Zeroizing::new(secret),
                     None => return Response::sw(SW_WRONG_DATA),
-                };
-                (Zeroizing::new(Vec::new()), Some(crt))
+                }
             }
             _ => unreachable!("alg is a NIST curve or an RSA key size"),
         };
-        let key = SlotKey { alg, secret, crt };
+        let key = SlotKey { alg, secret };
         self.commit_slot_key(index, key, true, import.pin_policy, import.touch_policy);
         Response::sw(SW_OK)
     }
@@ -372,8 +377,11 @@ impl PivApplet {
         }
 
         let key = self.slots[source].key.take().expect("checked above");
-        let (pin_policy, touch_policy, imported) =
-            (self.slots[source].pin_policy, self.slots[source].touch_policy, self.slots[source].imported);
+        let (pin_policy, touch_policy, imported) = (
+            self.slots[source].pin_policy,
+            self.slots[source].touch_policy,
+            self.slots[source].imported,
+        );
         if let Some(dest) = dest {
             self.slots[dest].key = Some(key);
             self.slots[dest].pin_policy = pin_policy;
@@ -573,6 +581,8 @@ mod tests {
     };
     use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
     use p256::ecdsa::{SigningKey, VerifyingKey};
+    use pkcs1::DecodeRsaPrivateKey;
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 
     /// A management-unlocked applet: the factory 3DES handshake ran, the
     /// 9B session is unlocked.
@@ -630,7 +640,13 @@ mod tests {
 
     /// A raw IMPORT ASYMMETRIC KEY APDU.
     fn import_apdu(alg: u8, slot: u8, body: &[u8]) -> Vec<u8> {
-        let mut apdu = vec![0x00, INS_IMPORT_ASYM, alg, slot, body.len() as u8];
+        let mut apdu = vec![0x00, INS_IMPORT_ASYM, alg, slot];
+        if body.len() <= 255 {
+            apdu.push(body.len() as u8);
+        } else {
+            // Extended Lc: `00 LL HH`.
+            apdu.extend_from_slice(&[0x00, (body.len() >> 8) as u8, body.len() as u8]);
+        }
         apdu.extend_from_slice(body);
         apdu
     }
@@ -897,15 +913,228 @@ mod tests {
         mgmt_handshake(&mut app);
         let scalar = fixed_scalar();
         assert_eq!(
-            app.process(&import_apdu(0x11, 0x9E, &ec_body(&scalar, None, None))).sw,
+            app.process(&import_apdu(0x11, 0x9E, &ec_body(&scalar, None, None)))
+                .sw,
             SW_OK
         );
         // 9E is `NEVER` at the factory, so no VERIFY is needed: the GA
         // signing path signs the prehashed digest with the imported
         // scalar, verified under the point that scalar derives.
         let sk = SigningKey::from_slice(&scalar).expect("a valid scalar");
-        let point = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let point = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
         crate::general_auth::tests::card_signature(&mut app, 0x9E, &point, &[0x2B; 32]);
+    }
+
+    /// The `81` modulus and `82` exponent in the `7F 49` template of an
+    /// RSA GENERATE response.
+    fn rsa_public_of(r: &Response) -> (Vec<u8>, Vec<u8>) {
+        match parse_public_key(&r.data).expect("a well-formed public-key template") {
+            PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
+            other => panic!("expected an RSA modulus, got {other:?}"),
+        }
+    }
+
+    /// The GA sign round trip for an RSA slot: the host sends a raw block
+    /// under the slot's algorithm id and the card's raw `m^d mod n` answer
+    /// must satisfy `s^e == m (mod n)`.
+    fn rsa_sign_check(app: &mut PivApplet, alg: KeyAlg, slot: u8, n: &[u8], e: &[u8], m: u8) {
+        let mut block = vec![0u8; n.len()];
+        block[n.len() - 1] = m;
+        let r = app.process(&keyroost_piv::general_auth_sign(alg.id(), slot, &block));
+        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
+        let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(
+            s.len(),
+            n.len(),
+            "the answer is zero-extended to the modulus size"
+        );
+        assert_eq!(
+            BigUint::from_bytes_be(s)
+                .modpow(&BigUint::from_bytes_be(e), &BigUint::from_bytes_be(n)),
+            BigUint::from(m),
+        );
+    }
+
+    /// An IMPORT body for the RSA branch: raw single-byte-length TLV members.
+    fn rsa_members(members: &[(u8, &Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (tag, value) in members {
+            body.push(*tag);
+            body.push(value.len() as u8);
+            body.extend_from_slice(value);
+        }
+        body
+    }
+
+    /// A host-side 1024-bit key with its CRT decomposition — the shape of
+    /// the IMPORT body — and its private exponent.
+    struct HostRsa {
+        p: Vec<u8>,
+        q: Vec<u8>,
+        dp: Vec<u8>,
+        dq: Vec<u8>,
+        d: Vec<u8>,
+        n: Vec<u8>,
+    }
+
+    fn host_rsa_1024() -> HostRsa {
+        let host = RsaPrivateKey::new(&mut rand_core::OsRng, 1024).expect("a 1024-bit key");
+        let (p, q) = (&host.primes()[0], &host.primes()[1]);
+        let d = host.d().clone();
+        let one = BigUint::from(1u32);
+        HostRsa {
+            p: p.to_bytes_be(),
+            q: q.to_bytes_be(),
+            dp: (d.clone() % (p.clone() - &one)).to_bytes_be(),
+            dq: (d.clone() % (q.clone() - &one)).to_bytes_be(),
+            d: d.to_bytes_be(),
+            n: host.n().to_bytes_be(),
+        }
+    }
+
+    #[test]
+    fn generate_rsa1024_stores_pkcs1_and_signs() {
+        let mut app = unlocked();
+        let alg = KeyAlg::Rsa1024;
+        // 9E is `NEVER` at the factory: the sign round trip needs no VERIFY.
+        let r = app.process(&generate_key(
+            Slot::CardAuthentication,
+            alg.id(),
+            PinPolicy::Default,
+            TouchPolicy::Default,
+        ));
+        assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
+        let (n, e) = rsa_public_of(&r);
+        assert_eq!(n.len(), 128);
+        assert_ne!(n[127] & 1, 0, "the modulus is odd");
+        assert_eq!(e, [0x01u8, 0x00, 0x01]);
+        // The stored secret is the PKCS#1 key itself: it decodes and
+        // carries the announced modulus and exponent.
+        let key = app.slots[3].key.as_ref().expect("the generated key");
+        let stored =
+            RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()).expect("a PKCS#1 RSAPrivateKey");
+        assert_eq!(stored.n().to_bytes_be(), n);
+        assert_eq!(stored.e().to_bytes_be(), e);
+        rsa_sign_check(&mut app, alg, 0x9E, &n, &e, 0x2B);
+    }
+
+    #[test]
+    fn imported_rsa_key_round_trips() {
+        let mut app = unlocked();
+        // Several keys so both `p < q` and `p > q` orderings are exercised.
+        for _ in 0..4 {
+            let host = host_rsa_1024();
+            let body = rsa_members(&[
+                (0x01, &host.p),
+                (0x02, &host.q),
+                (0x03, &host.dp),
+                (0x04, &host.dq),
+                (0x05, &host.n),
+            ]);
+            assert_eq!(
+                app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, &body))
+                    .sw,
+                SW_OK,
+                "IMPORT"
+            );
+            // The stored key is the host key: same modulus, and the
+            // exponent `from_p_q` derives from the primes — `e^{-1} mod
+            // lambda(n)` with `lambda(n) = lcm(p-1, q-1)` — is exactly the
+            // host's own `d` reduced to that modulus (the host's `d` is
+            // generated modulo phi(n), a multiple of lambda(n)). The GA
+            // round trip below proves the two sign the same thing.
+            let key = app.slots[3].key.as_ref().expect("the imported key");
+            let stored = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice())
+                .expect("a PKCS#1 RSAPrivateKey");
+            assert_eq!(stored.n().to_bytes_be(), host.n);
+            let one = BigUint::from(1u32);
+            let lambda = (BigUint::from_bytes_be(&host.p) - &one)
+                .lcm(&(BigUint::from_bytes_be(&host.q) - &one));
+            assert_eq!(
+                *stored.d(),
+                BigUint::from_bytes_be(&host.d) % &lambda,
+                "the stored exponent is the host's mod lambda(n)"
+            );
+            rsa_sign_check(
+                &mut app,
+                KeyAlg::Rsa1024,
+                0x9E,
+                &host.n,
+                &[0x01, 0x00, 0x01],
+                0x5A,
+            );
+        }
+    }
+
+    #[test]
+    fn imported_rsa_refusals_leave_the_slot_empty() {
+        let mut app = unlocked();
+        let host = host_rsa_1024();
+        let mut bad_n = host.n.clone();
+        bad_n[64] ^= 1; // `p * q` no longer matches `n`
+        let bad_dp = {
+            let mut v = vec![0u8];
+            v.extend_from_slice(&host.dp);
+            v
+        };
+        let mut even_p = host.p.clone();
+        let last = even_p.len() - 1;
+        even_p[last] &= 0xFE;
+        let bad_half = {
+            let mut v = host.dp.clone();
+            let last = v.len() - 1;
+            v[last] ^= 0x01; // `dP` no longer matches `d mod (p-1)`
+            v
+        };
+        let bodies: [Vec<u8>; 5] = [
+            rsa_members(&[
+                (0x01, &host.p),
+                (0x02, &host.q),
+                (0x03, &host.dp),
+                (0x04, &host.dq),
+                (0x05, &bad_n),
+            ]),
+            rsa_members(&[
+                (0x01, &host.p),
+                (0x02, &host.q),
+                (0x04, &host.dq),
+                (0x05, &host.n),
+            ]), // missing dP
+            rsa_members(&[
+                (0x01, &host.p),
+                (0x02, &host.q),
+                (0x03, &bad_dp),
+                (0x04, &host.dq),
+                (0x05, &host.n),
+            ]),
+            rsa_members(&[
+                (0x01, &even_p),
+                (0x02, &host.q),
+                (0x03, &host.dp),
+                (0x04, &host.dq),
+                (0x05, &host.n),
+            ]),
+            rsa_members(&[
+                (0x01, &host.p),
+                (0x02, &host.q),
+                (0x03, &bad_half),
+                (0x04, &host.dq),
+                (0x05, &host.n),
+            ]),
+        ];
+        for body in &bodies {
+            assert_eq!(
+                app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, body))
+                    .sw,
+                SW_WRONG_DATA,
+                "body {body:02X?}"
+            );
+        }
+        assert!(app.slots[3].key.is_none());
     }
 
     /// Read an object back through the host's GET DATA builder; the test
@@ -924,19 +1153,24 @@ mod tests {
         mgmt_handshake(&mut app);
         let scalar = fixed_scalar();
         assert_eq!(
-            app
-                .process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, Some(0x02), Some(0x02))))
-                .sw,
+            app.process(&import_apdu(
+                0x11,
+                0x9C,
+                &ec_body(&scalar, Some(0x02), Some(0x02))
+            ))
+            .sw,
             SW_OK
         );
         let cert_a = b"source-cert";
         let cert_b = b"dest-cert";
         assert_eq!(
-            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0A], cert_a)).sw,
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0A], cert_a))
+                .sw,
             SW_OK
         );
         assert_eq!(
-            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0D], cert_b)).sw,
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0D], cert_b))
+                .sw,
             SW_OK
         );
 
@@ -952,7 +1186,10 @@ mod tests {
         let source = &app.slots[slot_index(0x9C).expect("9C")];
         let dest = &app.slots[slot_index(0x82).expect("retired 1")];
         assert!(source.key.is_none(), "the source keeps no key");
-        assert_eq!(dest.key.as_ref().expect("the key moved").secret.as_slice(), &scalar);
+        assert_eq!(
+            dest.key.as_ref().expect("the key moved").secret.as_slice(),
+            &scalar
+        );
         assert_eq!(dest.pin_policy, PinPolicy::Once);
         assert_eq!(dest.touch_policy, 0x02);
         assert!(dest.imported);
@@ -967,18 +1204,21 @@ mod tests {
         mgmt_handshake(&mut app);
         let scalar = fixed_scalar();
         assert_eq!(
-            app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None))).sw,
+            app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
+                .sw,
             SW_OK
         );
         assert_eq!(
-            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x05], b"auth-cert")).sw,
+            app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x05], b"auth-cert"))
+                .sw,
             SW_OK
         );
 
         assert_eq!(
-            app
-                .process(&keyroost_piv::delete_key(keyroost_piv::Slot::Authentication))
-                .sw,
+            app.process(&keyroost_piv::delete_key(
+                keyroost_piv::Slot::Authentication
+            ))
+            .sw,
             SW_OK,
             "delete"
         );
@@ -1007,8 +1247,7 @@ mod tests {
             SW_NOT_FOUND
         );
         assert_eq!(
-            app
-                .process(&keyroost_piv::delete_key(keyroost_piv::Slot::KeyManagement))
+            app.process(&keyroost_piv::delete_key(keyroost_piv::Slot::KeyManagement))
                 .sw,
             SW_NOT_FOUND
         );
@@ -1017,13 +1256,19 @@ mod tests {
     #[test]
     fn move_key_refusals() {
         let mut app = PivApplet::new();
-        assert_eq!(app.process(&[0x00, 0xF6, 0x9C, 0x9A]).sw, SW_SECURITY_NOT_SATISFIED);
+        assert_eq!(
+            app.process(&[0x00, 0xF6, 0x9C, 0x9A]).sw,
+            SW_SECURITY_NOT_SATISFIED
+        );
         mgmt_handshake(&mut app);
         // F9 is not in the slot table, in either position; neither is 9B.
         assert_eq!(app.process(&[0x00, 0xF6, 0xF9, 0x9A]).sw, SW_INCORRECT_P1P2);
         assert_eq!(app.process(&[0x00, 0xF6, 0x9C, 0xF9]).sw, SW_INCORRECT_P1P2);
         assert_eq!(app.process(&[0x00, 0xF6, 0x9B, 0x9A]).sw, SW_INCORRECT_P1P2);
-        assert_eq!(app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).sw, SW_CLA_NOT_SUPPORTED);
+        assert_eq!(
+            app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).sw,
+            SW_CLA_NOT_SUPPORTED
+        );
     }
 
     #[test]
@@ -1033,11 +1278,13 @@ mod tests {
         let scalar = fixed_scalar();
         let other = [0x5E; 32];
         assert_eq!(
-            app.process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, None, None))).sw,
+            app.process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, None, None)))
+                .sw,
             SW_OK
         );
         assert_eq!(
-            app.process(&import_apdu(0x11, 0x9D, &ec_body(&other, None, None))).sw,
+            app.process(&import_apdu(0x11, 0x9D, &ec_body(&other, None, None)))
+                .sw,
             SW_OK
         );
 
@@ -1065,7 +1312,10 @@ mod tests {
             source.key.as_ref().expect("still there").secret.as_slice(),
             &scalar
         );
-        assert_eq!(dest.key.as_ref().expect("still there").secret.as_slice(), &other);
+        assert_eq!(
+            dest.key.as_ref().expect("still there").secret.as_slice(),
+            &other
+        );
     }
 
     /// A GENERATE APDU for a specific algorithm and slot: the host's own
@@ -1078,20 +1328,32 @@ mod tests {
     fn generate_produces_each_nist_curve() {
         let mut app = unlocked();
         // 9C: P-384, a 97-byte point on the curve.
-        let r = app.process(&gen_apdu_for(keyroost_piv::Slot::Signature, KeyAlg::EccP384));
+        let r = app.process(&gen_apdu_for(
+            keyroost_piv::Slot::Signature,
+            KeyAlg::EccP384,
+        ));
         assert_eq!(r.sw, SW_OK);
         let point = point_of(&r);
         assert_eq!(point.len(), 97);
         p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-384 point");
-        assert_eq!(app.slots[1].key.as_ref().expect("a key").alg, KeyAlg::EccP384);
+        assert_eq!(
+            app.slots[1].key.as_ref().expect("a key").alg,
+            KeyAlg::EccP384
+        );
 
         // 9D: P-521, a 133-byte point on the curve.
-        let r = app.process(&gen_apdu_for(keyroost_piv::Slot::KeyManagement, KeyAlg::EccP521));
+        let r = app.process(&gen_apdu_for(
+            keyroost_piv::Slot::KeyManagement,
+            KeyAlg::EccP521,
+        ));
         assert_eq!(r.sw, SW_OK);
         let point = point_of(&r);
         assert_eq!(point.len(), 133);
         p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-521 point");
-        assert_eq!(app.slots[2].key.as_ref().expect("a key").alg, KeyAlg::EccP521);
+        assert_eq!(
+            app.slots[2].key.as_ref().expect("a key").alg,
+            KeyAlg::EccP521
+        );
     }
 
     #[test]
@@ -1105,8 +1367,15 @@ mod tests {
             v
         };
         let body = ec_body(&scalar, None, None);
-        assert_eq!(app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9A, &body)).sw, SW_OK);
-        assert_eq!(app.slots[0].key.as_ref().expect("a key").alg, KeyAlg::EccP384);
+        assert_eq!(
+            app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9A, &body))
+                .sw,
+            SW_OK
+        );
+        assert_eq!(
+            app.slots[0].key.as_ref().expect("a key").alg,
+            KeyAlg::EccP384
+        );
         assert!(app.slots[0].imported);
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         use p384::elliptic_curve::sec1::ToEncodedPoint;
@@ -1116,7 +1385,8 @@ mod tests {
             .to_encoded_point(false);
         let expected_point = expected_point.as_bytes();
         assert_eq!(
-            app.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            app.process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         let digest = [0x2C; 48];
@@ -1139,8 +1409,15 @@ mod tests {
             v
         };
         let body = ec_body(&scalar, None, None);
-        assert_eq!(app.process(&import_apdu(KeyAlg::EccP521.id(), 0x82, &body)).sw, SW_OK);
-        assert_eq!(app.slots[4].key.as_ref().expect("a key").alg, KeyAlg::EccP521);
+        assert_eq!(
+            app.process(&import_apdu(KeyAlg::EccP521.id(), 0x82, &body))
+                .sw,
+            SW_OK
+        );
+        assert_eq!(
+            app.slots[4].key.as_ref().expect("a key").alg,
+            KeyAlg::EccP521
+        );
         assert!(app.slots[4].imported);
     }
 
@@ -1153,18 +1430,30 @@ mod tests {
         let short = [0x2B; 32];
         let mid: Vec<u8> = vec![0x2B; 48];
         assert_eq!(
-            app.process(&import_apdu(KeyAlg::EccP256.id(), 0x9C, &ec_body(&long, None, None)))
-                .sw,
+            app.process(&import_apdu(
+                KeyAlg::EccP256.id(),
+                0x9C,
+                &ec_body(&long, None, None)
+            ))
+            .sw,
             SW_WRONG_DATA
         );
         assert_eq!(
-            app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9C, &ec_body(&short, None, None)))
-                .sw,
+            app.process(&import_apdu(
+                KeyAlg::EccP384.id(),
+                0x9C,
+                &ec_body(&short, None, None)
+            ))
+            .sw,
             SW_WRONG_DATA
         );
         assert_eq!(
-            app.process(&import_apdu(KeyAlg::EccP521.id(), 0x9C, &ec_body(&mid, None, None)))
-                .sw,
+            app.process(&import_apdu(
+                KeyAlg::EccP521.id(),
+                0x9C,
+                &ec_body(&mid, None, None)
+            ))
+            .sw,
             SW_WRONG_DATA
         );
         // Zero scalars and group orders, per curve: the range check refuses
@@ -1176,7 +1465,8 @@ mod tests {
         ] {
             let zero = vec![0u8; size];
             assert_eq!(
-                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&zero, None, None))).sw,
+                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&zero, None, None)))
+                    .sw,
                 SW_WRONG_DATA
             );
             let order = match alg {
@@ -1186,7 +1476,8 @@ mod tests {
                 _ => unreachable!("a NIST curve"),
             };
             assert_eq!(
-                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&order, None, None))).sw,
+                app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&order, None, None)))
+                    .sw,
                 SW_WRONG_DATA
             );
         }

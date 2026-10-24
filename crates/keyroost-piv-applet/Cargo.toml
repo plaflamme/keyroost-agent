@@ -27,12 +27,18 @@ ecdsa = { version = "0.16.0" }
 # line. Both crates are already in the workspace lockfile (ssh-key pulls
 # rsa 0.9.10), so this resolves offline with no new versions.
 rsa = { version = "0.9", features = ["serde", "hazmat"] }
+# PKCS#1 ("RSAPrivateKey") is the on-card storage format for RSA slots: the
+# slot keeps the `rsa` crate's key serialized with `to_pkcs1_der` in the same
+# `secret` buffer the EC slots use for their scalar, and deserializes it for
+# each operation. `alloc` for the byte-vector document API, `pkcs8` for the
+# blanket `Encode/DecodeRsaPrivateKey` impls the `rsa` crate relies on.
+pkcs1 = { version = "0.7", features = ["alloc", "pkcs8"] }
 # The BigUint crate rsa 0.9 depends on (as `num_bigint`), as a direct dep
-# because `mod_inverse` (qinv for the raw CRT op) is a trait method on
-# `num_bigint_dig::traits::ModInverse` and rsa re-exports only the `BigUint`
-# type, not the trait. Default features off: rsa enables the features this
-# crate needs, and `std` would drag in `rand/std` + `serde` for no benefit
-# (the BigUint core and ModInverse are no-std).
+# for the numeric checks on the imported RSA components (`p * q == n`,
+# the `dP`/`dQ` consistency residues) that `rsa` itself leaves to the
+# caller. Default features off: rsa enables the features this crate needs,
+# and `std` would drag in `rand/std` + `serde` for no benefit (the BigUint
+# core is no-std).
 num-bigint-dig = { version = "0.8", default-features = false }
 # `num-integer` for the `Integer::is_even` primality pre-checks on the
 # imported RSA factors, `num-traits` for `is_zero`/`is_one`; both are
