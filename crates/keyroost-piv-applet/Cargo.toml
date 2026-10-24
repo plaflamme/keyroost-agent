@@ -26,7 +26,7 @@ ecdsa = { version = "0.16.0" }
 # RSA slots (T10, staged by spike keyroost-agent-rpx): the RustCrypto RSA
 # line. Both crates are already in the workspace lockfile (ssh-key pulls
 # rsa 0.9.10), so this resolves offline with no new versions.
-rsa = "0.9"
+rsa = { version = "0.9", features = ["serde", "hazmat"] }
 # The BigUint crate rsa 0.9 depends on (as `num_bigint`), as a direct dep
 # because `mod_inverse` (qinv for the raw CRT op) is a trait method on
 # `num_bigint_dig::traits::ModInverse` and rsa re-exports only the `BigUint`
@@ -34,6 +34,12 @@ rsa = "0.9"
 # crate needs, and `std` would drag in `rand/std` + `serde` for no benefit
 # (the BigUint core and ModInverse are no-std).
 num-bigint-dig = { version = "0.8", default-features = false }
+# `num-integer` for the `Integer::is_even` primality pre-checks on the
+# imported RSA factors, `num-traits` for `is_zero`/`is_one`; both are
+# already in the tree through `num-bigint-dig`. `default-features = false`
+# keeps `std` out of the BigInt stack.
+num-integer = { version = "0.1", default-features = false }
+num-traits = { version = "0.2", default-features = false }
 # Secret card state (PIN/PUK, management key, private key material) lives in
 # Zeroizing containers.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
@@ -51,3 +57,4 @@ getrandom = "0.2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = "1.0.229"

@@ -20,6 +20,7 @@
 //!   the session's `pin.verified` flag and the [`PivApplet::pin_always_armed`]
 //!   latch; [`SW_SECURITY_STATUS_NOT_SATISFIED`] otherwise.
 
+use elliptic_curve::sec1::ToEncodedPoint;
 use keyroost_piv::{KeyAlg, PinPolicy};
 use zeroize::Zeroizing;
 
@@ -54,18 +55,111 @@ pub(crate) struct Slot {
     pub(crate) cert: Option<Vec<u8>>,
 }
 
+/// The RSA CRT private-key components, each zeroized on drop and stored
+/// big-endian: the modulus `n` (the `05`/`PQ` wire member) with its prime
+/// factors `p` and `q`, the CRT exponents `dP1`/`dQ1` (`d` reduced modulo
+/// `p - 1` / `q - 1`) and the public exponent `e` (65537 — the card never
+/// re-derives it, so it is stored and served verbatim).
+///
+/// The set is the reference's IMPORT member set (`01`/`02`/`03`/`04`/`05`)
+/// plus the exponent GENERATE answers under `82`. Signing never reconstructs
+/// the full `d`: the raw operation is the two `mod_pow` halves recombined
+/// through the CRT (see `general_auth::slot_rsa_raw`).
+pub(crate) struct RsaCrt {
+    /// Prime factor `p` (`01`), half the modulus size.
+    pub(crate) p: Zeroizing<Vec<u8>>,
+    /// Prime factor `q` (`02`), half the modulus size.
+    pub(crate) q: Zeroizing<Vec<u8>>,
+    /// `d mod (p - 1)` (`03`), at most half the modulus size.
+    pub(crate) dp: Zeroizing<Vec<u8>>,
+    /// `d mod (q - 1)` (`04`), at most half the modulus size.
+    pub(crate) dq: Zeroizing<Vec<u8>>,
+    /// The modulus `n = p * q` (`05`), the full modulus size.
+    pub(crate) n: Zeroizing<Vec<u8>>,
+    /// The public exponent `e` (65537), big-endian, unpadded.
+    pub(crate) e: Zeroizing<Vec<u8>>,
+}
+
 /// A key held in a slot.
 ///
-/// The material is the curve's private scalar — a zeroized big-endian
-/// value, 32 bytes (P-256), 48 (P-384) or 66 (P-521) — the RSA CRT
-/// component set replaces this field with its own representation when T10
-/// lands.
+/// An EC key's material is the curve's private scalar — a zeroized
+/// big-endian value, 32 bytes (P-256), 48 (P-384) or 66 (P-521), in
+/// `secret`. An RSA key's material is the CRT component set in `crt`; its
+/// `secret` stays empty so the EC code paths read it unchanged.
 #[allow(dead_code)] // read by slot GA (T3) and GET METADATA (T5).
 pub(crate) struct SlotKey {
     /// The key's algorithm — the slot's key-algorithm id on the wire.
     pub(crate) alg: KeyAlg,
-    /// The private scalar, zeroized on drop.
+    /// The EC private scalar, zeroized on drop; empty for RSA keys.
     pub(crate) secret: Zeroizing<Vec<u8>>,
+    /// The RSA CRT components, present exactly for `Rsa*` keys.
+    pub(crate) crt: Option<RsaCrt>,
+}
+
+impl SlotKey {
+    /// The `7F49`-inner public-key TLVs this key reports — the same shape
+    /// GENERATE's answer, the GET METADATA `04` member and the host's
+    /// `parse_public_key`/`parse_metadata` all carry: the uncompressed
+    /// point under `86` for EC keys, the modulus under `81` and the
+    /// exponent under `82` for RSA keys. `None` for an algorithm this
+    /// applet does not store.
+    pub(crate) fn public_inner(&self) -> Option<Vec<u8>> {
+        match self.alg {
+            KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
+                let point = match self.alg {
+                    KeyAlg::EccP256 => {
+                        let signing = ecdsa::SigningKey::<p256::NistP256>::from_slice(
+                            &self.secret[..32],
+                        )
+                        .ok()?;
+                        signing.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+                    }
+                    KeyAlg::EccP384 => {
+                        let signing = ecdsa::SigningKey::<p384::NistP384>::from_slice(
+                            &self.secret[..48],
+                        )
+                        .ok()?;
+                        signing.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+                    }
+                    KeyAlg::EccP521 => {
+                        // The generic `SecretKey` derivation — the ECDH path's
+                        // own route — since `NistP521` does not satisfy the
+                        // `ecdsa` crate's signing bounds.
+                        let secret =
+                            elliptic_curve::SecretKey::<p521::NistP521>::from_slice(
+                                &self.secret[..],
+                            )
+                            .ok()?;
+                        secret.public_key().to_encoded_point(false).as_bytes().to_vec()
+                    }
+                    _ => unreachable!("the outer match arm holds only the EC curves"),
+                };
+                let mut inner = Vec::with_capacity(2 + point.len());
+                crate::data::push_tlv(&mut inner, &[0x86], &point);
+                Some(inner)
+            }
+            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+                let crt = self.crt.as_ref()?;
+                let mut inner = Vec::with_capacity(2 + crt.n.len() + 5);
+                crate::data::push_tlv(&mut inner, &[0x81], crt.n.as_slice());
+                crate::data::push_tlv(&mut inner, &[0x82], crt.e.as_slice());
+                Some(inner)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The modulus size in bytes of an RSA algorithm id — `None` for
+/// non-RSA algorithms.
+pub(crate) fn rsa_modulus_len(alg: KeyAlg) -> Option<usize> {
+    match alg {
+        KeyAlg::Rsa1024 => Some(128),
+        KeyAlg::Rsa2048 => Some(256),
+        KeyAlg::Rsa3072 => Some(384),
+        KeyAlg::Rsa4096 => Some(512),
+        _ => None,
+    }
 }
 
 impl Slot {

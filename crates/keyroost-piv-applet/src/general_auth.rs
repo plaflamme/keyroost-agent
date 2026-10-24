@@ -76,7 +76,12 @@ impl PivApplet {
     /// one-shot dynamic-auth template — an empty `82` plus exactly one
     /// data member. The applet answers the signature or shared secret
     /// under `82`.
-    fn ga_slot(&self, index: usize, p1: u8, lc_body: Result<(u8, &[u8]), ()>) -> Response {
+    fn ga_slot(
+        &self,
+        index: usize,
+        p1: u8,
+        lc_body: Result<(usize, &[u8], &[u8]), ()>,
+    ) -> Response {
         if let Err(sw) = self.slot_pin_gate(&self.slots[index]) {
             return Response::sw(sw);
         }
@@ -86,8 +91,8 @@ impl PivApplet {
         if p1 != key.alg.id() {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let (_lc, body) = match lc_body {
-            Ok(pair) => pair,
+        let (_lc, body, _) = match lc_body {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
         let t = match parse_ga_template(body) {
@@ -101,9 +106,11 @@ impl PivApplet {
         }
         match (t.challenge, t.exponent) {
             (Some(digest), None) => {
-                // The digest must be the slot curve's field size: the host
-                // hashes with the curve's hash (SHA-256/384/512).
-                let Some(size) = ec_field_bytes(key.alg) else {
+                // The member must be the slot's sign input: the curve's
+                // field size for EC (the host hashes with the curve's
+                // hash), the modulus size for RSA (the host's pre-encoded
+                // DigestInfo block).
+                let Some(size) = ga_sign_block_bytes(key.alg) else {
                     return Response::sw(SW_WRONG_DATA);
                 };
                 if digest.len() != size {
@@ -128,9 +135,13 @@ impl PivApplet {
     /// The 9B (management-key) half of GENERAL AUTHENTICATE: P1 selects the
     /// symmetric or an asymmetric algorithm, the body carries the
     /// dynamic-auth template.
-    fn ga_management(&mut self, p1: u8, lc_body: Result<(u8, &[u8]), ()>) -> Response {
-        let (_lc, body) = match lc_body {
-            Ok(pair) => pair,
+    fn ga_management(
+        &mut self,
+        p1: u8,
+        lc_body: Result<(usize, &[u8], &[u8]), ()>,
+    ) -> Response {
+        let (_lc, body, _) = match lc_body {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
         let tmpl = match parse_ga_template(body) {
@@ -189,13 +200,19 @@ impl PivApplet {
     }
 }
 
-/// The pre-hashed digest size a GA signature on `alg` expects: the curve's
-/// field byte size.
-fn ec_field_bytes(alg: KeyAlg) -> Option<usize> {
+/// The size of the `81` member a GA signature on `alg` expects: the curve's
+/// field byte size for EC (the host hashes with the curve's hash) and the
+/// modulus size for RSA (the host sends the pre-encoded PKCS#1 v1.5
+/// DigestInfo block — the card applies no padding).
+fn ga_sign_block_bytes(alg: KeyAlg) -> Option<usize> {
     match alg {
         KeyAlg::EccP256 => Some(32),
         KeyAlg::EccP384 => Some(48),
         KeyAlg::EccP521 => Some(66),
+        KeyAlg::Rsa1024 => Some(128),
+        KeyAlg::Rsa2048 => Some(256),
+        KeyAlg::Rsa3072 => Some(384),
+        KeyAlg::Rsa4096 => Some(512),
         _ => None,
     }
 }
@@ -210,17 +227,66 @@ fn ec_point_bytes(alg: KeyAlg) -> Option<usize> {
     }
 }
 
-/// The ECDSA half of the slot GA: the host sends the pre-hashed digest
-/// (hashed with the slot curve's hash — SHA-256/384/512 for
-/// P-256/384/521) and the applet answers the DER-encoded signature under
-/// `82`.
+/// The signature half of the slot GA: ECDSA for the EC slots (the host
+/// sends the pre-hashed digest — hashed with the slot curve's hash, SHA-
+/// 256/384/512 for P-256/384/521 — and the applet answers the DER-encoded
+/// signature under `82`), the raw CRT operation for the RSA slots (the
+/// host's pre-encoded DigestInfo block comes back raw under `82`).
 fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
     match key.alg {
         KeyAlg::EccP256 => sign_p256(key, digest),
         KeyAlg::EccP384 => sign_p384(key, digest),
         KeyAlg::EccP521 => sign_p521(key, digest),
+        KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+            slot_rsa_raw(key, digest)
+        }
         _ => Response::sw(SW_WRONG_DATA),
     }
+}
+
+/// The RSA half of the slot GA: the raw `m^d mod n` operation. The host
+/// sends the pre-encoded PKCS#1 v1.5 DigestInfo block — exactly the
+/// modulus size, numerically below `n` — and the applet answers the
+/// zero-extended raw signature block under `82`; the card applies no
+/// padding, so a block that is not below `n` is refused rather than
+/// mangled. The operation is the CRT form: `x1 = m^dp mod p`,
+/// `x2 = m^dq mod q`, `h = ((x1 - x2) mod p) * qinv mod p`,
+/// `m^d mod n = (q * h + x2) mod n` — the full `d` never exists on the
+/// card.
+fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
+    use num_bigint_dig::{BigUint, ModInverse};
+
+    let crt = key.crt.as_ref().expect("RSA slot keys carry the CRT set");
+    if block.len() != crt.n.len() {
+        return Response::sw(SW_WRONG_DATA);
+    }
+    let n = BigUint::from_bytes_be(crt.n.as_slice());
+    let m = BigUint::from_bytes_be(block);
+    if m >= n {
+        return Response::sw(SW_WRONG_DATA);
+    }
+    let p = BigUint::from_bytes_be(crt.p.as_slice());
+    let q = BigUint::from_bytes_be(crt.q.as_slice());
+    let dp = BigUint::from_bytes_be(crt.dp.as_slice());
+    let dq = BigUint::from_bytes_be(crt.dq.as_slice());
+    let x1 = m.modpow(&dp, &p);
+    let x2 = m.modpow(&dq, &q);
+    // `x1 - x2 (mod p)`: reduce `x2` modulo `p` first, then the `+ p`
+    // keeps the subtraction in the non-negative range BigUint requires.
+    let x2_mod_p = &x2 % &p;
+    let h = (&x1 + &p - &x2_mod_p) % &p;
+    // The inverse of `q` modulo `p` (the `BigInt` the trait returns is
+    // reduced into the positive range).
+    let qinv = q.clone().mod_inverse(&p).expect("p and q are distinct primes");
+    let h = (&h * &qinv).to_biguint().expect("a positive residue") % &p;
+    let s = (&q * &h + &x2) % &n;
+
+    // Zero-extend the residue to the full modulus size.
+    let s_be = s.to_bytes_be();
+    let mut out = vec![0u8; crt.n.len()];
+    let offset = out.len() - s_be.len();
+    out[offset..].copy_from_slice(&s_be);
+    Response::ok(ga_response(GA_TAG_RESPONSE, &out))
 }
 
 /// The ECDSA half for one curve: the `32`/`48`/`66`-byte scalar is the

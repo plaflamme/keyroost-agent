@@ -204,7 +204,7 @@ impl PivApplet {
         // PIN/ALWAYS latch.
         let pin_presentation = *ins == keyroost_piv::Instruction::Verify as u8
             && apdu.get(2) == Some(&0x00)
-            && matches!(apdu_lc_body(apdu), Ok((_, body)) if body.len() == 8);
+            && matches!(apdu_lc_body(apdu), Ok((_, body, _)) if body.len() == 8);
         let response = match Instruction::from_code(*ins) {
             Some(Instruction::Select) => self.process_select(apdu),
             Some(Instruction::Verify) => self.process_verify(apdu),
@@ -276,18 +276,37 @@ pub(crate) fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
     }
 }
 
-/// The `Lc` and body of a case-3 APDU: `Ok((lc, body))`, `Err(())` when
-/// `Lc` overruns the APDU — the caller answers
-/// [`keyroost_piv::SW_WRONG_LENGTH`]. A case-1/2 APDU carries no length byte
-/// at all and reads as an empty body.
-pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(u8, &[u8]), ()> {
-    let lc = match apdu.get(4) {
-        Some(&lc) => lc,
-        None => return Ok((0, &[])),
+/// The `Lc`, body and trailing bytes of a case-3/4 APDU:
+/// `Ok((lc, body, tail))`, where `tail` is the remainder after the body —
+/// the `Le` byte of a case-4 APDU, for the caller to read through
+/// [`apdu_le`] — and `Err(())` when `Lc` overruns the APDU: the caller
+/// answers [`keyroost_piv::SW_WRONG_LENGTH`]. A case-1/2 APDU carries no
+/// length byte at all and reads as an empty body.
+///
+/// Both the short form and the extended form are accepted: a non-zero byte
+/// at index 4 is the short `Lc` with the body at byte 5; a `0x00` there is
+/// either a case-4 APDU carrying no command data (a `Le` follows, the APDU
+/// is at most 6 bytes) or the extended marker, with `Lc` as the two-byte
+/// value at bytes 5–6 and the body at byte 7 — the host's `build_apdu_ext`
+/// form, which the large PUT DATA and IMPORT ASYMMETRIC KEY bodies use.
+pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(usize, &[u8], &[u8]), ()> {
+    let first = match apdu.get(4) {
+        Some(&b) => b,
+        None => return Ok((0, &[], &[])),
     };
-    apdu.get(5..5 + usize::from(lc))
-        .map(|body| (lc, body))
-        .ok_or(())
+    if first != 0 {
+        let lc = usize::from(first);
+        let Some(body) = apdu.get(5..5 + lc) else { return Err(()) };
+        return Ok((lc, body, &apdu[5 + lc..]));
+    }
+    // The zero leading length byte: a case-4 APDU with no command data, or
+    // (at 7 bytes and up) the extended marker.
+    if apdu.len() < 7 {
+        return Ok((0, &[], &apdu[5..]));
+    }
+    let lc = (usize::from(apdu[5]) << 8) | usize::from(apdu[6]);
+    let Some(body) = apdu.get(7..7 + lc) else { return Err(()) };
+    Ok((lc, body, &apdu[7 + lc..]))
 }
 
 /// The `63Cx` status word carrying `tries` remaining in the low nibble of

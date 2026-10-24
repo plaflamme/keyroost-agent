@@ -21,6 +21,11 @@
 //! `6A86`.
 
 use elliptic_curve::{FieldBytes, PrimeCurve};
+use num_bigint_dig::BigUint;
+use num_integer::Integer;
+use num_traits::{One, Zero};
+use rsa::RsaPrivateKey;
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
 
 use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
@@ -28,8 +33,14 @@ use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 use crate::Response;
 use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH};
 use crate::data::push_tlv;
-use crate::slot::{SlotKey, slot_index};
+use crate::slot::{SlotKey, RsaCrt, rsa_modulus_len, slot_index};
 use crate::{PivApplet, apdu_lc_body};
+
+/// The public exponent every PIV RSA key carries: `0x01 0x00 0x01` (65537).
+/// GENERATE reads it off the generated key; IMPORT assumes it, exactly as
+/// the reference applet does (the import body carries only the CRT
+/// components, never the exponent).
+const RSA_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
 
 /// The NIST group orders `n`, big endian. The largest scalar the IMPORT
 /// command will accept is `n - 1`. Taken from the `p256`, `p384` and
@@ -68,6 +79,76 @@ where
     Some(Zeroizing::new(key.to_bytes().to_vec()))
 }
 
+/// The CRT storage form of a freshly generated RSA key: `p`, `q`,
+/// `d mod (p-1)`, `d mod (q-1)`, the modulus `n` and the public exponent
+/// `e`, each in canonical big-endian bytes and zeroized. `dp` and `dq` are
+/// derived from `d` directly rather than read from the crate's
+/// precomputation (it is best-effort and may be `None`).
+fn generated_rsa_crt(key: &RsaPrivateKey) -> RsaCrt {
+    let (n, e, d) = (key.n().clone(), key.e().clone(), key.d().clone());
+    let (p, q) = (key.primes()[0].clone(), key.primes()[1].clone());
+    let one = BigUint::from(1u32);
+    let (dp, dq) = (&d % &(&p - &one), &d % &(&q - &one));
+    RsaCrt {
+        p: Zeroizing::new(p.to_bytes_be()),
+        q: Zeroizing::new(q.to_bytes_be()),
+        dp: Zeroizing::new(dp.to_bytes_be()),
+        dq: Zeroizing::new(dq.to_bytes_be()),
+        n: Zeroizing::new(n.to_bytes_be()),
+        e: Zeroizing::new(e.to_bytes_be()),
+    }
+}
+
+/// An imported RSA key validated against its modulus size: every component
+/// present, `p`/`q` exactly half the modulus size, `n` the full size, `dp`/
+/// `dq` non-zero and at most half the size, `p`/`q`/`n` odd and greater
+/// than 1, `p != q` and `p * q == n` (checked numerically with `BigUint`).
+/// Stricter than the reference applet, which does none of this — a broken
+/// CRT set would otherwise be stored and fail on first use. The exponent is
+/// assumed to be the PIV standard 65537 (see `RSA_EXPONENT`).
+fn imported_rsa_crt(
+    p: &[u8],
+    q: &[u8],
+    dp: &[u8],
+    dq: &[u8],
+    n: &[u8],
+    modulus_len: usize,
+) -> Option<RsaCrt> {
+    let half = modulus_len / 2;
+    if p.len() != half
+        || q.len() != half
+        || n.len() != modulus_len
+        || dp.is_empty()
+        || dq.is_empty()
+        || dp.len() > half
+        || dq.len() > half
+    {
+        return None;
+    }
+    for component in [&p, &q, &n] {
+        let value = BigUint::from_bytes_be(component);
+        if value.is_zero() || value.is_one() || value.is_even() {
+            return None;
+        }
+    }
+    let (p, q, n) = (
+        BigUint::from_bytes_be(p),
+        BigUint::from_bytes_be(q),
+        BigUint::from_bytes_be(n),
+    );
+    if p == q || &p * &q != n {
+        return None;
+    }
+    Some(RsaCrt {
+        p: Zeroizing::new(p.to_bytes_be()),
+        q: Zeroizing::new(q.to_bytes_be()),
+        dp: Zeroizing::new(dp.to_vec()),
+        dq: Zeroizing::new(dq.to_vec()),
+        n: Zeroizing::new(n.to_bytes_be()),
+        e: Zeroizing::new(RSA_EXPONENT.to_vec()),
+    })
+}
+
 impl PivApplet {
     /// GENERATE ASYMMETRIC KEY PAIR (`0x47`): the host's `generate_key`
     /// APDU, `00 47 00 <slot> Lc AC <len> 80 01 <alg> [AA 01 <pin>]
@@ -95,7 +176,7 @@ impl PivApplet {
             None => return Response::sw(SW_INCORRECT_P1P2),
         };
         let body = match apdu_lc_body(apdu) {
-            Ok((_, body)) => body,
+            Ok((_, body, _)) => body,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
         // Unwrap the `AC` control-reference template.
@@ -107,32 +188,45 @@ impl PivApplet {
             Ok(parsed) => parsed,
             Err(()) => return Response::sw(SW_WRONG_DATA),
         };
-        use elliptic_curve::sec1::ToEncodedPoint;
-        let (secret, point) = match alg {
+        let (secret, crt) = match alg {
             KeyAlg::EccP256 => {
                 let key =
                     elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng);
-                let point = key.public_key().to_encoded_point(false);
-                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+                (Zeroizing::new(key.to_bytes().to_vec()), None)
             }
             KeyAlg::EccP384 => {
                 let key =
                     elliptic_curve::SecretKey::<p384::NistP384>::random(&mut rand_core::OsRng);
-                let point = key.public_key().to_encoded_point(false);
-                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+                (Zeroizing::new(key.to_bytes().to_vec()), None)
             }
             KeyAlg::EccP521 => {
                 let key =
                     elliptic_curve::SecretKey::<p521::NistP521>::random(&mut rand_core::OsRng);
-                let point = key.public_key().to_encoded_point(false);
-                (Zeroizing::new(key.to_bytes().to_vec()), point.as_bytes().to_vec())
+                (Zeroizing::new(key.to_bytes().to_vec()), None)
+            }
+            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+                let bits = match alg {
+                    KeyAlg::Rsa1024 => 1024,
+                    KeyAlg::Rsa2048 => 2048,
+                    KeyAlg::Rsa3072 => 3072,
+                    KeyAlg::Rsa4096 => 4096,
+                    _ => unreachable!("alg is an RSA key size"),
+                };
+                let key = match RsaPrivateKey::new(&mut rand_core::OsRng, bits) {
+                    Ok(key) => key,
+                    Err(_) => return Response::sw(SW_WRONG_DATA),
+                };
+                (Zeroizing::new(Vec::new()), Some(generated_rsa_crt(&key)))
             }
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        self.commit_slot_key(index, secret, alg, false, pin_policy, touch_policy);
+        let key = SlotKey { alg, secret, crt };
+        let inner = match key.public_inner() {
+            Some(inner) => inner,
+            None => return Response::sw(SW_WRONG_DATA),
+        };
+        self.commit_slot_key(index, key, false, pin_policy, touch_policy);
 
-        let mut inner = Vec::with_capacity(2 + 65);
-        push_tlv(&mut inner, &[0x86], &point);
         let mut data = Vec::with_capacity(3 + inner.len());
         push_tlv(&mut data, &[0x7F, 0x49], &inner);
         Response::ok(data)
@@ -162,45 +256,73 @@ impl PivApplet {
         };
         let alg = match KeyAlg::from_id(*p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
+            Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => alg,
             _ => return Response::sw(SW_WRONG_DATA),
         };
         let body = match apdu_lc_body(apdu) {
-            Ok((_, body)) => body,
+            Ok((_, body, _)) => body,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
-        let import = match parse_import(body) {
+        let rsa = matches!(alg, KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096);
+        let import = match parse_import(body, rsa) {
             Ok(import) => import,
             Err(()) => return Response::sw(SW_WRONG_DATA),
         };
 
-        // The scalar must be the big-endian encoding of a value in
-        // 1..=n-1 for the requested curve: the curve's field length,
-        // non-zero, below the group order. The range check precedes
-        // `from_bytes` — it would reduce `n` and above modulo `n` instead
-        // of refusing them.
-        let order: &[u8] = match alg {
-            KeyAlg::EccP256 => &P256_ORDER,
-            KeyAlg::EccP384 => &P384_ORDER,
-            KeyAlg::EccP521 => &P521_ORDER,
-            _ => unreachable!("alg is one of the NIST curves"),
+        let (secret, crt) = match alg {
+            KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
+                // The scalar must be the big-endian encoding of a value in
+                // 1..=n-1 for the requested curve: the curve's field
+                // length, non-zero, below the group order. The range check
+                // precedes `from_bytes` — it would reduce `n` and above
+                // modulo `n` instead of refusing them.
+                let scalar = import
+                    .scalar
+                    .as_ref()
+                    .expect("the EC branch requires the scalar member");
+                let order: &[u8] = match alg {
+                    KeyAlg::EccP256 => &P256_ORDER,
+                    KeyAlg::EccP384 => &P384_ORDER,
+                    KeyAlg::EccP521 => &P521_ORDER,
+                    _ => unreachable!("alg is one of the NIST curves"),
+                };
+                if scalar.len() != order.len()
+                    || scalar.iter().all(|byte| *byte == 0)
+                    || scalar.as_slice() >= order
+                {
+                    return Response::sw(SW_WRONG_DATA);
+                }
+                let secret = match alg {
+                    KeyAlg::EccP256 => imported_secret::<p256::NistP256>(scalar),
+                    KeyAlg::EccP384 => imported_secret::<p384::NistP384>(scalar),
+                    KeyAlg::EccP521 => imported_secret::<p521::NistP521>(scalar),
+                    _ => unreachable!("alg is one of the NIST curves"),
+                };
+                let secret = match secret {
+                    Some(secret) => secret,
+                    None => return Response::sw(SW_WRONG_DATA),
+                };
+                (secret, None)
+            }
+            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+                // The CRT component set: every member present, sizes
+                // right, p * q == n.
+                let (Some(p), Some(q), Some(dp), Some(dq), Some(n)) =
+                    (&import.p, &import.q, &import.dp, &import.dq, &import.n)
+                else {
+                    return Response::sw(SW_WRONG_DATA);
+                };
+                let modulus_len = rsa_modulus_len(alg).expect("alg is an RSA key size");
+                let crt = match imported_rsa_crt(p, q, dp, dq, n, modulus_len) {
+                    Some(crt) => crt,
+                    None => return Response::sw(SW_WRONG_DATA),
+                };
+                (Zeroizing::new(Vec::new()), Some(crt))
+            }
+            _ => unreachable!("alg is a NIST curve or an RSA key size"),
         };
-        if import.scalar.len() != order.len()
-            || import.scalar.iter().all(|byte| *byte == 0)
-            || import.scalar.as_slice() >= order
-        {
-            return Response::sw(SW_WRONG_DATA);
-        }
-        let secret = match alg {
-            KeyAlg::EccP256 => imported_secret::<p256::NistP256>(&import.scalar),
-            KeyAlg::EccP384 => imported_secret::<p384::NistP384>(&import.scalar),
-            KeyAlg::EccP521 => imported_secret::<p521::NistP521>(&import.scalar),
-            _ => unreachable!("alg is one of the NIST curves"),
-        };
-        let secret = match secret {
-            Some(secret) => secret,
-            None => return Response::sw(SW_WRONG_DATA),
-        };
-        self.commit_slot_key(index, secret, alg, true, import.pin_policy, import.touch_policy);
+        let key = SlotKey { alg, secret, crt };
+        self.commit_slot_key(index, key, true, import.pin_policy, import.touch_policy);
         Response::sw(SW_OK)
     }
 
@@ -282,31 +404,71 @@ fn parse_control(control: &[u8]) -> Result<(KeyAlg, Option<PinPolicy>, Option<To
     Ok((alg.ok_or(())?, pin_policy, touch_policy))
 }
 
-/// The body of an IMPORT ASYMMETRIC KEY command, EC branches: a required
-/// `06 20 <scalar>` member and optional `AA` / `AB` policy members, in any
-/// order, each at most once.
-fn parse_import(body: &[u8]) -> Result<ImportKey, ()> {
+/// The body of an IMPORT ASYMMETRIC KEY command: either the EC branch —
+/// a required `06 <len> <scalar>` member — or the RSA branch — the five CRT
+/// components `01 P`, `02 Q`, `03 dP`, `04 dQ`, `05 n` — plus optional
+/// `AA` / `AB` policy members, in any order, each at most once. Which
+/// branch applies is decided by the algorithm in P1; a member of the other
+/// branch refuses the command.
+fn parse_import(body: &[u8], rsa: bool) -> Result<ImportKey, ()> {
     let mut scalar = None;
+    let mut p = None;
+    let mut q = None;
+    let mut dp = None;
+    let mut dq = None;
+    let mut n = None;
     let mut pin_policy = None;
     let mut touch_policy = None;
     walk_tlvs(body, |tag, value| {
         match tag {
             0x06 if scalar.is_none() => scalar = Some(parse_scalar(value)?),
+            0x01 if p.is_none() => p = Some(value.to_vec()),
+            0x02 if q.is_none() => q = Some(value.to_vec()),
+            0x03 if dp.is_none() => dp = Some(value.to_vec()),
+            0x04 if dq.is_none() => dq = Some(value.to_vec()),
+            0x05 if n.is_none() => n = Some(value.to_vec()),
             0xAA if pin_policy.is_none() => pin_policy = Some(parse_pin_policy(value)?),
             0xAB if touch_policy.is_none() => touch_policy = Some(parse_touch_policy(value)?),
             _ => return Err(()),
         }
         Ok(())
     })?;
+    if rsa {
+        // The EC scalar must not sneak in alongside the CRT set.
+        if scalar.is_some() {
+            return Err(());
+        }
+        if !(p.is_some() && q.is_some() && dp.is_some() && dq.is_some() && n.is_some()) {
+            return Err(());
+        }
+    } else {
+        // The RSA components must not sneak in alongside the scalar.
+        if p.is_some() || q.is_some() || dp.is_some() || dq.is_some() || n.is_some() {
+            return Err(());
+        }
+        if scalar.is_none() {
+            return Err(());
+        }
+    }
     Ok(ImportKey {
-        scalar: scalar.ok_or(())?,
+        scalar,
+        p,
+        q,
+        dp,
+        dq,
+        n,
         pin_policy,
         touch_policy,
     })
 }
 
 struct ImportKey {
-    scalar: Vec<u8>,
+    scalar: Option<Vec<u8>>,
+    p: Option<Vec<u8>>,
+    q: Option<Vec<u8>>,
+    dp: Option<Vec<u8>>,
+    dq: Option<Vec<u8>>,
+    n: Option<Vec<u8>>,
     pin_policy: Option<PinPolicy>,
     touch_policy: Option<TouchPolicy>,
 }
@@ -379,14 +541,13 @@ impl PivApplet {
     fn commit_slot_key(
         &mut self,
         index: usize,
-        secret: Zeroizing<Vec<u8>>,
-        alg: KeyAlg,
+        key: SlotKey,
         imported: bool,
         pin_policy: Option<PinPolicy>,
         touch_policy: Option<TouchPolicy>,
     ) {
         let slot = &mut self.slots[index];
-        slot.key = Some(SlotKey { alg, secret });
+        slot.key = Some(key);
         slot.imported = imported;
         slot.pin_policy = match pin_policy {
             Some(PinPolicy::Default) => Self::factory_pin_policy(index),

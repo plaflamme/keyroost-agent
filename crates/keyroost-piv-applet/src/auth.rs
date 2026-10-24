@@ -41,8 +41,8 @@ impl PivApplet {
         } else {
             return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
         };
-        let (lc, body) = match apdu_lc_body(apdu) {
-            Ok(pair) => pair,
+        let (lc, body, _) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
         };
         if pin.tries == 0 {
@@ -56,7 +56,7 @@ impl PivApplet {
             }
             return Response::sw(keyroost_piv::SW_OK);
         }
-        if usize::from(lc) == 0 {
+        if lc == 0 {
             // Status query: `9000` when verified, else `63Cx`.
             return if pin.verified {
                 Response::sw(keyroost_piv::SW_OK)
@@ -64,7 +64,7 @@ impl PivApplet {
                 Response::sw(tries_sw(pin.tries))
             };
         }
-        if usize::from(lc) != 8 {
+        if lc != 8 {
             return Response::sw(SW_WRONG_DATA);
         }
         if pin.check(body) {
@@ -107,8 +107,8 @@ impl PivApplet {
             PIN_REF_PUK => &mut self.puk,
             _ => return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND),
         };
-        let (_, body) = match apdu_lc_body(apdu) {
-            Ok(pair) => pair,
+        let (_, body, _) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
         };
         if body.len() != 16 {
@@ -155,8 +155,8 @@ impl PivApplet {
         if *p2 != PIN_REF_APPLICATION {
             return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
         }
-        let (_, body) = match apdu_lc_body(apdu) {
-            Ok(pair) => pair,
+        let (_, body, _) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
         };
         if body.len() != 16 {

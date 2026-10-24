@@ -200,8 +200,8 @@ impl PivApplet {
         if !self.mgmt.unlocked() {
             return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        let (_lc, body) = match apdu_lc_body(apdu) {
-            Ok(pair) => pair,
+        let (_lc, body, _) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
         if body.len() < 4 {

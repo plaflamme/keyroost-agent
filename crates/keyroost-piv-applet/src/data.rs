@@ -13,7 +13,7 @@
 use crate::constants::{
     SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_LENGTH,
 };
-use crate::{PivApplet, Response, apdu_le};
+use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
 use keyroost_piv::{OBJECT_ADMIN_DATA, OBJECT_CHUID, OBJECT_PIN_PROTECTED_DATA};
 
 /// The non-slot data objects: the CHUID (`5F C1 02`), the PIN-protected
@@ -96,11 +96,11 @@ impl PivApplet {
         if *p1 != 0x3F || *p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let (lc, body) = match lc_body(apdu) {
-            Ok(pair) => pair,
+        let (_lc, body, tail) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
-        let le = match apdu_le(&apdu[5 + lc..]) {
+        let le = match apdu_le(tail) {
             Ok(le) => le,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
@@ -138,8 +138,8 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let (_, body) = match lc_body(apdu) {
-            Ok(pair) => pair,
+        let (_, body, _) = match apdu_lc_body(apdu) {
+            Ok(triple) => triple,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
         };
         let (tag, value) = match parse_put_body(body) {
@@ -174,29 +174,6 @@ impl PivApplet {
             None => self.data.put(tag, value),
         }
     }
-}
-
-/// The `Lc` and body of a GET/PUT DATA APDU, in its short or extended
-/// length form: the host's builders go extended once the `53` value pushes
-/// the body past 255 bytes (a large certificate). The host's extended form
-/// (keyroost-piv's `build_apdu_ext`) writes a `0x00` marker byte where a
-/// standard APDU's `Lc` high byte would sit, then the 2-byte `Lc` — so the
-/// command data starts at byte 7, not byte 6. `Err(())` when the length
-/// overruns the APDU.
-fn lc_body(apdu: &[u8]) -> Result<(usize, &[u8]), ()> {
-    let first = *apdu.get(4).ok_or(())?;
-    if first != 0 {
-        let lc = usize::from(first);
-        return apdu.get(5..5 + lc).map(|body| (lc, body)).ok_or(());
-    }
-    // A zero first length byte is either a case-4 `Le` (no command data)
-    // or the extended-form marker: a case-4 APDU is only 5 bytes long, so
-    // anything longer carries the extended header.
-    if apdu.len() < 8 {
-        return Ok((0, &[]));
-    }
-    let lc = (usize::from(*apdu.get(5).ok_or(())?) << 8) | usize::from(*apdu.get(6).ok_or(())?);
-    apdu.get(7..7 + lc).map(|body| (lc, body)).ok_or(())
 }
 
 /// The `5C` selector's 3-byte object tag from a GET/PUT DATA body: `None`

@@ -4,10 +4,10 @@
 use crate::constants::{
     DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, VERSION,
 };
-use crate::slot::{factory_pin_policy, slot_index, SlotKey};
+use crate::slot::{factory_pin_policy, slot_index};
 use crate::state::Pin;
 use crate::{PivApplet, Response, apdu_le};
-use keyroost_piv::{KeyAlg, SW_REFERENCE_NOT_FOUND};
+use keyroost_piv::SW_REFERENCE_NOT_FOUND;
 
 impl PivApplet {
     /// GET VERSION (0xFD, Yubico extension): the applet version as three
@@ -105,22 +105,15 @@ impl PivApplet {
     fn key_reference_metadata(&self, index: usize) -> Option<Vec<u8>> {
         let slot = &self.slots[index];
         let key = slot.key.as_ref()?;
-        // Only P-256 keys can be stored today, so the point always exists;
-        // P-384/P-521 (T9) and the RSA keys (T10) add their encodings here.
-        let point = ec_point(key)?;
         let is_default = slot.pin_policy == factory_pin_policy(index) && slot.touch_policy == 0;
+        // The `7F49` inner TLVs, unwrapped from their template exactly as
+        // the GENERATE response carries it: the `86` point for EC keys,
+        // the `81` modulus and `82` exponent for RSA keys.
+        let inner = key.public_inner()?;
         let mut body = Vec::new();
         body.extend_from_slice(&[0x01, 0x01, key.alg.id()]);
         body.extend_from_slice(&[0x02, 0x02, slot.pin_policy.id(), slot.touch_policy]);
         body.extend_from_slice(&[0x03, 0x01, if slot.imported { 0x02 } else { 0x01 }]);
-        // The `7F49` inner TLVs: the `86` EC point, unwrapped from its
-        // template exactly as the GENERATE response carries it. The
-        // lengths are BER-encoded — the P-521 point (133 bytes) does not
-        // fit in a short-form length byte.
-        let mut inner = Vec::with_capacity(3 + point.len());
-        inner.push(0x86);
-        push_ber_len(&mut inner, point.len());
-        inner.extend_from_slice(&point);
         body.push(0x04);
         push_ber_len(&mut body, inner.len());
         body.extend_from_slice(&inner);
@@ -144,40 +137,21 @@ impl PivApplet {
     }
 }
 
-/// Append a BER length: the short form to `0x7F`, otherwise the one-byte
-/// `0x81` long form. The metadata values never reach the two-byte form —
-/// the largest point is the P-521's 133 bytes.
+/// Append a BER length: the short form to `0x7F`, the one-byte `0x81`
+/// long form to `0xFF`, the two-byte `0x82` form to `0xFFFF`. The RSA-4096
+/// `04` member (modulus plus exponent) needs the two-byte form.
 fn push_ber_len(out: &mut Vec<u8>, len: usize) {
     if len < 0x80 {
         out.push(len as u8);
-    } else {
+    } else if len <= 0xFF {
         out.push(0x81);
         out.push(len as u8);
-    }
-}
-
-/// The uncompressed point of the slot key: the `86` TLV content the GENERATE
-/// response and the metadata `04` member carry. `None` for a key family
-/// GET METADATA does not yet report (T10's RSA keys). The `32`/`48`/`66`-
-/// byte scalar is the head of the slot's uniform `66`-byte buffer.
-fn ec_point(key: &SlotKey) -> Option<Vec<u8>> {
-    match key.alg {
-        KeyAlg::EccP256 => {
-            let signing =
-                ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]).ok()?;
-            Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
-        }
-        KeyAlg::EccP384 => {
-            let signing =
-                ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]).ok()?;
-            Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
-        }
-        KeyAlg::EccP521 => {
-            let signing =
-                ecdsa::SigningKey::<p521::NistP521>::from_slice(&key.secret[..]).ok()?;
-            Some(signing.verifying_key().to_encoded_point(false).as_bytes().to_vec())
-        }
-        _ => None,
+    } else if len <= 0xFFFF {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else {
+        panic!("metadata 7F49 member exceeds 65535 bytes");
     }
 }
 
