@@ -4,6 +4,7 @@ result
 .pi/
 .nixos-test-history
 plans/
+.history/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
