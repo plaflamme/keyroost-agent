@@ -190,12 +190,17 @@ fn slot_to_ssh_identity(
 
     let (key_alg, public_key) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)?;
 
+    let comment = if let Some(serial) = session.status().ok().and_then(|status| status.serial) {
+        format!("PIV {serial}:{slot:?}")
+    } else {
+        format!("PIV {slot:?}")
+    };
     Ok(Some(PivIdentity {
         slot,
         key_alg,
         ssh_identity: Identity {
             credential: ssh_public_credentials(key_alg, public_key)?,
-            comment: format!("PIV {slot:?}"),
+            comment,
         },
     }))
 }
