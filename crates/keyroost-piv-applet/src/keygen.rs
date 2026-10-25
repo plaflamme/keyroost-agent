@@ -166,10 +166,6 @@ impl PivApplet {
         if *p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let index = match slot_index(*p2) {
-            Some(index) => index,
-            None => return Response::sw(SW_INCORRECT_P1P2),
-        };
         let body = match apdu_lc_body(apdu) {
             Ok((_, body, _)) => body,
             Err(()) => return Response::sw(SW_WRONG_LENGTH),
@@ -182,6 +178,56 @@ impl PivApplet {
         let (alg, pin_policy, touch_policy) = match parse_control(control) {
             Ok(parsed) => parsed,
             Err(()) => return Response::sw(SW_WRONG_DATA),
+        };
+        // The `F9` attestation key: P-256 only, and a regeneration
+        // re-mints the self-signed certificate that describes it — the
+        // reference applet leaves the certificate stale after a key
+        // replacement, and a stale attestation CA would certify the wrong
+        // key. The policy request is ignored: the self-signed certificate
+        // keeps the reference applet's fixed policy bytes.
+        if *p2 == 0xF9 && alg != KeyAlg::EccP256 {
+            // The `F9` attestation key is P-256 only, not a slot of the
+            // 24-slot table.
+            return Response::sw(SW_WRONG_DATA);
+        }
+        if *p2 == 0xF9 {
+            let secret = Zeroizing::new(
+                elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng)
+                    .to_bytes()
+                    .to_vec(),
+            );
+            let signing = match ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) {
+                Ok(signing) => signing,
+                Err(_) => return Response::sw(SW_WRONG_DATA),
+            };
+            let point = signing
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec();
+            let cert = crate::attest::attestation_cert(
+                &keyroost_piv::PublicKey::Ecc { point: point.clone() },
+                KeyAlg::EccP256,
+                &secret,
+                None,
+                crate::attest::F9_PIN_POLICY,
+                crate::attest::F9_TOUCH_POLICY,
+            );
+            let mut wrapped = Vec::new();
+            if let Some(der) = &cert {
+                push_tlv(&mut wrapped, &[0x70], der);
+            }
+            self.attestation.secret = secret;
+            self.attestation.cert = if wrapped.is_empty() { None } else { Some(wrapped) };
+            let mut inner = Vec::with_capacity(2 + point.len());
+            push_tlv(&mut inner, &[0x86], &point);
+            let mut data = Vec::with_capacity(inner.len() + 2);
+            push_tlv(&mut data, &[0x7F, 0x49], &inner);
+            return Response::ok(data);
+        }
+        let index = match slot_index(*p2) {
+            Some(index) => index,
+            None => return Response::sw(SW_INCORRECT_P1P2),
         };
         let secret = match alg {
             KeyAlg::EccP256 => {
@@ -620,9 +666,10 @@ mod tests {
         apdu
     }
 
-    /// A raw GENERATE APDU with an arbitrary P2 (slot reference).
+    /// A raw GENERATE APDU with an arbitrary P2 (slot reference): case 4,
+    /// `Le 0x00`, with a one-member P-256 AC control template.
     fn gen_raw_p2(p2: u8) -> Vec<u8> {
-        vec![0x00, 0x47, 0x00, p2, 0x06, 0x80, 0x01, 0x11, 0x00]
+        vec![0x00, 0x47, 0x00, p2, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00]
     }
 
     /// An IMPORT body: `06 <len> <scalar>` plus optional `AA`/`AB` members.
@@ -693,11 +740,23 @@ mod tests {
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[2] = 0x01;
         assert_eq!(app.process(&apdu).sw, SW_INCORRECT_P1P2);
-        // Non-slot P2s: management, attestation, vendor-extension and PIN
-        // references.
-        for p2 in [0x9B, 0xF9, 0xE0, 0xE1, 0x80, 0x00u8] {
-            assert_eq!(app.process(&gen_raw_p2(p2)).sw, SW_INCORRECT_P1P2);
+        // Non-slot P2s: the vendor-extension and PIN references.
+        // `9B` (management) and `F9` (attestation) are valid GENERATE
+        // targets — `F9` in particular, see
+        // `attest::tests::generate_on_f9_mints_a_fresh_ca`.
+        for p2 in [0xE0, 0xE1, 0x80, 0x00u8] {
+            assert_eq!(
+                app.process(&gen_raw_p2(p2)).sw,
+                SW_INCORRECT_P1P2,
+                "P2 {p2:02X}",
+            );
         }
+        // `F9` with a non-P-256 algorithm is refused before the management
+        // gate is reached.
+        let f9_p384 = vec![
+            0x00u8, 0x47, 0x00, 0xF9, 0x00, 0x00, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x14, 0x00,
+        ];
+        assert_eq!(app.process(&f9_p384).sw, SW_WRONG_DATA);
         // A non-PIV CLA.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[0] = 0x80;

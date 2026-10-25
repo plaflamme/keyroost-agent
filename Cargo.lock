@@ -742,6 +742,7 @@ dependencies = [
  "rand_core",
  "rsa",
  "serde",
+ "sha2",
  "tracing",
  "tracing-subscriber",
  "zeroize",

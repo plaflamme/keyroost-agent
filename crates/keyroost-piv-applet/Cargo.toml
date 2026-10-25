@@ -22,7 +22,10 @@ p521 = { version = "0.13.0", features = ["ecdh"] }
 # The generic secret-key / prime-curve API the three NIST curves share
 # (the same elliptic-curve major the 0.13 curve crates are built on).
 elliptic-curve = "0.13"
-ecdsa = { version = "0.16.0" }
+ecdsa = { version = "0.16.0", features = ["der"] }
+# SHA-256 of the attestation TBS certificate (the ecdsa-with-SHA-256
+# signature algorithm the `F9` key signs with).
+sha2 = "0.10"
 # RSA slots (T10, staged by spike keyroost-agent-rpx): the RustCrypto RSA
 # line. Both crates are already in the workspace lockfile (ssh-key pulls
 # rsa 0.9.10), so this resolves offline with no new versions.

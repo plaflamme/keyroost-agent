@@ -47,10 +47,10 @@
 
 #![forbid(unsafe_code)]
 
+mod attest;
 mod auth;
 mod constants;
 mod data;
-mod extensions;
 mod general_auth;
 mod identity;
 mod keygen;
@@ -61,6 +61,7 @@ mod state;
 
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
 
+use attest::Attestation;
 use constants::{
     DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
     SW_INS_NOT_SUPPORTED, SW_OK,
@@ -141,6 +142,10 @@ pub struct PivApplet {
     /// next non-chained APDU — an `ALWAYS`-policy slot operation must be
     /// the APDU right after the VERIFY that armed it.
     pub(crate) pin_always_armed: bool,
+    /// The `F9` attestation key and its self-signed certificate — the key
+    /// that signs the ATTEST certificates and the slot keys' on-card
+    /// origin proof.
+    pub(crate) attestation: Attestation,
 }
 
 impl Default for PivApplet {
@@ -170,6 +175,7 @@ impl PivApplet {
             slots: factory_slots(),
             data: PivData::default(),
             pin_always_armed: false,
+            attestation: crate::attest::fresh_attestation(),
         }
     }
 

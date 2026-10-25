@@ -16,6 +16,10 @@ use crate::constants::{
 use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
 use keyroost_piv::{OBJECT_ADMIN_DATA, OBJECT_CHUID, OBJECT_PIN_PROTECTED_DATA};
 
+/// The `F9` attestation certificate object tag (the Yubico PIV Attestation
+/// Certificate), the one data object the applet mints at construction.
+const ATTESTATION_OBJECT_TAG: [u8; 3] = [0x5F, 0xFF, 0x01];
+
 /// The non-slot data objects: the CHUID (`5F C1 02`), the PIN-protected
 /// data object (`5F C1 09`) and the Yubico admin object (`5F FF 00`), each
 /// stored opaquely as the value of its `53` template, `None` until first
@@ -153,9 +157,13 @@ impl PivApplet {
     }
 
     /// The value stored under the object `tag` — the slot's certificate for
-    /// a slot tag, the corresponding [`PivData`] object otherwise — or
-    /// `None` when nothing has been stored under it.
+    /// a slot tag, the `F9` attestation certificate for `5F FF 01`, the
+    /// corresponding [`PivData`] object otherwise — or `None` when nothing
+    /// has been stored under it.
     pub(crate) fn data_object_value(&self, tag: &[u8; 3]) -> Option<&[u8]> {
+        if *tag == ATTESTATION_OBJECT_TAG {
+            return self.attestation.cert.as_deref();
+        }
         match cert_slot_index(tag) {
             Some(index) => self.slots[index].cert.as_deref(),
             None => self.data.get(tag),
@@ -163,9 +171,14 @@ impl PivApplet {
     }
 
     /// Store `value` under the object `tag`: the slot's certificate for a
-    /// slot tag, the corresponding [`PivData`] object otherwise. Returns
-    /// whether the tag names a known object.
+    /// slot tag, the `F9` attestation certificate for `5F FF 01`, the
+    /// corresponding [`PivData`] object otherwise. Returns whether the tag
+    /// names a known object.
     pub(crate) fn store_data_object(&mut self, tag: &[u8; 3], value: Vec<u8>) -> bool {
+        if *tag == ATTESTATION_OBJECT_TAG {
+            self.attestation.cert = Some(value);
+            return true;
+        }
         match cert_slot_index(tag) {
             Some(index) => {
                 self.slots[index].cert = Some(value);
