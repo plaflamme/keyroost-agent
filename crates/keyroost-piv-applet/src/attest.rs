@@ -264,9 +264,8 @@ pub(crate) fn fresh_attestation() -> Attestation {
             .to_bytes()
             .to_vec(),
     );
-    let signing = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret).ok().expect(
-        "a fresh P-256 secret scalar is always a valid signing key",
-    );
+    let signing = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret)
+        .expect("a fresh P-256 secret scalar is always a valid signing key");
     let point = signing.verifying_key().to_encoded_point(false).as_bytes().to_vec();
     let cert = attestation_cert(
         &PublicKey::Ecc { point },
