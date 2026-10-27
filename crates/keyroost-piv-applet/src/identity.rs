@@ -131,6 +131,7 @@ impl PivApplet {
 /// Append a BER length: the short form to `0x7F`, the one-byte `0x81`
 /// long form to `0xFF`, the two-byte `0x82` form to `0xFFFF`. The RSA-4096
 /// `04` member (modulus plus exponent) needs the two-byte form.
+#[allow(clippy::cast_possible_truncation)]
 fn push_ber_len(out: &mut Vec<u8>, len: usize) {
     if len < 0x80 {
         out.push(len as u8);

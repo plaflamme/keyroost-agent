@@ -59,6 +59,7 @@ impl PivApplet {
     /// `YubiKey` 5 response: a `61` wrapper holding the AID after the RID
     /// (tag `4F`) and the RID itself (tag `4F` inside the `79`
     /// application-identifier template).
+    #[allow(clippy::cast_possible_truncation)]
     fn select_response() -> Vec<u8> {
         let suffix = &AID_FULL[AID_RID.len()..];
         let mut body = Vec::with_capacity(suffix.len() + 2 + AID_RID.len() + 4);

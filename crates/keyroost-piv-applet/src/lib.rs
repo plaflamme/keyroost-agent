@@ -258,6 +258,7 @@ impl PivApplet {
         match cap {
             Some(cap) if full.len() > cap => {
                 self.get_response_tail = Some(full[cap..].to_vec());
+                #[allow(clippy::cast_possible_truncation)]
                 let remaining = u16::from((full.len() - cap).min(255) as u8);
                 Response {
                     data: full[..cap].to_vec(),

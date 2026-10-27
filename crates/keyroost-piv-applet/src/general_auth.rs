@@ -384,6 +384,7 @@ struct GaTemplate<'a> {
 }
 
 /// Build the card's GA answer: the `7C` wrapper around one tagged value.
+#[allow(clippy::cast_possible_truncation)]
 fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
     fn length(data: &mut Vec<u8>, len: usize) {
         if len <= 127 {

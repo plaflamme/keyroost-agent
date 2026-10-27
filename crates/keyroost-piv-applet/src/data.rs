@@ -222,6 +222,7 @@ fn ber_length(rest: &[u8]) -> Option<(usize, &[u8])> {
 /// Append `tag` + BER length + `value` to `out` — short form up to `0x7F`,
 /// `81`/`82` long form above, the same encoding the host's `put_data`
 /// builder emits.
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn push_tlv(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
     out.extend_from_slice(tag);
     match value.len() {
