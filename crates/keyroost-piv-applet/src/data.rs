@@ -100,18 +100,9 @@ impl PivApplet {
         if *p1 != 0x3F || *p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let (_lc, body, tail) = match apdu_lc_body(apdu) {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
-        let le = match apdu_le(tail) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
-        let tag = match selector_tag(body) {
-            Some(tag) => tag,
-            None => return Response::sw(SW_DATA_INVALID),
-        };
+        let Ok((_lc, body, tail)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(tail) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Some(tag) = selector_tag(body) else { return Response::sw(SW_DATA_INVALID) };
         match self.data_object_value(&tag) {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
@@ -142,14 +133,8 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let (_, body, _) = match apdu_lc_body(apdu) {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
-        let (tag, value) = match parse_put_body(body) {
-            Some(pair) => pair,
-            None => return Response::sw(SW_DATA_INVALID),
-        };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Some((tag, value)) = parse_put_body(body) else { return Response::sw(SW_DATA_INVALID) };
         if self.store_data_object(&tag, value) { Response::sw(SW_OK) } else { Response::sw(keyroost_piv::SW_NOT_FOUND) }
     }
 

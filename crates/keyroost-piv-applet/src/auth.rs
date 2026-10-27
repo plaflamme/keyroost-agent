@@ -41,10 +41,7 @@ impl PivApplet {
         } else {
             return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
         };
-        let (lc, body, _) = match apdu_lc_body(apdu) {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok((lc, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         if pin.tries == 0 {
             return Response::sw(keyroost_piv::SW_AUTH_BLOCKED);
         }
@@ -107,10 +104,7 @@ impl PivApplet {
             PIN_REF_PUK => &mut self.puk,
             _ => return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND),
         };
-        let (_, body, _) = match apdu_lc_body(apdu) {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
@@ -155,10 +149,7 @@ impl PivApplet {
         if *p2 != PIN_REF_APPLICATION {
             return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
         }
-        let (_, body, _) = match apdu_lc_body(apdu) {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }

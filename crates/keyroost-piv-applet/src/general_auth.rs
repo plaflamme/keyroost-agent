@@ -91,10 +91,7 @@ impl PivApplet {
         if p1 != key.alg.id() {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let (_lc, body, _) = match lc_body {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
+        let Ok((_lc, body, _)) = lc_body else { return Response::sw(SW_WRONG_LENGTH) };
         let t = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -140,10 +137,7 @@ impl PivApplet {
         p1: u8,
         lc_body: Result<(usize, &[u8], &[u8]), ()>,
     ) -> Response {
-        let (_lc, body, _) = match lc_body {
-            Ok(triple) => triple,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
+        let Ok((_lc, body, _)) = lc_body else { return Response::sw(SW_WRONG_LENGTH) };
         let tmpl = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -269,10 +263,7 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     use rsa::RsaPrivateKey;
     use rsa::traits::PublicKeyParts;
 
-    let key = match RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) {
-        Ok(key) => key,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(key) = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) else { return Response::sw(SW_WRONG_DATA) };
     let n = key.n().to_bytes_be();
     if block.len() != n.len() {
         return Response::sw(SW_WRONG_DATA);
@@ -281,10 +272,7 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     if &c >= key.n() {
         return Response::sw(SW_WRONG_DATA);
     }
-    let m = match rsa_decrypt::<rand_core::OsRng>(None, &key, &c) {
-        Ok(m) => m,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(m) = rsa_decrypt::<rand_core::OsRng>(None, &key, &c) else { return Response::sw(SW_WRONG_DATA) };
 
     // Zero-extend the residue to the full modulus size.
     let m_be = m.to_bytes_be();
@@ -298,10 +286,7 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
 /// head of the slot's uniform `66`-byte buffer.
 fn sign_p256(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
-    let signing = match ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]) {
-        Ok(signing) => signing,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]) else { return Response::sw(SW_WRONG_DATA) };
     // The annotation pins the `Signature<C>` impl: with the `der` feature
     // the `PrehashSigner` impl for `der::Signature<C>` is also in scope.
     let sig: ecdsa::Signature<p256::NistP256> =
@@ -315,10 +300,7 @@ fn sign_p256(key: &SlotKey, digest: &[u8]) -> Response {
 /// The ECDSA half for P-384 (the host hashes with SHA-384).
 fn sign_p384(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
-    let signing = match ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]) {
-        Ok(signing) => signing,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(signing) = ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]) else { return Response::sw(SW_WRONG_DATA) };
     let sig: ecdsa::Signature<p384::NistP384> =
         match signing.sign_prehash(digest) {
             Ok(sig) => sig,
@@ -333,10 +315,7 @@ fn sign_p521(key: &SlotKey, digest: &[u8]) -> Response {
     // `NistP521` does not implement the `ecdsa` crate's generic signing
     // bounds (no `DigestPrimitive` impl), so the curve's own key type
     // signs instead — the same `PrehashSigner` trait.
-    let signing = match p521::ecdsa::SigningKey::from_slice(&key.secret[..]) {
-        Ok(signing) => signing,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(signing) = p521::ecdsa::SigningKey::from_slice(&key.secret[..]) else { return Response::sw(SW_WRONG_DATA) };
     let sig: ecdsa::Signature<p521::NistP521> =
         match signing.sign_prehash(digest) {
             Ok(sig) => sig,
@@ -362,15 +341,8 @@ fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
 /// point under `85` and the card answers the shared secret's x-coordinate
 /// under `82`.
 fn ecdh_p256(key: &SlotKey, peer: &[u8]) -> Response {
-    let secret =
-        match elliptic_curve::SecretKey::<p256::NistP256>::from_slice(&key.secret[..32]) {
-            Ok(secret) => secret,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
-    let peer = match elliptic_curve::PublicKey::<p256::NistP256>::from_sec1_bytes(peer) {
-        Ok(peer) => peer,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(secret) = elliptic_curve::SecretKey::<p256::NistP256>::from_slice(&key.secret[..32]) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(peer) = elliptic_curve::PublicKey::<p256::NistP256>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
     let shared =
         elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
@@ -378,15 +350,8 @@ fn ecdh_p256(key: &SlotKey, peer: &[u8]) -> Response {
 
 /// The ECDH half for P-384: the shared secret is the 48-byte x-coordinate.
 fn ecdh_p384(key: &SlotKey, peer: &[u8]) -> Response {
-    let secret =
-        match elliptic_curve::SecretKey::<p384::NistP384>::from_slice(&key.secret[..48]) {
-            Ok(secret) => secret,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
-    let peer = match elliptic_curve::PublicKey::<p384::NistP384>::from_sec1_bytes(peer) {
-        Ok(peer) => peer,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(secret) = elliptic_curve::SecretKey::<p384::NistP384>::from_slice(&key.secret[..48]) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(peer) = elliptic_curve::PublicKey::<p384::NistP384>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
     let shared =
         elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
@@ -394,15 +359,8 @@ fn ecdh_p384(key: &SlotKey, peer: &[u8]) -> Response {
 
 /// The ECDH half for P-521: the shared secret is the 66-byte x-coordinate.
 fn ecdh_p521(key: &SlotKey, peer: &[u8]) -> Response {
-    let secret =
-        match elliptic_curve::SecretKey::<p521::NistP521>::from_slice(&key.secret[..]) {
-            Ok(secret) => secret,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
-    let peer = match elliptic_curve::PublicKey::<p521::NistP521>::from_sec1_bytes(peer) {
-        Ok(peer) => peer,
-        Err(_) => return Response::sw(SW_WRONG_DATA),
-    };
+    let Ok(secret) = elliptic_curve::SecretKey::<p521::NistP521>::from_slice(&key.secret[..]) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(peer) = elliptic_curve::PublicKey::<p521::NistP521>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
     let shared =
         elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))

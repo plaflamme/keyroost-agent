@@ -47,17 +47,11 @@ impl PivApplet {
             Some(&lc) => (lc, &apdu[5..]),
             None => (0, &apdu[4..]),
         };
-        let aid = match body.get(..usize::from(lc)) {
-            Some(aid) => aid,
-            None => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Some(aid) = body.get(..usize::from(lc)) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         if !(aid.len() >= AID_RID.len() && AID_FULL.starts_with(aid)) {
             return Response::sw(keyroost_piv::SW_NOT_FOUND);
         }
-        let le = match apdu_le(&body[aid.len()..]) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok(le) = apdu_le(&body[aid.len()..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         self.split_for_le(Self::select_response(), le)
     }
 
@@ -98,14 +92,8 @@ impl PivApplet {
         if cla & 0x90 != 0 {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let tail = match self.get_response_tail.take() {
-            Some(tail) => tail,
-            None => return Response::sw(SW_CONDITIONS_NOT_SATISFIED),
-        };
-        let le = match apdu_le(&apdu[4..]) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Some(tail) = self.get_response_tail.take() else { return Response::sw(SW_CONDITIONS_NOT_SATISFIED) };
+        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         self.split_for_le(tail, le)
     }
 }

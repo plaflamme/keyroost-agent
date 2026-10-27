@@ -89,38 +89,22 @@ impl PivApplet {
         if *p2 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let index = match slot_index(*p1) {
-            Some(index) => index,
-            None => return Response::sw(SW_INCORRECT_P1P2),
-        };
-        let (key, pin_policy, touch_policy) = match &self.slots[index].key {
-            Some(key) => (key, self.slots[index].pin_policy, self.slots[index].touch_policy),
-            None => return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND),
-        };
-        let (alg, public) = match target_public_key(key) {
-            Some(material) => material,
-            None => return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND),
-        };
+        let Some(index) = slot_index(*p1) else { return Response::sw(SW_INCORRECT_P1P2) };
+        let Some(key) = &self.slots[index].key else { return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND) };
+        let pin_policy = self.slots[index].pin_policy;
+        let touch_policy = self.slots[index].touch_policy;
+        let Some((alg, public)) = target_public_key(key) else { return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND) };
         let subject = format!(" {p1:02X}");
-        let cert = match attestation_cert(
+        let Some(cert) = attestation_cert(
             &public,
             alg,
             &self.attestation.secret,
             Some(&subject),
             pin_policy.id(),
             touch_policy,
-        ) {
-            Some(cert) => cert,
-            None => return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED),
-        };
-        let (_lc, _body, tail) = match apdu_lc_body(apdu) {
-            Ok(parsed) => parsed,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
-        let le = match apdu_le(tail) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
+        ) else { return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED) };
+        let Ok((_lc, _body, tail)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(tail) else { return Response::sw(SW_WRONG_LENGTH) };
         self.split_for_le(cert, le)
     }
 }

@@ -22,10 +22,7 @@ impl PivApplet {
         if cla != 0x00 && cla != 0xFF {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let le = match apdu_le(&apdu[4..]) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         self.split_for_le(VERSION.to_vec(), le)
     }
 
@@ -41,10 +38,7 @@ impl PivApplet {
         if cla != 0x00 && cla != 0xFF {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let le = match apdu_le(&apdu[4..]) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         self.split_for_le(self.serial.to_be_bytes().to_vec(), le)
     }
 
@@ -81,10 +75,7 @@ impl PivApplet {
         if apdu[2] != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let le = match apdu_le(&apdu[4..]) {
-            Ok(le) => le,
-            Err(()) => return Response::sw(keyroost_piv::SW_WRONG_LENGTH),
-        };
+        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         let body = match apdu[3] {
             0x80 => self.pin_reference_metadata(&self.pin, &DEFAULT_PIN_VALUE),
             0x81 => self.pin_reference_metadata(&self.puk, &DEFAULT_PUK_VALUE),

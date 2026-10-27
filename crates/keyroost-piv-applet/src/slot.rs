@@ -122,10 +122,7 @@ impl SlotKey {
                 // The slot key's PKCS#1 encoding: serve the modulus under
                 // `81` and the public exponent under `82`, as the
                 // reference applet's `getKeyDetails` does.
-                let key = match RsaPrivateKey::from_pkcs1_der(self.secret.as_slice()) {
-                    Ok(key) => key,
-                    Err(_) => return None,
-                };
+                let Ok(key) = RsaPrivateKey::from_pkcs1_der(self.secret.as_slice()) else { return None };
                 let (n, e) = (key.n().to_bytes_be(), key.e().to_bytes_be());
                 let mut inner = Vec::with_capacity(2 + n.len() + 5);
                 crate::data::push_tlv(&mut inner, &[0x81], &n);

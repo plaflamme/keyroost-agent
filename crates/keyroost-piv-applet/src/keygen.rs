@@ -166,19 +166,13 @@ impl PivApplet {
         if *p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let body = match apdu_lc_body(apdu) {
-            Ok((_, body, _)) => body,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         // Unwrap the `AC` control-reference template.
         let control = match body {
             [0xAC, len, control @ ..] if usize::from(*len) == control.len() => control,
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let (alg, pin_policy, touch_policy) = match parse_control(control) {
-            Ok(parsed) => parsed,
-            Err(()) => return Response::sw(SW_WRONG_DATA),
-        };
+        let Ok((alg, pin_policy, touch_policy)) = parse_control(control) else { return Response::sw(SW_WRONG_DATA) };
         // The `F9` attestation key: P-256 only, and a regeneration
         // re-mints the self-signed certificate that describes it — the
         // reference applet leaves the certificate stale after a key
@@ -196,10 +190,7 @@ impl PivApplet {
                     .to_bytes()
                     .to_vec(),
             );
-            let signing = match ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) {
-                Ok(signing) => signing,
-                Err(_) => return Response::sw(SW_WRONG_DATA),
-            };
+            let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) else { return Response::sw(SW_WRONG_DATA) };
             let point = signing
                 .verifying_key()
                 .to_encoded_point(false)
@@ -225,10 +216,7 @@ impl PivApplet {
             push_tlv(&mut data, &[0x7F, 0x49], &inner);
             return Response::ok(data);
         }
-        let index = match slot_index(*p2) {
-            Some(index) => index,
-            None => return Response::sw(SW_INCORRECT_P1P2),
-        };
+        let Some(index) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
         let secret = match alg {
             KeyAlg::EccP256 => {
                 let key =
@@ -253,10 +241,7 @@ impl PivApplet {
                     KeyAlg::Rsa4096 => 4096,
                     _ => unreachable!("alg is an RSA key size"),
                 };
-                let key = match RsaPrivateKey::new(&mut rand_core::OsRng, bits) {
-                    Ok(key) => key,
-                    Err(_) => return Response::sw(SW_WRONG_DATA),
-                };
+                let Ok(key) = RsaPrivateKey::new(&mut rand_core::OsRng, bits) else { return Response::sw(SW_WRONG_DATA) };
                 // The card's storage form: the key's PKCS#1 encoding,
                 // zeroized on drop. `new` always precomputes the CRT
                 // exponents, which `to_pkcs1_der` needs for its
@@ -269,10 +254,7 @@ impl PivApplet {
             _ => return Response::sw(SW_WRONG_DATA),
         };
         let key = SlotKey { alg, secret };
-        let inner = match key.public_inner() {
-            Some(inner) => inner,
-            None => return Response::sw(SW_WRONG_DATA),
-        };
+        let Some(inner) = key.public_inner() else { return Response::sw(SW_WRONG_DATA) };
         self.commit_slot_key(index, key, false, pin_policy, touch_policy);
 
         let mut data = Vec::with_capacity(3 + inner.len());
@@ -298,10 +280,7 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let index = match slot_index(*p2) {
-            Some(index) => index,
-            None => return Response::sw(SW_INCORRECT_P1P2),
-        };
+        let Some(index) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
         let alg = match KeyAlg::from_id(*p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
             Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
@@ -309,18 +288,12 @@ impl PivApplet {
             }
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let body = match apdu_lc_body(apdu) {
-            Ok((_, body, _)) => body,
-            Err(()) => return Response::sw(SW_WRONG_LENGTH),
-        };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         let rsa = matches!(
             alg,
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096
         );
-        let import = match parse_import(body, rsa) {
-            Ok(import) => import,
-            Err(()) => return Response::sw(SW_WRONG_DATA),
-        };
+        let Ok(import) = parse_import(body, rsa) else { return Response::sw(SW_WRONG_DATA) };
 
         let secret = match alg {
             KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
@@ -402,10 +375,7 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let source = match slot_index(*p2) {
-            Some(index) => index,
-            None => return Response::sw(SW_INCORRECT_P1P2),
-        };
+        let Some(source) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
         let dest = match *p1 {
             0xFF => None,
             reference => match slot_index(reference) {
@@ -533,10 +503,7 @@ struct ImportKey {
 fn walk_tlvs(rest: &[u8], mut f: impl FnMut(u8, &[u8]) -> Result<(), ()>) -> Result<(), ()> {
     let mut rest = rest;
     while !rest.is_empty() {
-        let (tag, value, next) = match next_tlv(rest) {
-            Some(tlv) => tlv,
-            None => return Err(()),
-        };
+        let Some((tag, value, next)) = next_tlv(rest) else { return Err(()) };
         f(tag, value)?;
         rest = next;
     }

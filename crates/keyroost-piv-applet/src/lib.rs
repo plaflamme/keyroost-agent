@@ -296,10 +296,7 @@ pub(crate) fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
 /// value at bytes 5–6 and the body at byte 7 — the host's `build_apdu_ext`
 /// form, which the large PUT DATA and IMPORT ASYMMETRIC KEY bodies use.
 pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(usize, &[u8], &[u8]), ()> {
-    let first = match apdu.get(4) {
-        Some(&b) => b,
-        None => return Ok((0, &[], &[])),
-    };
+    let Some(&first) = apdu.get(4) else { return Ok((0, &[], &[])) };
     if first != 0 {
         let lc = usize::from(first);
         let Some(body) = apdu.get(5..5 + lc) else { return Err(()) };
