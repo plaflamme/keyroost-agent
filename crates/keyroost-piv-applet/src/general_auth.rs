@@ -200,15 +200,21 @@ impl PivApplet {
     }
 }
 
-/// The size of the `81` member a GA signature on `alg` expects: the curve's
-/// field byte size for EC (the host hashes with the curve's hash) and the
-/// modulus size for RSA (the host sends the pre-encoded PKCS#1 v1.5
-/// DigestInfo block — the card applies no padding).
+/// The size of the `81` member a GA signature on `alg` expects: the ECDSA
+/// hash output size for EC (the host sends the raw digest, hashed with the
+/// curve's SP 800-78 hash) and the modulus size for RSA (the host sends the
+/// pre-encoded PKCS#1 v1.5 DigestInfo block — the card applies no padding).
+///
+/// For P-256/P-384 the hash output happens to equal the curve's field size
+/// (SHA-256 → 32, SHA-384 → 48), but P-521 pairs with SHA-512, whose 64-byte
+/// output is two bytes short of the 66-byte field: the host sends those 64
+/// bytes, so that is what the slot path accepts (`sign_prehash` reduces the
+/// digest modulo `n` regardless of its length).
 fn ga_sign_block_bytes(alg: KeyAlg) -> Option<usize> {
     match alg {
         KeyAlg::EccP256 => Some(32),
         KeyAlg::EccP384 => Some(48),
-        KeyAlg::EccP521 => Some(66),
+        KeyAlg::EccP521 => Some(64),
         KeyAlg::Rsa1024 => Some(128),
         KeyAlg::Rsa2048 => Some(256),
         KeyAlg::Rsa3072 => Some(384),
@@ -217,12 +223,15 @@ fn ga_sign_block_bytes(alg: KeyAlg) -> Option<usize> {
     }
 }
 
-/// The uncompressed-point size a GA key agreement on `alg` expects.
+/// The uncompressed-point size a GA key agreement on `alg` expects:
+/// `04 || X || Y`, so `1 + 2 * field_size` -- 65 for P-256 (32-byte field),
+/// 97 for P-384 (48), 133 for P-521 (66-byte field; its coordinates are the
+/// full field width, not the 64-byte SHA-512 size).
 fn ec_point_bytes(alg: KeyAlg) -> Option<usize> {
     match alg {
         KeyAlg::EccP256 => Some(65),
         KeyAlg::EccP384 => Some(97),
-        KeyAlg::EccP521 => Some(129),
+        KeyAlg::EccP521 => Some(133),
         _ => None,
     }
 }
@@ -901,6 +910,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ga_slot_signs_a_p521_digest() {
+        let mut applet = PivApplet::new();
+        let point = slot_with_key(
+            &mut applet,
+            keyroost_piv::Slot::Authentication, // 9A: ONCE
+            keyroost_piv::KeyAlg::EccP521,
+        );
+        assert_eq!(point.len(), 133);
+        assert_eq!(
+            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            SW_OK
+        );
+        // The host hashes the TBS with SHA-512: a 64-byte digest, two bytes
+        // short of the 66-byte field -- the applet accepts it as-is.
+        let digest = [0x2D; 64];
+        let r = applet.process(&keyroost_piv::general_auth_sign(
+            keyroost_piv::KeyAlg::EccP521.id(),
+            0x9A,
+            &digest,
+        ));
+        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        use p521::ecdsa::signature::hazmat::PrehashVerifier;
+        let vk = p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("the announced point");
+        let sig = p521::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
+        vk.verify_prehash(&digest, &sig).expect("a valid signature");
+    }
+
+    #[test]
     fn ga_slot_ecdh_answers_the_p384_shared_x_coordinate() {
         let mut applet = PivApplet::new();
         let point = slot_with_key(
@@ -920,6 +958,33 @@ pub(crate) mod tests {
         let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
         assert_eq!(z.len(), 48);
         let card_pub = p384::PublicKey::from_sec1_bytes(&point).expect("the announced point");
+        let expected = peer.diffie_hellman(&card_pub);
+        assert_eq!(z, expected.raw_secret_bytes().as_slice());
+    }
+
+    #[test]
+    fn ga_slot_ecdh_answers_the_p521_shared_x_coordinate() {
+        let mut applet = PivApplet::new();
+        let point = slot_with_key(
+            &mut applet,
+            keyroost_piv::Slot::CardAuthentication, // 9E: NEVER
+            keyroost_piv::KeyAlg::EccP521,
+        );
+        // A P-521 uncompressed point is `04 || X || Y` = 1 + 66 + 66 = 133
+        // bytes, not the 1 + 64 + 64 a SHA-512-sized coordinate would give.
+        assert_eq!(point.len(), 133);
+        use p521::elliptic_curve::sec1::ToEncodedPoint;
+        let mut rng = rand_core::OsRng;
+        let peer = p521::ecdh::EphemeralSecret::random(&mut rng);
+        let r = applet.process(&keyroost_piv::general_auth_key_agree(
+            keyroost_piv::KeyAlg::EccP521.id(),
+            0x9E,
+            peer.public_key().to_encoded_point(false).as_bytes(),
+        ));
+        assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
+        let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(z.len(), 66);
+        let card_pub = p521::PublicKey::from_sec1_bytes(&point).expect("the announced point");
         let expected = peer.diffie_hellman(&card_pub);
         assert_eq!(z, expected.raw_secret_bytes().as_slice());
     }

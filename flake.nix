@@ -155,7 +155,8 @@
                 # RSA-2048 exercises on-card signing with a modulus-size block
                 # (256 bytes), which crosses the 255-byte boundary into the
                 # two-byte BER length form the slot GA path must parse.
-                # P-521 key generation works but P-521 signing still fails (SW=6A86).
+                # P-521 pairs with SHA-512, whose 64-byte digest is two bytes
+                # short of the 66-byte field: the applet accepts it as-is.
 
                 algorithms = [
                     # (alg_name, slot, slot_label, force)
@@ -163,6 +164,10 @@
                     # sign/verify -- all via on-card signing.
                     ("eccp256", "9a", "authentication", False),
                     ("eccp384", "9a", "authentication", False),
+                    # P-521 generation needs --force: keyroost's capability
+                    # list marks the emulated YubiKey-4 ATR as not supporting
+                    # it, though the applet does.
+                    ("eccp521", "9a", "authentication", True),
                     ("rsa2048", "9a", "authentication", False),
                 ]
 
