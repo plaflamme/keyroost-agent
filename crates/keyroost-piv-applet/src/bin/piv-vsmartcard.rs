@@ -1,6 +1,6 @@
-//! VSmartCard front end: presents [`PivApplet`] as a PC/SC card.
+//! `VSmartCard` front end: presents [`PivApplet`] as a PC/SC card.
 //!
-//! This binary is the `vpicc` (virtual ICC) side of the VSmartCard
+//! This binary is the `vpicc` (virtual ICC) side of the `VSmartCard`
 //! architecture: it listens on a TCP port; the `vpcd` PC/SC reader driver
 //! (shipped by `pkgs.vsmartcard-vpcd`, registered with `pcscd` by the
 //! `services.vsmartcard-vpcd` NixOS module, and pointed at this host with
@@ -9,7 +9,7 @@
 //!
 //! # Wire protocol
 //!
-//! VSmartCard is a length-prefixed TCP protocol in both directions: a
+//! `VSmartCard` is a length-prefixed TCP protocol in both directions: a
 //! big-endian `u16` count, then exactly that many payload bytes.
 //!
 //! * The driver sends a one-byte control message: `0x00` (power off),
@@ -34,8 +34,8 @@ use tracing_subscriber::EnvFilter;
 
 use keyroost_piv_applet::{PivApplet, Response};
 
-/// The ATR of a YubiKey 4, so card drivers that match on the ATR (OpenSC's
-/// PIV support, GnuPG) bind to the virtual card.
+/// The ATR of a `YubiKey` 4, so card drivers that match on the ATR (`OpenSC`'s
+/// PIV support, `GnuPG`) bind to the virtual card.
 const DEFAULT_ATR: &str = "3BFD1300008131FE158073C021C057597562694B657940";
 
 // VSmartCard control commands (driver → card, one-byte payload).

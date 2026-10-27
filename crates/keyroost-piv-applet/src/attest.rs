@@ -10,7 +10,7 @@
 //!   host reads back through GET DATA object `5FFF01` (the Yubico PIV
 //!   Attestation Certificate),
 //! - a certificate for a key slot's key, minted on demand by ATTEST: the
-//!   slot's public key under the issuer "PIVApplet Attestation", signed by
+//!   slot's public key under the issuer "`PIVApplet` Attestation", signed by
 //!   the `F9` key — the card's proof that the key it names was generated on
 //!   the card.
 
@@ -41,7 +41,7 @@ const CN_STRING: &[u8] = b"PIVApplet Attestation";
 const NOT_BEFORE: &[u8] = b"180101000000Z";
 const NOT_AFTER: &[u8] = b"20500101000000Z";
 
-/// The ecdsa-with-SHA-256 AlgorithmIdentifier: the OID alone, no parameters
+/// The ecdsa-with-SHA-256 `AlgorithmIdentifier`: the OID alone, no parameters
 /// (the reference writes the bare OID for EC signers).
 const SIG_ALG_ECDSA_SHA256: &[u8] = &[
     0x30, 0x0A, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,

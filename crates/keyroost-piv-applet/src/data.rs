@@ -7,7 +7,7 @@
 //! certificate objects are per-slot state while the three non-slot objects
 //! live in [`PivData`]. Both are opaque: the applet neither parses nor
 //! rewrites a value, so a certificate written with the host's
-//! [`keyroost_piv::encode_certificate`] (DER or gzip, CertInfo `0x00`/`0x01`)
+//! [`keyroost_piv::encode_certificate`] (DER or gzip, `CertInfo` `0x00`/`0x01`)
 //! reads back byte-identical.
 
 use crate::constants::{
@@ -150,10 +150,7 @@ impl PivApplet {
             Some(pair) => pair,
             None => return Response::sw(SW_DATA_INVALID),
         };
-        match self.store_data_object(&tag, value) {
-            true => Response::sw(SW_OK),
-            false => Response::sw(keyroost_piv::SW_NOT_FOUND),
-        }
+        if self.store_data_object(&tag, value) { Response::sw(SW_OK) } else { Response::sw(keyroost_piv::SW_NOT_FOUND) }
     }
 
     /// The value stored under the object `tag` — the slot's certificate for

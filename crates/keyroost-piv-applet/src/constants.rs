@@ -2,7 +2,7 @@
 //! the SP 800-73-4 dynamic-authentication tags, and the factory default
 //! values.
 
-/// Yubico extension: IMPORT ASYMMETRIC KEY. PivApplet implements it, but
+/// Yubico extension: IMPORT ASYMMETRIC KEY. `PivApplet` implements it, but
 /// `keyroost-piv` has no host-side builder for it, so the byte is local
 /// rather than a variant of [`keyroost_piv::Instruction`].
 pub const INS_IMPORT_ASYM: u8 = 0x86;
@@ -15,14 +15,14 @@ pub(crate) const SW_CLA_NOT_SUPPORTED: u16 = 0x6400;
 /// (a GET RESPONSE with nothing pending). Note `keyroost-piv` carries its
 /// own `SW_CONDITIONS_NOT_SATISFIED` = `0x6985`; this is the `0x6900` one.
 pub(crate) const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6900;
-/// ISO 7816-4 status word: incorrect P1/P2 — the JavaCard
+/// ISO 7816-4 status word: incorrect P1/P2 — the `JavaCard`
 /// `ISO7816.SW_INCORRECT_P1P2` word the card answers for an unexpected P1.
 pub(crate) const SW_INCORRECT_P1P2: u16 = 0x6B00;
-/// ISO 7816-4 status word: wrong data — the JavaCard
+/// ISO 7816-4 status word: wrong data — the `JavaCard`
 /// `ISO7816.SW_WRONG_DATA` word the card answers for a wrong-length or
 /// invalid reference-data body.
 pub(crate) const SW_WRONG_DATA: u16 = 0x6A86;
-/// ISO 7816-4 status word: security status not satisfied — the JavaCard
+/// ISO 7816-4 status word: security status not satisfied — the `JavaCard`
 /// `ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED` word the card answers when a
 /// management command's preconditions are not met.
 pub(crate) const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6986;
@@ -93,7 +93,7 @@ pub(crate) const TAG_79: u8 = 0x79;
 pub(crate) const DEFAULT_PIN_VALUE: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF];
 /// The factory PUK: "12345678".
 pub(crate) const DEFAULT_PUK_VALUE: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
-/// The factory PIN retry limit (PivApplet's `pinRetries`).
+/// The factory PIN retry limit (`PivApplet`'s `pinRetries`).
 pub(crate) const DEFAULT_PIN_TRIES: u8 = 5;
-/// The factory PUK retry limit (PivApplet's `pukRetries`).
+/// The factory PUK retry limit (`PivApplet`'s `pukRetries`).
 pub(crate) const DEFAULT_PUK_TRIES: u8 = 3;

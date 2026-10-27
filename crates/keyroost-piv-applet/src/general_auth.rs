@@ -203,7 +203,7 @@ impl PivApplet {
 /// The size of the `81` member a GA signature on `alg` expects: the ECDSA
 /// hash output size for EC (the host sends the raw digest, hashed with the
 /// curve's SP 800-78 hash) and the modulus size for RSA (the host sends the
-/// pre-encoded PKCS#1 v1.5 DigestInfo block — the card applies no padding).
+/// pre-encoded PKCS#1 v1.5 `DigestInfo` block — the card applies no padding).
 ///
 /// For P-256/P-384 the hash output happens to equal the curve's field size
 /// (SHA-256 → 32, SHA-384 → 48), but P-521 pairs with SHA-512, whose 64-byte
@@ -240,7 +240,7 @@ fn ec_point_bytes(alg: KeyAlg) -> Option<usize> {
 /// sends the pre-hashed digest — hashed with the slot curve's hash, SHA-
 /// 256/384/512 for P-256/384/521 — and the applet answers the DER-encoded
 /// signature under `82`), the raw CRT operation for the RSA slots (the
-/// host's pre-encoded DigestInfo block comes back raw under `82`).
+/// host's pre-encoded `DigestInfo` block comes back raw under `82`).
 fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
     match key.alg {
         KeyAlg::EccP256 => sign_p256(key, digest),
@@ -254,7 +254,7 @@ fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
 }
 
 /// The RSA half of the slot GA: the raw `m^d mod n` operation. The host
-/// sends the pre-encoded PKCS#1 v1.5 DigestInfo block — exactly the
+/// sends the pre-encoded PKCS#1 v1.5 `DigestInfo` block — exactly the
 /// modulus size, numerically below `n` — and the applet answers the
 /// zero-extended raw signature block under `82`; the card applies no
 /// padding, so a block that is not below `n` is refused rather than
@@ -454,7 +454,7 @@ fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
 /// length. `6B00` on a structurally broken template (truncated lengths,
 /// underrun), `6A86` on a protocol violation (two empty tags, an unknown or
 /// non-80/81/82 empty tag).
-fn parse_ga_template<'a>(body: &'a [u8]) -> Result<GaTemplate<'a>, u16> {
+fn parse_ga_template(body: &[u8]) -> Result<GaTemplate<'_>, u16> {
     let Some((&outer, rest)) = body.split_first() else {
         return Err(SW_WRONG_DATA);
     };

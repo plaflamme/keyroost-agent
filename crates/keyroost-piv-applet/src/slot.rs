@@ -62,7 +62,7 @@ pub(crate) struct Slot {
 ///
 /// An EC key's material is the curve's private scalar — a zeroized
 /// big-endian value, 32 bytes (P-256), 48 (P-384) or 66 (P-521), in
-/// `secret`. An RSA key's material is the key's PKCS#1 ("RSAPrivateKey")
+/// `secret`. An RSA key's material is the key's PKCS#1 ("`RSAPrivateKey`")
 /// DER encoding — the `rsa` crate's `RsaPrivateKey` via `to_pkcs1_der`,
 /// modulus, private exponent and the prime factors — and the card keeps
 /// only that byte string, deserializing it for each use (the raw GA sign

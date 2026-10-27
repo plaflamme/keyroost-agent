@@ -10,14 +10,14 @@
 //! device firmware), the same way `keyroost-transport`'s `PivSession` drives
 //! a real card from the host side. A ready front end ships in this crate as
 //! the `piv-vsmartcard` binary: it hosts the applet on PC/SC through the
-//! VSmartCard protocol, behind the `vpcd` reader driver.
+//! `VSmartCard` protocol, behind the `vpcd` reader driver.
 //!
 //! # Reference
 //!
-//! The behaviour being reimplemented here is the one of PivApplet, the
-//! JavaCard PIV applet (YubiKey-PIV-compatible, including the Yubico
+//! The behaviour being reimplemented here is the one of `PivApplet`, the
+//! `JavaCard` PIV applet (YubiKey-PIV-compatible, including the Yubico
 //! extension instructions) — done in pure Rust, so the crate itself needs no
-//! JavaCard toolchain or JVM; an engine front-end (e.g. jCardEngine) can
+//! `JavaCard` toolchain or JVM; an engine front-end (e.g. jCardEngine) can
 //! drive [`PivApplet::process`] directly.
 //!
 //! # Scope
@@ -40,7 +40,7 @@
 //! (nothing survives a power-off).
 //!
 //! The instruction surface is the union of SP 800-73-4's PIV commands and
-//! the Yubico extensions PivApplet implements — the same set
+//! the Yubico extensions `PivApplet` implements — the same set
 //! [`keyroost_piv::Instruction`] enumerates for the host side, plus IMPORT
 //! ASYMMETRIC KEY ([`INS_IMPORT_ASYM`]), which the host byte layer does not
 //! build yet.

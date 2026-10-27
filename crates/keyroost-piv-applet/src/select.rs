@@ -11,14 +11,14 @@ use crate::{PivApplet, Response, apdu_le};
 impl PivApplet {
     /// SELECT (0xA4, P1=`04`): activate the applet by AID.
     ///
-    /// The AID is matched the way a YubiKey matches: any prefix of
+    /// The AID is matched the way a `YubiKey` matches: any prefix of
     /// [`AID_FULL`] of at least [`AID_RID`] length selects the applet, so
     /// the host's 11-byte `select_full()`, its 5-byte `select()`, and
-    /// OpenSC's 9-byte generic PIV AID all work. A different P1, a shorter
+    /// `OpenSC`'s 9-byte generic PIV AID all work. A different P1, a shorter
     /// or non-matching AID answers [`keyroost_piv::SW_NOT_FOUND`].
     ///
     /// On success the answer is the application property template a
-    /// YubiKey 5 returns, byte for byte:
+    /// `YubiKey` 5 returns, byte for byte:
     ///
     /// ```text
     /// 61 11
@@ -62,7 +62,7 @@ impl PivApplet {
     }
 
     /// The application property template a SELECT answers with — the
-    /// YubiKey 5 response: a `61` wrapper holding the AID after the RID
+    /// `YubiKey` 5 response: a `61` wrapper holding the AID after the RID
     /// (tag `4F`) and the RID itself (tag `4F` inside the `79`
     /// application-identifier template).
     fn select_response() -> Vec<u8> {

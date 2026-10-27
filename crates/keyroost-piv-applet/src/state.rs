@@ -3,7 +3,7 @@
 use zeroize::Zeroizing;
 
 /// One PIV reference-data secret — the application PIN or the PUK — as the
-/// card's JavaCard `OwnerPIN` objects model it: the stored 8-byte value, the
+/// card's `JavaCard` `OwnerPIN` objects model it: the stored 8-byte value, the
 /// tries-remaining counter, and the session-verified flag.
 ///
 /// The value and the counter live for the applet's life; `verified` lives
@@ -35,7 +35,7 @@ impl Pin {
         }
     }
 
-    /// JavaCard `OwnerPIN.check`: compare `presented` to the stored value in
+    /// `JavaCard` `OwnerPIN.check`: compare `presented` to the stored value in
     /// constant time. A correct value sets `verified` and restores the
     /// counter to its limit; a wrong one burns a try and leaves `verified`
     /// untouched. Callers must not call this while blocked.
@@ -50,14 +50,14 @@ impl Pin {
         ok
     }
 
-    /// JavaCard `OwnerPIN.reset` / `resetAndUnblock`: the counter back to
+    /// `JavaCard` `OwnerPIN.reset` / `resetAndUnblock`: the counter back to
     /// its limit, `verified` cleared.
     pub(crate) fn reset(&mut self) {
         self.tries = self.max_tries;
         self.verified = false;
     }
 
-    /// JavaCard `OwnerPIN.update`: replace the stored value; the counter and
+    /// `JavaCard` `OwnerPIN.update`: replace the stored value; the counter and
     /// `verified` are untouched.
     pub(crate) fn set_value(&mut self, value: [u8; 8]) {
         *self.value = value;

@@ -183,7 +183,7 @@ impl PivApplet {
 /// The card's new-PIN/PUK validation: six to eight ASCII digits — the first
 /// six bytes must be digits, the last two are digits or 0xFF padding.
 fn is_valid_pin(value: &[u8; 8]) -> bool {
-    value[0..6].iter().all(|b| b.is_ascii_digit())
+    value[0..6].iter().all(u8::is_ascii_digit)
         && value[6..].iter().all(|b| *b == 0xFF || b.is_ascii_digit())
 }
 
