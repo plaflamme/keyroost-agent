@@ -520,7 +520,10 @@ fn read_tlv_length(buf: &[u8]) -> Result<(usize, usize), u16> {
             Ok((usize::from(b), 2))
         }
         Some(0x82) => {
-            let b = buf.get(2..4).ok_or(SW_DATA_INVALID)?;
+            // The two length bytes follow the `82` marker at indices 1 and
+            // 2 — the modulus-size RSA blocks are the only GA members long
+            // enough to reach this long form.
+            let b = buf.get(1..3).ok_or(SW_DATA_INVALID)?;
             let v = (usize::from(b[0])) << 8 | usize::from(b[1]);
             Ok((v, 3))
         }
@@ -972,12 +975,30 @@ pub(crate) mod tests {
 
     #[test]
     fn ga_slot_rsa_signs_the_hosts_preencoded_block() {
+        rsa_sign_roundtrip(keyroost_piv::KeyAlg::Rsa1024);
+    }
+
+    /// The RSA-2048 slot: its modulus-size block is 256 bytes, so the GA
+    /// dynamic-auth template crosses the 255-byte boundary and both its
+    /// `7C` wrapper and the `81` data member carry a two-byte `82` length —
+    /// the long form the slot path has to parse. (RSA-1024's 128-byte block
+    /// stays in the short form, so only this size exercises it.)
+    #[test]
+    fn ga_slot_rsa2048_signs_a_modulus_size_block() {
+        rsa_sign_roundtrip(keyroost_piv::KeyAlg::Rsa2048);
+    }
+
+    /// Generate an RSA key of `alg` in the `NEVER`-policy 9E slot (no VERIFY
+    /// needed), sign the host's pre-encoded modulus-size block through a
+    /// single extended-length GENERAL AUTHENTICATE, and check the raw
+    /// `s^e == m (mod n)` round trip plus the length guards.
+    fn rsa_sign_roundtrip(alg: keyroost_piv::KeyAlg) {
         let mut applet = PivApplet::new();
         mgmt_handshake(&mut applet);
         // 9E is `NEVER` at the factory: the sign round trip needs no VERIFY.
         let r = applet.process(&keyroost_piv::generate_key(
             keyroost_piv::Slot::CardAuthentication,
-            keyroost_piv::KeyAlg::Rsa1024.id(),
+            alg.id(),
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
@@ -989,11 +1010,7 @@ pub(crate) mod tests {
         // The host's pre-encoded DigestInfo block — exactly the modulus size.
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = 0x2B;
-        let r = applet.process(&keyroost_piv::general_auth_sign(
-            keyroost_piv::KeyAlg::Rsa1024.id(),
-            0x9E,
-            &block,
-        ));
+        let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &block));
         assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
         let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
         assert_eq!(s.len(), n.len(), "the answer is zero-extended to the modulus size");
@@ -1006,17 +1023,13 @@ pub(crate) mod tests {
         );
         // A short block is the wrong length, whatever it says.
         let r = applet.process(&keyroost_piv::general_auth_sign(
-            keyroost_piv::KeyAlg::Rsa1024.id(),
+            alg.id(),
             0x9E,
             &block[..block.len() - 1],
         ));
         assert_eq!(r.sw, SW_WRONG_DATA);
         // A block >= n is not a valid residue.
-        let r = applet.process(&keyroost_piv::general_auth_sign(
-            keyroost_piv::KeyAlg::Rsa1024.id(),
-            0x9E,
-            &n,
-        ));
+        let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &n));
         assert_eq!(r.sw, SW_WRONG_DATA);
     }
 
@@ -1100,5 +1113,28 @@ pub(crate) mod tests {
         // shape.
         let r = applet.process(&[0x00, 0x87, 0x11, 0x9A, 0x04, 0x7C, 0x02, 0x82, 0x00, 0x00]);
         assert_eq!(r.sw, SW_INCORRECT_P1P2);
+    }
+
+    #[test]
+    fn read_tlv_length_decodes_each_ber_form() {
+        // Short form: the length is the byte itself.
+        assert_eq!(read_tlv_length(&[0x00]), Ok((0, 1)));
+        assert_eq!(read_tlv_length(&[0x7F, 0xAA]), Ok((0x7F, 1)));
+        // One-byte long form (`81`): the next byte is the length.
+        assert_eq!(read_tlv_length(&[0x81, 0x80]), Ok((0x80, 2)));
+        assert_eq!(read_tlv_length(&[0x81, 0xFF]), Ok((0xFF, 2)));
+        // Two-byte long form (`82`): the two bytes immediately after the
+        // marker are the big-endian length -- the form the RSA-2048+ GA
+        // template (256-byte blocks) relies on. A regression here reads one
+        // byte too far and decodes a garbage length.
+        assert_eq!(read_tlv_length(&[0x82, 0x01, 0x00, 0xDE]), Ok((0x0100, 3)));
+        assert_eq!(read_tlv_length(&[0x82, 0x01, 0x06]), Ok((0x0106, 3)));
+        assert_eq!(read_tlv_length(&[0x82, 0xFF, 0xFF]), Ok((0xFFFF, 3)));
+        // Truncated long forms are structurally invalid.
+        assert_eq!(read_tlv_length(&[0x81]), Err(SW_DATA_INVALID));
+        assert_eq!(read_tlv_length(&[0x82, 0x01]), Err(SW_DATA_INVALID));
+        // `80` and `83`+ are not valid PIV length bytes.
+        assert_eq!(read_tlv_length(&[0x80]), Err(SW_DATA_INVALID));
+        assert_eq!(read_tlv_length(&[0x83, 0x00, 0x00, 0x00]), Err(SW_DATA_INVALID));
     }
 }

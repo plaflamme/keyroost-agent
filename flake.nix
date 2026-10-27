@@ -151,18 +151,19 @@
 
                 # --- Multi-algorithm test: test all supported key algorithms ---
                 # Use a single slot (9A) and test all supported algorithms sequentially
-                # Ed25519 and X25519 are key agreement only, not signing, so skip them
-                # Note: The applet supports RSA key generation but NOT RSA signing
-                # (self-signed certificates require on-card signing which fails for RSA)
-                # P-521 key generation works but P-521 signing fails (SW=6A86)
-                # So we only test P-256 and P-384 for full signing/cert operations
+                # Ed25519 and X25519 are key agreement only, not signing, so skip them.
+                # RSA-2048 exercises on-card signing with a modulus-size block
+                # (256 bytes), which crosses the 255-byte boundary into the
+                # two-byte BER length form the slot GA path must parse.
+                # P-521 key generation works but P-521 signing still fails (SW=6A86).
 
                 algorithms = [
                     # (alg_name, slot, slot_label, force)
-                    # P-256 and P-384 are the only algorithms that fully work:
-                    # key generation, certificate generation, sign/verify
+                    # Full round trip: key generation, certificate generation,
+                    # sign/verify -- all via on-card signing.
                     ("eccp256", "9a", "authentication", False),
                     ("eccp384", "9a", "authentication", False),
+                    ("rsa2048", "9a", "authentication", False),
                 ]
 
                 mgmt_key = "010203040506070801020304050607080102030405060708"
@@ -178,7 +179,7 @@
                     # Verify key is present
                     host.succeed("keyroostctl piv info | grep -F '" + slot_label + " (" + slot.upper() + ")' | grep -q 'key present, no certificate'")
 
-                    # Generate certificate (only ECC supports on-card signing)
+                    # Generate certificate (self-signed, via on-card signing)
                     host.succeed("PIN=" + pin + " MGMT=" + mgmt_key + " keyroostctl piv cert generate --slot " + slot + " --subject 'CN=Test-" + alg + "' --mgmt-key env:MGMT --pin env:PIN --yes")
 
                     # Export certificate
@@ -191,7 +192,7 @@
                     host.succeed("keyroostctl piv cert export --slot " + slot + " --out /tmp/cert_" + alg + "_2.pem --overwrite")
                     host.succeed("cmp /tmp/cert_" + alg + ".pem /tmp/cert_" + alg + "_2.pem")
 
-                    # Test sign/verify (ECC only - RSA signing is not supported)
+                    # Test sign/verify (on-card signing)
                     host.succeed("PIN=" + pin + " keyroostctl piv test --slot " + slot + " --pin env:PIN")
 
                     print(alg + " test PASSED")
