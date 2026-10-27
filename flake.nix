@@ -152,9 +152,12 @@
                 # --- Multi-algorithm test: test all supported key algorithms ---
                 # Use a single slot (9A) and test all supported algorithms sequentially
                 # Ed25519 and X25519 are key agreement only, not signing, so skip them.
-                # RSA-2048 exercises on-card signing with a modulus-size block
-                # (256 bytes), which crosses the 255-byte boundary into the
-                # two-byte BER length form the slot GA path must parse.
+                # Every RSA size exercises on-card signing with a modulus-size
+                # block (128/256/384/512 bytes); the 256-byte-and-larger ones
+                # cross the 255-byte boundary into the two-byte BER length form
+                # the slot GA path must parse. RSA-3072/4096 are supported
+                # without --force because the applet reports version 5.7+,
+                # where keyroost's capability table lists them.
                 # P-521 pairs with SHA-512, whose 64-byte digest is two bytes
                 # short of the 66-byte field: the applet accepts it as-is.
 
@@ -165,10 +168,13 @@
                     ("eccp256", "9a", "authentication", False),
                     ("eccp384", "9a", "authentication", False),
                     # P-521 generation needs --force: keyroost's capability
-                    # list marks the emulated YubiKey-4 ATR as not supporting
-                    # it, though the applet does.
+                    # list marks P-521 PIV key generation as unsupported on
+                    # YubiKey, though the applet does support it.
                     ("eccp521", "9a", "authentication", True),
+                    ("rsa1024", "9a", "authentication", False),
                     ("rsa2048", "9a", "authentication", False),
+                    ("rsa3072", "9a", "authentication", False),
+                    ("rsa4096", "9a", "authentication", False),
                 ]
 
                 mgmt_key = "010203040506070801020304050607080102030405060708"
