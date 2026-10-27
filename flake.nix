@@ -117,16 +117,29 @@
                 host.wait_for_unit("pcscd.socket")
                 host.wait_for_unit("piv-vsmartcard.service")
 
+                # Helper method to invoke keyroostctl with PIN and MGMT env vars set
+                def keyroostctl(args, pin="123456", mgmt="010203040506070801020304050607080102030405060708", **kwargs):
+                    env_parts = []
+                    if pin:
+                        env_parts.append(f"PIN={pin}")
+                    if mgmt:
+                        env_parts.append(f"MGMT={mgmt}")
+                    for key, value in kwargs.items():
+                        env_parts.append(f"{key}={value}")
+                    env_str = " ".join(env_parts) + " " if env_parts else ""
+                    cmd = f"{env_str}keyroostctl {args}"
+                    return host.succeed(cmd)
+
                 # Read-only status: fingerprint, version, serial, PIN retries, slots.
-                host.succeed("keyroostctl piv info")
+                keyroostctl("piv info")
 
                 # PIN change: CHANGE REFERENCE verifies the old PIN.
-                host.succeed("OLD=123456 NEW=654321 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
-                host.succeed("OLD=654321 NEW=123456 keyroostctl piv pin change --pin env:OLD --new-pin env:NEW")
+                keyroostctl("piv pin change --pin env:OLD --new-pin env:NEW", OLD="123456", NEW="654321")
+                keyroostctl("piv pin change --pin env:OLD --new-pin env:NEW", OLD="654321", NEW="123456")
 
                 # PUK change: the same command with the PUK reference.
-                host.succeed("OLD=12345678 NEW=87654321 keyroostctl piv puk change --puk env:OLD --new-puk env:NEW")
-                host.succeed("OLD=87654321 NEW=12345678 keyroostctl piv puk change --puk env:OLD --new-puk env:NEW")
+                keyroostctl("piv puk change --puk env:OLD --new-puk env:NEW", OLD="12345678", NEW="87654321")
+                keyroostctl("piv puk change --puk env:OLD --new-puk env:NEW", OLD="87654321", NEW="12345678")
 
                 # Block the PIN: five wrong old PINs, each burning one try.
                 host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
@@ -136,18 +149,22 @@
                 host.fail("BAD=000000 keyroostctl piv pin change --pin env:BAD --new-pin env:000000")
 
                 # Unblock with the PUK (RESET RETRY COUNTER), then restore the factory PIN.
-                host.succeed("PUK=12345678 NEW=654321 keyroostctl piv pin unblock --puk env:PUK --new-pin env:NEW")
+                keyroostctl("piv pin unblock --puk env:PUK --new-pin env:NEW", PUK="12345678", NEW="654321")
+
+                # Helper for setting retry counts
+                def set_retries(pin, pin_tries, puk_tries):
+                    return keyroostctl(f"piv retries set --pin-tries {pin_tries} --puk-tries {puk_tries} --pin env:PIN --mgmt-key env:MGMT --yes", pin=pin)
 
                 # Set the retry counts (Yubico 0xFA): needs the management key and the
                 # verified PIN; also resets both credentials to factory values.
-                host.succeed("PIN=654321 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv retries set --pin-tries 2 --puk-tries 2 --pin env:PIN --mgmt-key env:MGMT --yes")
+                set_retries("654321", 2, 2)
 
                 # Factory reset: the host burns the PIN and PUK counters itself, then sends RESET.
-                host.succeed("keyroostctl piv reset --yes")
+                keyroostctl("piv reset --yes")
 
                 # The card is back at factory state: the factory PIN and the factory
                 # management key work again.
-                host.succeed("PIN=123456 MGMT=010203040506070801020304050607080102030405060708 keyroostctl piv retries set --pin-tries 5 --puk-tries 3 --pin env:PIN --mgmt-key env:MGMT --yes")
+                set_retries("123456", 5, 3)
 
                 # --- Multi-algorithm test: test all supported key algorithms ---
                 # Use a single slot (9A) and test all supported algorithms sequentially
@@ -160,10 +177,6 @@
                 # where keyroost's capability table lists them.
                 # P-521 pairs with SHA-512, whose 64-byte digest is two bytes
                 # short of the 66-byte field: the applet accepts it as-is.
-
-                # Every algorithm is tested in the same slot.
-                slot = "9a"
-                slot_label = "authentication"
 
                 algorithms = [
                     # (alg_name, force)
@@ -181,46 +194,47 @@
                     ("rsa4096", False),
                 ]
 
-                mgmt_key = "010203040506070801020304050607080102030405060708"
-                pin = "123456"
-
                 for alg, force in algorithms:
-                    print("=== Testing " + alg + " in slot " + slot + " (" + slot_label + ") ===")
+                    # Every algorithm is tested in the same slot.
+                    slot = "9a"
+                    slot_label = "authentication"
+
+                    print(f"=== Testing {alg} ===")
 
                     # Generate key
                     force_flag = " --force" if force else ""
-                    host.succeed("MGMT=" + mgmt_key + " keyroostctl piv key generate --slot " + slot + " --algorithm " + alg + " --mgmt-key env:MGMT" + force_flag + " --yes")
+                    keyroostctl(f"piv key generate --slot {slot} --algorithm {alg} --mgmt-key env:MGMT{force_flag} --yes")
 
-                    # Verify key is present
-                    host.succeed("keyroostctl piv info | grep -F '" + slot_label + " (" + slot.upper() + ")' | grep -q 'key present, no certificate'")
+                        # Verify key is present
+                    keyroostctl(f"piv info | grep -F '{slot_label} ({slot.upper()})' | grep -q 'key present, no certificate'")
 
                     # Generate certificate (self-signed, via on-card signing)
-                    host.succeed("PIN=" + pin + " MGMT=" + mgmt_key + " keyroostctl piv cert generate --slot " + slot + " --subject 'CN=Test-" + alg + "' --mgmt-key env:MGMT --pin env:PIN --yes")
+                    keyroostctl(f"piv cert generate --slot {slot} --subject 'CN=Test-{alg}' --mgmt-key env:MGMT --pin env:PIN --yes")
 
                     # Export certificate
-                    host.succeed("keyroostctl piv cert export --slot " + slot + " --out /tmp/cert_" + alg + ".pem --overwrite")
+                    keyroostctl(f"piv cert export --slot {slot} --out /tmp/cert_{alg}.pem --overwrite")
 
                     # Import certificate
-                    host.succeed("MGMT=" + mgmt_key + " keyroostctl piv cert import --slot " + slot + " --in /tmp/cert_" + alg + ".pem --mgmt-key env:MGMT --yes")
+                    keyroostctl(f"piv cert import --slot {slot} --in /tmp/cert_{alg}.pem --mgmt-key env:MGMT --yes")
 
                     # Export again and verify identical
-                    host.succeed("keyroostctl piv cert export --slot " + slot + " --out /tmp/cert_" + alg + "_2.pem --overwrite")
-                    host.succeed("cmp /tmp/cert_" + alg + ".pem /tmp/cert_" + alg + "_2.pem")
+                    keyroostctl(f"piv cert export --slot {slot} --out /tmp/cert_{alg}_2.pem --overwrite")
+                    host.succeed(f"cmp /tmp/cert_{alg}.pem /tmp/cert_{alg}_2.pem")
 
                     # Test sign/verify (on-card signing)
-                    host.succeed("PIN=" + pin + " keyroostctl piv test --slot " + slot + " --pin env:PIN")
+                    keyroostctl(f"piv test --slot {slot} --pin env:PIN")
 
                     print(alg + " test PASSED")
 
                     # Delete the key and certificate for this algorithm before testing the next
-                    host.succeed("MGMT=" + mgmt_key + " keyroostctl piv key delete --slot " + slot + " --mgmt-key env:MGMT --yes")
-                    host.succeed("MGMT=" + mgmt_key + " keyroostctl piv cert delete --slot " + slot + " --mgmt-key env:MGMT --yes")
+                    keyroostctl(f"piv key delete --slot {slot} --mgmt-key env:MGMT --yes")
+                    keyroostctl(f"piv cert delete --slot {slot} --mgmt-key env:MGMT --yes")
 
                 # Final empty card check
-                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
+                keyroostctl("piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
 
                 # Final empty card check
-                host.succeed("keyroostctl piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
+                keyroostctl("piv info | grep -F 'authentication (9A)' | grep -q 'empty'")
 
                 print("=== All tests PASSED ===")
               '';
