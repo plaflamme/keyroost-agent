@@ -161,26 +161,30 @@
                 # P-521 pairs with SHA-512, whose 64-byte digest is two bytes
                 # short of the 66-byte field: the applet accepts it as-is.
 
+                # Every algorithm is tested in the same slot.
+                slot = "9a"
+                slot_label = "authentication"
+
                 algorithms = [
-                    # (alg_name, slot, slot_label, force)
+                    # (alg_name, force)
                     # Full round trip: key generation, certificate generation,
                     # sign/verify -- all via on-card signing.
-                    ("eccp256", "9a", "authentication", False),
-                    ("eccp384", "9a", "authentication", False),
+                    ("eccp256", False),
+                    ("eccp384", False),
                     # P-521 generation needs --force: keyroost's capability
                     # list marks P-521 PIV key generation as unsupported on
                     # YubiKey, though the applet does support it.
-                    ("eccp521", "9a", "authentication", True),
-                    ("rsa1024", "9a", "authentication", False),
-                    ("rsa2048", "9a", "authentication", False),
-                    ("rsa3072", "9a", "authentication", False),
-                    ("rsa4096", "9a", "authentication", False),
+                    ("eccp521", True),
+                    ("rsa1024", False),
+                    ("rsa2048", False),
+                    ("rsa3072", False),
+                    ("rsa4096", False),
                 ]
 
                 mgmt_key = "010203040506070801020304050607080102030405060708"
                 pin = "123456"
 
-                for alg, slot, slot_label, force in algorithms:
+                for alg, force in algorithms:
                     print("=== Testing " + alg + " in slot " + slot + " (" + slot_label + ") ===")
 
                     # Generate key
