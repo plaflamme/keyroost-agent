@@ -143,7 +143,7 @@ impl PivApplet {
             Err(sw) => return Response::sw(sw),
         };
         match MgmtAlg::from_id(p1) {
-            Some(alg) => self.ga_sym(alg, tmpl),
+            Some(alg) => self.ga_sym(alg, &tmpl),
             // Asymmetric (or unknown) algorithm: no key slot, so no
             // exchange — the reference fails on the missing key.
             None => Response::sw(SW_INCORRECT_P1P2),
@@ -152,7 +152,7 @@ impl PivApplet {
 
     /// The symmetric 9B dynamic-auth exchange (the card's
     /// `processGenAuthSym`), once the template is parsed.
-    fn ga_sym(&mut self, alg: MgmtAlg, t: GaTemplate) -> Response {
+    fn ga_sym(&mut self, alg: MgmtAlg, t: &GaTemplate) -> Response {
         if self.mgmt.alg() != alg {
             return Response::sw(SW_INCORRECT_P1P2);
         }

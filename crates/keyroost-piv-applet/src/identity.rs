@@ -77,8 +77,8 @@ impl PivApplet {
         }
         let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
         let body = match apdu[3] {
-            0x80 => self.pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
-            0x81 => self.pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
+            0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
+            0x81 => PivApplet::pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
             reference => match slot_index(reference) {
                 Some(index) => match self.key_reference_metadata(index) {
                     Some(body) => body,
@@ -114,7 +114,7 @@ impl PivApplet {
 
     /// The flat metadata TLVs of a PIN/PUK reference: `05 <is default>` and
     /// `06 <remaining><total>`.
-    fn pin_reference_metadata(&self, reference: &Pin, factory: [u8; 8]) -> Vec<u8> {
+    fn pin_reference_metadata(reference: &Pin, factory: [u8; 8]) -> Vec<u8> {
         let is_default = *reference.value == factory;
         vec![
             0x05,
