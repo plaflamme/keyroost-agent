@@ -117,7 +117,7 @@ impl PivApplet {
             // blocked both PIN and PUK; this applet has no key slots yet.
             return Response::sw(tries_sw(target.tries));
         }
-        if !is_valid_pin(&new_value) {
+        if !is_valid_pin(new_value) {
             return Response::sw(SW_WRONG_DATA);
         }
         target.set_value(new_value);
@@ -162,7 +162,7 @@ impl PivApplet {
             // blocked both PIN and PUK; this applet has no key slots yet.
             return Response::sw(tries_sw(self.puk.tries));
         }
-        if !is_valid_pin(&new_pin) {
+        if !is_valid_pin(new_pin) {
             return Response::sw(SW_WRONG_DATA);
         }
         self.pin.set_value(new_pin);
@@ -173,7 +173,7 @@ impl PivApplet {
 
 /// The card's new-PIN/PUK validation: six to eight ASCII digits — the first
 /// six bytes must be digits, the last two are digits or 0xFF padding.
-fn is_valid_pin(value: &[u8; 8]) -> bool {
+fn is_valid_pin(value: [u8; 8]) -> bool {
     value[0..6].iter().all(u8::is_ascii_digit)
         && value[6..].iter().all(|b| *b == 0xFF || b.is_ascii_digit())
 }

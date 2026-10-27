@@ -37,8 +37,8 @@ pub(crate) struct PivData {
 impl PivData {
     /// The object stored under `tag`, or `None` when no object exists under
     /// it (or `tag` is not a non-slot object tag).
-    pub(crate) fn get(&self, tag: &[u8; 3]) -> Option<&[u8]> {
-        match *tag {
+    pub(crate) fn get(&self, tag: [u8; 3]) -> Option<&[u8]> {
+        match tag {
             OBJECT_CHUID => self.chuid.as_deref(),
             OBJECT_PIN_PROTECTED_DATA => self.pin_protected.as_deref(),
             OBJECT_ADMIN_DATA => self.admin_data.as_deref(),
@@ -48,8 +48,8 @@ impl PivData {
 
     /// Store `value` under `tag`, returning whether the tag names a known
     /// non-slot object.
-    pub(crate) fn put(&mut self, tag: &[u8; 3], value: Vec<u8>) -> bool {
-        match *tag {
+    pub(crate) fn put(&mut self, tag: [u8; 3], value: Vec<u8>) -> bool {
+        match tag {
             OBJECT_CHUID => {
                 self.chuid = Some(value);
                 true
@@ -71,13 +71,13 @@ impl PivData {
 /// tag — `5F C1 05` (`9A`), `5F C1 0A` (`9C`), `5F C1 0B` (`9D`),
 /// `5F C1 01` (`9E`) and `5F C1 0C+n` for retired slot `n` — or `None`
 /// for a non-slot object tag.
-pub(crate) fn cert_slot_index(tag: &[u8; 3]) -> Option<usize> {
+pub(crate) fn cert_slot_index(tag: [u8; 3]) -> Option<usize> {
     match tag {
         [0x5F, 0xC1, 0x05] => Some(0),
         [0x5F, 0xC1, 0x0A] => Some(1),
         [0x5F, 0xC1, 0x0B] => Some(2),
         [0x5F, 0xC1, 0x01] => Some(3),
-        [0x5F, 0xC1, third] if (0x0D..=0x20).contains(third) => Some(3 + usize::from(third - 0x0C)),
+        [0x5F, 0xC1, third] if (0x0D..=0x20).contains(&third) => Some(3 + usize::from(third - 0x0C)),
         _ => None,
     }
 }
@@ -103,7 +103,7 @@ impl PivApplet {
         let Ok((_lc, body, tail)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         let Ok(le) = apdu_le(tail) else { return Response::sw(SW_WRONG_LENGTH) };
         let Some(tag) = selector_tag(body) else { return Response::sw(SW_DATA_INVALID) };
-        match self.data_object_value(&tag) {
+        match self.data_object_value(tag) {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
                 push_tlv(&mut full, &[0x53], value);
@@ -135,15 +135,15 @@ impl PivApplet {
         }
         let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         let Some((tag, value)) = parse_put_body(body) else { return Response::sw(SW_DATA_INVALID) };
-        if self.store_data_object(&tag, value) { Response::sw(SW_OK) } else { Response::sw(keyroost_piv::SW_NOT_FOUND) }
+        if self.store_data_object(tag, value) { Response::sw(SW_OK) } else { Response::sw(keyroost_piv::SW_NOT_FOUND) }
     }
 
     /// The value stored under the object `tag` — the slot's certificate for
     /// a slot tag, the `F9` attestation certificate for `5F FF 01`, the
     /// corresponding [`PivData`] object otherwise — or `None` when nothing
     /// has been stored under it.
-    pub(crate) fn data_object_value(&self, tag: &[u8; 3]) -> Option<&[u8]> {
-        if *tag == ATTESTATION_OBJECT_TAG {
+    pub(crate) fn data_object_value(&self, tag: [u8; 3]) -> Option<&[u8]> {
+        if tag == ATTESTATION_OBJECT_TAG {
             return self.attestation.cert.as_deref();
         }
         match cert_slot_index(tag) {
@@ -156,8 +156,8 @@ impl PivApplet {
     /// slot tag, the `F9` attestation certificate for `5F FF 01`, the
     /// corresponding [`PivData`] object otherwise. Returns whether the tag
     /// names a known object.
-    pub(crate) fn store_data_object(&mut self, tag: &[u8; 3], value: Vec<u8>) -> bool {
-        if *tag == ATTESTATION_OBJECT_TAG {
+    pub(crate) fn store_data_object(&mut self, tag: [u8; 3], value: Vec<u8>) -> bool {
+        if tag == ATTESTATION_OBJECT_TAG {
             self.attestation.cert = Some(value);
             return true;
         }
