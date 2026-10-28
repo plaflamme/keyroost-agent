@@ -100,10 +100,11 @@ impl PivApplet {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 
-    /// The exact SELECT response a YubiKey 5 returns (body, no SW), as
+    /// The exact SELECT response a `YubiKey` 5 returns (body, no SW), as
     /// captured on hardware: a `61` wrapper holding the AID after the RID
     /// and the RID itself.
     const YUBIKEY5_SELECT_BODY: [u8; 19] = [

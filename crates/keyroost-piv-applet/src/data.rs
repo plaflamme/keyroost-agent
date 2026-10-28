@@ -234,6 +234,7 @@ pub(crate) fn push_tlv(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::general_auth::tests::mgmt_handshake;
@@ -280,7 +281,7 @@ mod tests {
         }
     }
 
-    /// A certificate built with the host's encoder — DER plus the CertInfo
+    /// A certificate built with the host's encoder — DER plus the `CertInfo`
     /// `0x01` gzip flag — is stored opaquely: the `53` value PUT DATA wrote
     /// is what GET DATA returns, byte for byte.
     #[test]
@@ -382,11 +383,11 @@ mod tests {
         let first = applet.process(&get_data(&tag));
         assert_eq!(first.data.len(), 256);
         assert_eq!(first.sw, 0x6130);
-        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data.len(), 48);
-        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+        let second = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
+        assert_eq!(second.data.len(), 48);
+        assert_eq!(second.sw, keyroost_piv::SW_OK);
         let mut full = first.data;
-        full.extend_from_slice(&rest.data);
+        full.extend_from_slice(&second.data);
         let inner = unwrap_data_object(&full).expect("a well-formed 53 template");
         assert_eq!(inner, value.as_slice());
     }

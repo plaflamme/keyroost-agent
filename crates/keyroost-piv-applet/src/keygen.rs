@@ -584,6 +584,8 @@ impl PivApplet {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
     use crate::constants::{INS_IMPORT_ASYM, SW_SECURITY_NOT_SATISFIED};
@@ -675,7 +677,7 @@ mod tests {
     fn point_of(r: &Response) -> Vec<u8> {
         match parse_public_key(&r.data).expect("a well-formed public-key template") {
             PublicKey::Ecc { point } => point,
-            other => panic!("expected an EC point, got {other:?}"),
+            PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
     }
 
@@ -817,7 +819,7 @@ mod tests {
             &ec_body(&scalar, Some(0x02), Some(0x02)),
         ));
         assert_eq!(r.sw, SW_OK);
-        assert!(r.data.is_empty());
+        assert_eq!(r.data, [] as [u8; 0]);
 
         let slot = &app.slots[0];
         let key = slot.key.as_ref().expect("the imported key");
@@ -960,13 +962,14 @@ mod tests {
     fn rsa_public_of(r: &Response) -> (Vec<u8>, Vec<u8>) {
         match parse_public_key(&r.data).expect("a well-formed public-key template") {
             PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
-            other => panic!("expected an RSA modulus, got {other:?}"),
+            PublicKey::Ecc { .. } => panic!("expected an RSA modulus"),
         }
     }
 
     /// The GA sign round trip for an RSA slot: the host sends a raw block
     /// under the slot's algorithm id and the card's raw `m^d mod n` answer
     /// must satisfy `s^e == m (mod n)`.
+    #[allow(clippy::many_single_char_names)]
     fn rsa_sign_check(app: &mut PivApplet, alg: KeyAlg, slot: u8, n: &[u8], e: &[u8], m: u8) {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = m;

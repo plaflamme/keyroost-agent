@@ -500,6 +500,8 @@ fn read_tlv_length(buf: &[u8]) -> Result<(usize, usize), u16> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::items_after_statements)]
 pub(crate) mod tests {
     use super::*;
     use crate::constants::{
@@ -785,7 +787,7 @@ pub(crate) mod tests {
         assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
         match keyroost_piv::parse_public_key(&r.data).expect("a well-formed public-key template") {
             keyroost_piv::PublicKey::Ecc { point } => point,
-            other => panic!("expected an EC point, got {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
     }
 
@@ -1029,7 +1031,7 @@ pub(crate) mod tests {
         assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
         let (n, e) = match keyroost_piv::parse_public_key(&r.data).expect("a template") {
             keyroost_piv::PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
-            other => panic!("expected an RSA modulus, got {other:?}"),
+            keyroost_piv::PublicKey::Ecc { .. } => panic!("expected an RSA modulus"),
         };
         // The host's pre-encoded DigestInfo block — exactly the modulus size.
         let mut block = vec![0u8; n.len()];

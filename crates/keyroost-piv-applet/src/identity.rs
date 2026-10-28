@@ -148,6 +148,7 @@ fn push_ber_len(out: &mut Vec<u8>, len: usize) {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::constants::{DEFAULT_PIN_TRIES, DEFAULT_PUK_TRIES, DEFAULT_SERIAL};
@@ -328,7 +329,7 @@ mod tests {
         assert_eq!(generated.sw, keyroost_piv::SW_OK);
         let announced = match parse_public_key(&generated.data).expect("the announced public key") {
             keyroost_piv::PublicKey::Ecc { point } => point,
-            other => panic!("expected an EC point, got {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         };
         let md = metadata(&mut applet, 0x9C);
         assert_eq!(md.algorithm, Some(KeyAlg::EccP256.id()));
@@ -363,7 +364,7 @@ mod tests {
         assert_eq!(generated.sw, keyroost_piv::SW_OK);
         let announced = match parse_public_key(&generated.data).expect("the announced public key") {
             keyroost_piv::PublicKey::Ecc { point } => point,
-            other => panic!("expected an EC point, got {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         };
         assert_eq!(announced.len(), 133);
         p521::ecdsa::VerifyingKey::from_sec1_bytes(&announced).expect("a P-521 point");
@@ -387,7 +388,7 @@ mod tests {
         assert_eq!(generated.sw, keyroost_piv::SW_OK);
         let announced = match parse_public_key(&generated.data).expect("the announced public key") {
             keyroost_piv::PublicKey::Ecc { point } => point,
-            other => panic!("expected an EC point, got {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         };
         assert_eq!(announced.len(), 97);
         p384::ecdsa::VerifyingKey::from_sec1_bytes(&announced).expect("a P-384 point");

@@ -268,6 +268,7 @@ pub(crate) fn fresh_attestation() -> Attestation {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::constants::SW_OK;
@@ -320,7 +321,7 @@ mod tests {
         assert_eq!(alg, KeyAlg::EccP256);
         match point {
             keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
-            other => panic!("expected an EC point: {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
 
         let (pin, touch) = keyroost_piv::x509_parse::parse_key_policy_extension(&cert_data)
@@ -464,7 +465,7 @@ mod tests {
         assert_eq!(alg, KeyAlg::EccP521);
         match point {
             keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
-            other => panic!("expected an EC point: {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
     }
 
@@ -500,7 +501,7 @@ mod tests {
         assert_eq!(alg, KeyAlg::EccP256);
         match point {
             keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
-            other => panic!("expected an EC point: {other:?}"),
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
         let (tbs, sig_bytes) = tbs_and_signature(der).expect("certificate structure");
         let f9_signing =

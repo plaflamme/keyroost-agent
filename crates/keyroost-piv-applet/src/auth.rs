@@ -179,6 +179,7 @@ fn is_valid_pin(value: [u8; 8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) mod tests {
     use super::*;
     use crate::constants::{DEFAULT_PIN_TRIES, DEFAULT_PUK_TRIES};

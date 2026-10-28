@@ -283,6 +283,7 @@ impl PivApplet {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) mod tests {
     use super::*;
     use crate::auth::tests::block_pin;

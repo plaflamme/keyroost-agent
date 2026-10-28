@@ -273,6 +273,7 @@ impl PivApplet {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::PivApplet;
