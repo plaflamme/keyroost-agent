@@ -98,6 +98,9 @@
             piv-multi-slot = pkgs.callPackage ./nix/checks/piv-multi-slot.nix {
               inherit keyroost keyroost-piv-applet system;
             };
+            piv-attest = pkgs.callPackage ./nix/checks/piv-attest.nix {
+              inherit keyroost keyroost-piv-applet system;
+            };
           };
 
           devShells.default = config.devShells.rust;
