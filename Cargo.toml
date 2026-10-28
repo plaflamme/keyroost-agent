@@ -11,9 +11,9 @@ description = "Implementation of the ssh agent protocol on top of keyroost APIs"
 clap = { version = "4", features = ["derive"] }
 clap-verbosity-flag = { version = "3", features = ["tracing"] }
 ecdsa = "0.16"
-keyroost-openpgp = { version = "0.13.0" }
-keyroost-piv = { version = "0.13.0" }
-keyroost-transport = { version = "0.13.0" }
+keyroost-openpgp = { version = "0.14.0" }
+keyroost-piv = { version = "0.14.0" }
+keyroost-transport = { version = "0.14.0" }
 p256 = "0.13"
 p384 = "0.13"
 p521 = "0.13"

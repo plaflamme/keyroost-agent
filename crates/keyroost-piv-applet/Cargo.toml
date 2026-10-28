@@ -8,9 +8,9 @@ description = "Pure-Rust PIV (NIST SP 800-73-4 / FIPS 201) card-side applet: hos
 # The host-side PIV byte layer: the instruction set, slots, algorithm
 # identifiers, status words, and BER-TLV / SPKI / X.509 parsers this applet
 # reuses for the responses it builds.
-keyroost-piv = { version = "0.13.0" }
+keyroost-piv = "0.14.0"
 # APDU and codec primitives (TLV read/write) the command handlers parse with.
-keyroost-proto = { version = "0.13.0" }
+keyroost-proto = "0.14.0"
 # The P-256 key material the key-slot commands generate, import and sign
 # with: the same crates (and feature paths) the root host crate uses. The
 # `ecdh` feature adds the shared-secret computation the slot key-agreement

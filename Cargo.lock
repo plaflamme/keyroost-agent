@@ -652,9 +652,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-ctap"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75f2e96f8e1ae955a1ea6c963fe67adf4dd4a3e60b9e2dd4d213a30a921536e1"
+checksum = "905b6972fdc00356a3b32cac5e855944bb7dd568bfe2ec171fd32bf84d179772"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -672,18 +672,20 @@ dependencies = [
 
 [[package]]
 name = "keyroost-hid"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903a3fee662b5e7e2ad288f8dc5bb455563e5b533f03c394727d6e4f727d8ad4"
+checksum = "4476818c2614750dc5a1ad6271d074542665a093bb156749b8a64e90c1b7b961"
 dependencies = [
  "hidapi",
+ "keyroost-proto",
+ "keyroost-windevtree",
 ]
 
 [[package]]
 name = "keyroost-import"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9191e5e23c8432402dec6bbe60021ab96e3244a96bdc41eccec8bd02f2a09cde"
+checksum = "1d31228d1d0f420be52ea69d0a216473fc0157676224808f841501332aba660a"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -691,9 +693,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-oath"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d238161a6a8f80e6ad04f11065433646fbf80fafd77c6686f75fbd6d641615e"
+checksum = "b590529d212dba75ddb6bf632c1bb1b99efb193bc023a1a17a86b527eaef8408"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -701,9 +703,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-openpgp"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8071a6ee0ca681004365784a6c869e5e4121ea573f19a9a017c5510af640d31"
+checksum = "4d8d895c6c38ec170a93ee8cd15a56d0d290e1de8b0ffcd4cac60edfe939147a"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -711,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-piv"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca50ff9f96666bdc7b84768ff339e1048cc5c2146d4811edcbe1f5182ce8681"
+checksum = "812ccf80ebf66579dcf57ca02f120d02b1eec8f7be001aa37378d135ea9c659c"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -750,15 +752,15 @@ dependencies = [
 
 [[package]]
 name = "keyroost-proto"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "474416292e6fa0821ea2b650766511c7b8b5806cdd2dd562fb121598e19a56fb"
+checksum = "d8bb6675e722e0bb6c28ab580608460b190cd4165ab774738842056724147caa"
 
 [[package]]
 name = "keyroost-token2otp"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488845359883e01e1b03ac4c5fa8f5a03b0967cad82db86188d88d1ea6ed7fb4"
+checksum = "96e8f0039acf26add32e4284f84a848e1b728a071516616a2a8f79ad550e4d3b"
 dependencies = [
  "aes",
  "cbc",
@@ -771,9 +773,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-token2prog"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "131b7f5f006c7e20bbe613dd90d1828b4d99662ba6553996d4e7107a3eb3b093"
+checksum = "e11c00eab073dd7304b41282d98e64793e1c6befecff61483f9317e6f3ef85e9"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -781,9 +783,9 @@ dependencies = [
 
 [[package]]
 name = "keyroost-transport"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "176636554a1679972eeae4bdfeeeca1220395b518c9086ab8eb8fe14e9583941"
+checksum = "67532911297d95a4ad94680e5b8313cf9167f2e1620eeff7cecb1f687d648895"
 dependencies = [
  "aes",
  "cipher",
@@ -799,9 +801,19 @@ dependencies = [
  "keyroost-proto",
  "keyroost-token2otp",
  "keyroost-token2prog",
+ "keyroost-windevtree",
  "miniz_oxide",
  "pcsc",
  "zeroize",
+]
+
+[[package]]
+name = "keyroost-windevtree"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3ff9ab35bf69d31ebe79ebcae9f6c0f9b60d79b4299d7c856be1fc0dc4d7ea8"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
-    keyroost.url = "github:framefilter/keyroost/v0.13.0";
+    keyroost.url = "github:framefilter/keyroost/v0.14.0";
   };
 
   outputs =
