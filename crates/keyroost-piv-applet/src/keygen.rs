@@ -200,26 +200,11 @@ impl PivApplet {
                 .to_sec1_point(false)
                 .as_bytes()
                 .to_vec();
-            let cert = crate::attest::attestation_cert(
-                &keyroost_piv::PublicKey::Ecc {
-                    point: point.clone(),
-                },
-                KeyAlg::EccP256,
-                &secret,
-                None,
-                crate::attest::F9_PIN_POLICY,
-                crate::attest::F9_TOUCH_POLICY,
-            );
-            let mut wrapped = Vec::new();
-            if let Some(der) = &cert {
-                push_tlv(&mut wrapped, &[0x70], der);
-            }
+
             self.attestation.secret = secret;
-            self.attestation.cert = if wrapped.is_empty() {
-                None
-            } else {
-                Some(wrapped)
-            };
+            // NOTE: generating a new key in this slot breaks attestation until a new certificate is imported.
+            // The imported certificate is normally signed by a
+            self.attestation.cert = None;
             let mut inner = Vec::with_capacity(2 + point.len());
             push_tlv(&mut inner, &[0x86], &point);
             let mut data = Vec::with_capacity(inner.len() + 2);
