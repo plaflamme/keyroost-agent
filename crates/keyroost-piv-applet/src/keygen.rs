@@ -187,21 +187,16 @@ impl PivApplet {
             return Response::sw(SW_WRONG_DATA);
         }
         if *p2 == 0xF9 {
-            let secret = Zeroizing::new(
-                elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng())
-                    .to_bytes()
-                    .to_vec(),
-            );
-            let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) else {
-                return Response::sw(SW_WRONG_DATA);
-            };
+            let secret =
+                elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
+            let signing = ecdsa::SigningKey::<p256::NistP256>::from(&secret);
             let point = signing
                 .verifying_key()
                 .to_sec1_point(false)
                 .as_bytes()
                 .to_vec();
 
-            self.attestation.secret = secret;
+            self.attestation.secret_key = secret;
             // NOTE: generating a new key in this slot breaks attestation until a new certificate is imported.
             // The imported certificate is normally signed by a
             self.attestation.cert = None;
@@ -590,7 +585,7 @@ impl PivApplet {
             None => slot.pin_policy,
         };
         slot.touch_policy = match touch_policy {
-            Some(policy) => policy.id(),
+            Some(policy) => policy,
             None => slot.touch_policy,
         };
         slot.cert = None;
@@ -785,13 +780,13 @@ mod tests {
         let slot = &app.slots[0];
         assert!(slot.key.is_some());
         assert_eq!(slot.pin_policy, PinPolicy::Always);
-        assert_eq!(slot.touch_policy, TouchPolicy::Always.id());
+        assert_eq!(slot.touch_policy, TouchPolicy::Always);
         assert!(!slot.imported);
 
         // Absent policy requests keep the slot's current policies.
         assert_eq!(app.process(&gen_apdu(Slot::Authentication)).sw, SW_OK);
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Always);
-        assert_eq!(app.slots[0].touch_policy, TouchPolicy::Always.id());
+        assert_eq!(app.slots[0].touch_policy, TouchPolicy::Always);
 
         // Explicit `DEFAULT` policies restore the slot's factory policies.
         let control = [0x80, 0x01, 0x11, 0xAA, 0x01, 0x00, 0xAB, 0x01, 0x00];
@@ -801,7 +796,7 @@ mod tests {
             SW_OK
         );
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Once); // 9A's factory
-        assert_eq!(app.slots[0].touch_policy, 0); // factory: no touch policy
+        assert_eq!(app.slots[0].touch_policy, TouchPolicy::Default); // factory: no touch policy
     }
 
     #[test]
@@ -844,7 +839,7 @@ mod tests {
         assert_eq!(&key.secret[..], &scalar[..]);
         assert!(slot.imported);
         assert_eq!(slot.pin_policy, PinPolicy::Once);
-        assert_eq!(slot.touch_policy, 0x02);
+        assert_eq!(slot.touch_policy, TouchPolicy::Always);
 
         // R5: import clears the stored certificate.
         assert_eq!(app.process(&get_data(&tag)).sw, SW_NOT_FOUND);
@@ -1233,7 +1228,7 @@ mod tests {
             &scalar
         );
         assert_eq!(dest.pin_policy, PinPolicy::Once);
-        assert_eq!(dest.touch_policy, 0x02);
+        assert_eq!(dest.touch_policy, TouchPolicy::Always);
         assert!(dest.imported);
         // The certificate objects are left untouched (host contract).
         assert_eq!(read_object(&mut app, &[0x5F, 0xC1, 0x0A]), cert_a);

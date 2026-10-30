@@ -7,7 +7,7 @@ use crate::constants::{
 use crate::slot::{factory_pin_policy, slot_index};
 use crate::state::Pin;
 use crate::{PivApplet, Response, apdu_le};
-use keyroost_piv::SW_REFERENCE_NOT_FOUND;
+use keyroost_piv::{SW_REFERENCE_NOT_FOUND, TouchPolicy};
 
 impl PivApplet {
     /// GET VERSION (0xFD, Yubico extension): the applet version as three
@@ -22,7 +22,9 @@ impl PivApplet {
         if cla != 0x00 && cla != 0xFF {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(&apdu[4..]) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         self.split_for_le(VERSION.to_vec(), le)
     }
 
@@ -38,7 +40,9 @@ impl PivApplet {
         if cla != 0x00 && cla != 0xFF {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(&apdu[4..]) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         self.split_for_le(self.serial.to_be_bytes().to_vec(), le)
     }
 
@@ -75,7 +79,9 @@ impl PivApplet {
         if apdu[2] != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(&apdu[4..]) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         let body = match apdu[3] {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
             0x81 => PivApplet::pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
@@ -96,14 +102,15 @@ impl PivApplet {
     fn key_reference_metadata(&self, index: usize) -> Option<Vec<u8>> {
         let slot = &self.slots[index];
         let key = slot.key.as_ref()?;
-        let is_default = slot.pin_policy == factory_pin_policy(index) && slot.touch_policy == 0;
+        let is_default = slot.pin_policy == factory_pin_policy(index)
+            && slot.touch_policy == TouchPolicy::Default;
         // The `7F49` inner TLVs, unwrapped from their template exactly as
         // the GENERATE response carries it: the `86` point for EC keys,
         // the `81` modulus and `82` exponent for RSA keys.
         let inner = key.public_inner()?;
         let mut body = Vec::new();
         body.extend_from_slice(&[0x01, 0x01, key.alg.id()]);
-        body.extend_from_slice(&[0x02, 0x02, slot.pin_policy.id(), slot.touch_policy]);
+        body.extend_from_slice(&[0x02, 0x02, slot.pin_policy.id(), slot.touch_policy.id()]);
         body.extend_from_slice(&[0x03, 0x01, if slot.imported { 0x02 } else { 0x01 }]);
         body.push(0x04);
         push_ber_len(&mut body, inner.len());
@@ -154,8 +161,8 @@ mod tests {
     use crate::constants::{DEFAULT_PIN_TRIES, DEFAULT_PUK_TRIES, DEFAULT_SERIAL};
     use crate::general_auth::tests::mgmt_handshake;
     use keyroost_piv::{
-        KeyAlg, PinPolicy, Slot, TouchPolicy, change_reference, generate_key, get_metadata,
-        parse_metadata, parse_public_key, verify_pin, PIN_REF_APPLICATION,
+        KeyAlg, PIN_REF_APPLICATION, PinPolicy, Slot, TouchPolicy, change_reference, generate_key,
+        get_metadata, parse_metadata, parse_public_key, verify_pin,
     };
 
     /// A management-unlocked applet: the factory 3DES handshake ran, the
@@ -170,7 +177,11 @@ mod tests {
     /// host's `parse_metadata`.
     fn metadata(app: &mut PivApplet, reference: u8) -> keyroost_piv::Metadata {
         let resp = app.process(&get_metadata(reference));
-        assert_eq!(resp.sw, keyroost_piv::SW_OK, "GET METADATA {reference:#04x}");
+        assert_eq!(
+            resp.sw,
+            keyroost_piv::SW_OK,
+            "GET METADATA {reference:#04x}"
+        );
         parse_metadata(&resp.data).expect("a well-formed metadata response")
     }
 
@@ -309,8 +320,8 @@ mod tests {
     #[test]
     fn pin_metadata_is_default_flips_after_a_change() {
         let mut applet = PivApplet::new();
-        let resp = applet
-            .process(&change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap());
+        let resp =
+            applet.process(&change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap());
         assert_eq!(resp.sw, keyroost_piv::SW_OK);
         let pin = metadata(&mut applet, 0x80);
         assert_eq!(pin.is_default, Some(false));
@@ -433,7 +444,10 @@ mod tests {
         ));
         assert_eq!(generated.sw, keyroost_piv::SW_OK);
         let md = metadata(&mut applet, 0x9A);
-        assert_eq!(md.policy, Some((PinPolicy::Always.id(), TouchPolicy::Default.id())));
+        assert_eq!(
+            md.policy,
+            Some((PinPolicy::Always.id(), TouchPolicy::Default.id()))
+        );
         assert_eq!(md.is_default, Some(false));
     }
 

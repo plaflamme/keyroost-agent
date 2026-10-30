@@ -15,6 +15,7 @@ use crate::constants::{
 };
 use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
 use keyroost_piv::{OBJECT_ADMIN_DATA, OBJECT_CHUID, OBJECT_PIN_PROTECTED_DATA};
+use x509_cert::der::{Decode, Encode};
 
 /// The `F9` attestation certificate object tag (the Yubico PIV Attestation
 /// Certificate), the one data object the applet mints at construction.
@@ -77,7 +78,9 @@ pub(crate) fn cert_slot_index(tag: [u8; 3]) -> Option<usize> {
         [0x5F, 0xC1, 0x0A] => Some(1),
         [0x5F, 0xC1, 0x0B] => Some(2),
         [0x5F, 0xC1, 0x01] => Some(3),
-        [0x5F, 0xC1, third] if (0x0D..=0x20).contains(&third) => Some(3 + usize::from(third - 0x0C)),
+        [0x5F, 0xC1, third] if (0x0D..=0x20).contains(&third) => {
+            Some(3 + usize::from(third - 0x0C))
+        }
         _ => None,
     }
 }
@@ -100,13 +103,19 @@ impl PivApplet {
         if *p1 != 0x3F || *p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_lc, body, tail)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
-        let Ok(le) = apdu_le(tail) else { return Response::sw(SW_WRONG_LENGTH) };
-        let Some(tag) = selector_tag(body) else { return Response::sw(SW_DATA_INVALID) };
+        let Ok((_lc, body, tail)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
+        let Ok(le) = apdu_le(tail) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
+        let Some(tag) = selector_tag(body) else {
+            return Response::sw(SW_DATA_INVALID);
+        };
         match self.data_object_value(tag) {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
-                push_tlv(&mut full, &[0x53], value);
+                push_tlv(&mut full, &[0x53], &value);
                 self.split_for_le(full, le)
             }
             None => Response::sw(keyroost_piv::SW_NOT_FOUND),
@@ -133,22 +142,30 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
-        let Some((tag, value)) = parse_put_body(body) else { return Response::sw(SW_DATA_INVALID) };
-        if self.store_data_object(tag, value) { Response::sw(SW_OK) } else { Response::sw(keyroost_piv::SW_NOT_FOUND) }
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
+        let Some((tag, value)) = parse_put_body(body) else {
+            return Response::sw(SW_DATA_INVALID);
+        };
+        if self.store_data_object(tag, value) {
+            Response::sw(SW_OK)
+        } else {
+            Response::sw(keyroost_piv::SW_NOT_FOUND)
+        }
     }
 
     /// The value stored under the object `tag` — the slot's certificate for
     /// a slot tag, the `F9` attestation certificate for `5F FF 01`, the
     /// corresponding [`PivData`] object otherwise — or `None` when nothing
     /// has been stored under it.
-    pub(crate) fn data_object_value(&self, tag: [u8; 3]) -> Option<&[u8]> {
+    pub(crate) fn data_object_value(&self, tag: [u8; 3]) -> Option<Vec<u8>> {
         if tag == ATTESTATION_OBJECT_TAG {
-            return self.attestation.cert.as_deref();
+            return self.attestation.cert.to_der().ok();
         }
         match cert_slot_index(tag) {
-            Some(index) => self.slots[index].cert.as_deref(),
-            None => self.data.get(tag),
+            Some(index) => self.slots[index].cert.clone(),
+            None => self.data.get(tag).map(Vec::from),
         }
     }
 
@@ -158,7 +175,7 @@ impl PivApplet {
     /// names a known object.
     pub(crate) fn store_data_object(&mut self, tag: [u8; 3], value: Vec<u8>) -> bool {
         if tag == ATTESTATION_OBJECT_TAG {
-            self.attestation.cert = Some(value);
+            self.attestation.cert = x509_cert::Certificate::from_der(&value).ok(); // TODO: validate
             return true;
         }
         match cert_slot_index(tag) {

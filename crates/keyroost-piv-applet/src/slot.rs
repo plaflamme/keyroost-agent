@@ -21,7 +21,7 @@
 //!   latch; [`SW_SECURITY_STATUS_NOT_SATISFIED`] otherwise.
 
 use elliptic_curve::sec1::ToSec1Point;
-use keyroost_piv::{KeyAlg, PinPolicy};
+use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -47,7 +47,7 @@ pub(crate) struct Slot {
     /// The touch policy GENERATE KEY (re)sets for this slot: a raw
     /// [`keyroost_piv::TouchPolicy`] id, `0` (default) at the factory.
     #[allow(dead_code)] // (re)set by GENERATE/IMPORT/MOVE, read by GET METADATA (T5).
-    pub(crate) touch_policy: u8,
+    pub(crate) touch_policy: TouchPolicy,
     /// Whether the current key was imported by the host (`true`, origin
     /// `0x02`) or generated on the card (`false`, origin `0x01`).
     #[allow(dead_code)] // set by GENERATE/IMPORT/MOVE, read by GET METADATA (T5).
@@ -160,7 +160,7 @@ impl Slot {
         Slot {
             key: None,
             pin_policy,
-            touch_policy: 0,
+            touch_policy: TouchPolicy::Default,
             imported: false,
             cert: None,
         }
@@ -335,7 +335,7 @@ mod tests {
             assert!(slot.key.is_none());
             assert!(slot.cert.is_none());
             assert!(!slot.imported);
-            assert_eq!(slot.touch_policy, 0);
+            assert_eq!(slot.touch_policy, TouchPolicy::Default);
         }
     }
 

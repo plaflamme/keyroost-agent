@@ -165,6 +165,7 @@ impl PivApplet {
     /// A factory-fresh applet with the given card serial, everything else as
     /// in [`PivApplet::new`].
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn with_serial(serial: u32) -> Self {
         Self {
             serial,
@@ -175,7 +176,7 @@ impl PivApplet {
             slots: factory_slots(),
             data: PivData::default(),
             pin_always_armed: false,
-            attestation: crate::attest::fresh_attestation(),
+            attestation: crate::attest::fresh_attestation().expect("fresh attestation"),
         }
     }
 
@@ -297,10 +298,14 @@ pub(crate) fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
 /// value at bytes 5–6 and the body at byte 7 — the host's `build_apdu_ext`
 /// form, which the large PUT DATA and IMPORT ASYMMETRIC KEY bodies use.
 pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(usize, &[u8], &[u8]), ()> {
-    let Some(&first) = apdu.get(4) else { return Ok((0, &[], &[])) };
+    let Some(&first) = apdu.get(4) else {
+        return Ok((0, &[], &[]));
+    };
     if first != 0 {
         let lc = usize::from(first);
-        let Some(body) = apdu.get(5..5 + lc) else { return Err(()) };
+        let Some(body) = apdu.get(5..5 + lc) else {
+            return Err(());
+        };
         return Ok((lc, body, &apdu[5 + lc..]));
     }
     // The zero leading length byte: a case-4 APDU with no command data, or
@@ -309,7 +314,9 @@ pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(usize, &[u8], &[u8]), ()> {
         return Ok((0, &[], &apdu[5..]));
     }
     let lc = (usize::from(apdu[5]) << 8) | usize::from(apdu[6]);
-    let Some(body) = apdu.get(7..7 + lc) else { return Err(()) };
+    let Some(body) = apdu.get(7..7 + lc) else {
+        return Err(());
+    };
     Ok((lc, body, &apdu[7 + lc..]))
 }
 
