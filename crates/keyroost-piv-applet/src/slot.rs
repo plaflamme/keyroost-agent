@@ -20,7 +20,7 @@
 //!   the session's `pin.verified` flag and the [`PivApplet::pin_always_armed`]
 //!   latch; [`SW_SECURITY_STATUS_NOT_SATISFIED`] otherwise.
 
-use elliptic_curve::sec1::ToEncodedPoint;
+use elliptic_curve::sec1::ToSec1Point;
 use keyroost_piv::{KeyAlg, PinPolicy};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
@@ -88,29 +88,34 @@ impl SlotKey {
             KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
                 let point = match self.alg {
                     KeyAlg::EccP256 => {
-                        let signing = ecdsa::SigningKey::<p256::NistP256>::from_slice(
-                            &self.secret[..32],
-                        )
-                        .ok()?;
-                        signing.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+                        let signing =
+                            ecdsa::SigningKey::<p256::NistP256>::from_slice(&self.secret[..32])
+                                .ok()?;
+                        signing
+                            .verifying_key()
+                            .to_sec1_point(false)
+                            .as_bytes()
+                            .to_vec()
                     }
                     KeyAlg::EccP384 => {
-                        let signing = ecdsa::SigningKey::<p384::NistP384>::from_slice(
-                            &self.secret[..48],
-                        )
-                        .ok()?;
-                        signing.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+                        let signing =
+                            ecdsa::SigningKey::<p384::NistP384>::from_slice(&self.secret[..48])
+                                .ok()?;
+                        signing
+                            .verifying_key()
+                            .to_sec1_point(false)
+                            .as_bytes()
+                            .to_vec()
                     }
                     KeyAlg::EccP521 => {
                         // The generic `SecretKey` derivation — the ECDH path's
                         // own route — since `NistP521` does not satisfy the
                         // `ecdsa` crate's signing bounds.
-                        let secret =
-                            elliptic_curve::SecretKey::<p521::NistP521>::from_slice(
-                                &self.secret[..],
-                            )
-                            .ok()?;
-                        secret.public_key().to_encoded_point(false).as_bytes().to_vec()
+                        let secret = elliptic_curve::SecretKey::<p521::NistP521>::from_slice(
+                            &self.secret[..],
+                        )
+                        .ok()?;
+                        secret.public_key().to_sec1_point(false).as_bytes().to_vec()
                     }
                     _ => unreachable!("the outer match arm holds only the EC curves"),
                 };
@@ -122,7 +127,9 @@ impl SlotKey {
                 // The slot key's PKCS#1 encoding: serve the modulus under
                 // `81` and the public exponent under `82`, as the
                 // reference applet's `getKeyDetails` does.
-                let Ok(key) = RsaPrivateKey::from_pkcs1_der(self.secret.as_slice()) else { return None };
+                let Ok(key) = RsaPrivateKey::from_pkcs1_der(self.secret.as_slice()) else {
+                    return None;
+                };
                 let (n, e) = (key.n().to_bytes_be(), key.e().to_bytes_be());
                 let mut inner = Vec::with_capacity(2 + n.len() + 5);
                 crate::data::push_tlv(&mut inner, &[0x81], &n);

@@ -20,7 +20,7 @@
 //! structure or an unknown or repeated member refusing the command with
 //! `6A86`.
 
-use elliptic_curve::{FieldBytes, PrimeCurve};
+use elliptic_curve::{FieldBytes, Generate, PrimeCurve};
 use num_bigint_dig::BigUint;
 use num_integer::Integer;
 use num_traits::{One, Zero};
@@ -75,10 +75,8 @@ where
     C: PrimeCurve,
 {
     // The caller checked the scalar is exactly the curve's field size.
-    use elliptic_curve::generic_array::typenum::Unsigned;
-    debug_assert_eq!(scalar.len(), C::FieldBytesSize::to_usize());
-    let bytes = FieldBytes::<C>::from_slice(scalar);
-    let key = elliptic_curve::SecretKey::<C>::from_bytes(bytes).ok()?;
+    let bytes = FieldBytes::<C>::try_from(scalar).ok()?;
+    let key = elliptic_curve::SecretKey::<C>::from_bytes(&bytes).ok()?;
     Some(Zeroizing::new(key.to_bytes().to_vec()))
 }
 
@@ -166,13 +164,17 @@ impl PivApplet {
         if *p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         // Unwrap the `AC` control-reference template.
         let control = match body {
             [0xAC, len, control @ ..] if usize::from(*len) == control.len() => control,
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let Ok((alg, pin_policy, touch_policy)) = parse_control(control) else { return Response::sw(SW_WRONG_DATA) };
+        let Ok((alg, pin_policy, touch_policy)) = parse_control(control) else {
+            return Response::sw(SW_WRONG_DATA);
+        };
         // The `F9` attestation key: P-256 only, and a regeneration
         // re-mints the self-signed certificate that describes it — the
         // reference applet leaves the certificate stale after a key
@@ -186,18 +188,22 @@ impl PivApplet {
         }
         if *p2 == 0xF9 {
             let secret = Zeroizing::new(
-                elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng)
+                elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng())
                     .to_bytes()
                     .to_vec(),
             );
-            let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) else { return Response::sw(SW_WRONG_DATA) };
+            let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&secret) else {
+                return Response::sw(SW_WRONG_DATA);
+            };
             let point = signing
                 .verifying_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec();
             let cert = crate::attest::attestation_cert(
-                &keyroost_piv::PublicKey::Ecc { point: point.clone() },
+                &keyroost_piv::PublicKey::Ecc {
+                    point: point.clone(),
+                },
                 KeyAlg::EccP256,
                 &secret,
                 None,
@@ -209,28 +215,37 @@ impl PivApplet {
                 push_tlv(&mut wrapped, &[0x70], der);
             }
             self.attestation.secret = secret;
-            self.attestation.cert = if wrapped.is_empty() { None } else { Some(wrapped) };
+            self.attestation.cert = if wrapped.is_empty() {
+                None
+            } else {
+                Some(wrapped)
+            };
             let mut inner = Vec::with_capacity(2 + point.len());
             push_tlv(&mut inner, &[0x86], &point);
             let mut data = Vec::with_capacity(inner.len() + 2);
             push_tlv(&mut data, &[0x7F, 0x49], &inner);
             return Response::ok(data);
         }
-        let Some(index) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
+        let Some(index) = slot_index(*p2) else {
+            return Response::sw(SW_INCORRECT_P1P2);
+        };
         let secret = match alg {
             KeyAlg::EccP256 => {
-                let key =
-                    elliptic_curve::SecretKey::<p256::NistP256>::random(&mut rand_core::OsRng);
+                let key = elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(
+                    &mut rand::rng(),
+                );
                 Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::EccP384 => {
-                let key =
-                    elliptic_curve::SecretKey::<p384::NistP384>::random(&mut rand_core::OsRng);
+                let key = elliptic_curve::SecretKey::<p384::NistP384>::generate_from_rng(
+                    &mut rand::rng(),
+                );
                 Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::EccP521 => {
-                let key =
-                    elliptic_curve::SecretKey::<p521::NistP521>::random(&mut rand_core::OsRng);
+                let key = elliptic_curve::SecretKey::<p521::NistP521>::generate_from_rng(
+                    &mut rand::rng(),
+                );
                 Zeroizing::new(key.to_bytes().to_vec())
             }
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
@@ -241,7 +256,9 @@ impl PivApplet {
                     KeyAlg::Rsa4096 => 4096,
                     _ => unreachable!("alg is an RSA key size"),
                 };
-                let Ok(key) = RsaPrivateKey::new(&mut rand_core::OsRng, bits) else { return Response::sw(SW_WRONG_DATA) };
+                let Ok(key) = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits) else {
+                    return Response::sw(SW_WRONG_DATA);
+                };
                 // The card's storage form: the key's PKCS#1 encoding,
                 // zeroized on drop. `new` always precomputes the CRT
                 // exponents, which `to_pkcs1_der` needs for its
@@ -254,7 +271,9 @@ impl PivApplet {
             _ => return Response::sw(SW_WRONG_DATA),
         };
         let key = SlotKey { alg, secret };
-        let Some(inner) = key.public_inner() else { return Response::sw(SW_WRONG_DATA) };
+        let Some(inner) = key.public_inner() else {
+            return Response::sw(SW_WRONG_DATA);
+        };
         self.commit_slot_key(index, key, false, pin_policy, touch_policy);
 
         let mut data = Vec::with_capacity(3 + inner.len());
@@ -280,7 +299,9 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Some(index) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
+        let Some(index) = slot_index(*p2) else {
+            return Response::sw(SW_INCORRECT_P1P2);
+        };
         let alg = match KeyAlg::from_id(*p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
             Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
@@ -288,12 +309,16 @@ impl PivApplet {
             }
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         let rsa = matches!(
             alg,
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096
         );
-        let Ok(import) = parse_import(body, rsa) else { return Response::sw(SW_WRONG_DATA) };
+        let Ok(import) = parse_import(body, rsa) else {
+            return Response::sw(SW_WRONG_DATA);
+        };
 
         let secret = match alg {
             KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
@@ -375,7 +400,9 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Some(source) = slot_index(*p2) else { return Response::sw(SW_INCORRECT_P1P2) };
+        let Some(source) = slot_index(*p2) else {
+            return Response::sw(SW_INCORRECT_P1P2);
+        };
         let dest = match *p1 {
             0xFF => None,
             reference => match slot_index(reference) {
@@ -503,7 +530,9 @@ struct ImportKey {
 fn walk_tlvs(rest: &[u8], mut f: impl FnMut(u8, &[u8]) -> Result<(), ()>) -> Result<(), ()> {
     let mut rest = rest;
     while !rest.is_empty() {
-        let Some((tag, value, next)) = next_tlv(rest) else { return Err(()) };
+        let Some((tag, value, next)) = next_tlv(rest) else {
+            return Err(());
+        };
         f(tag, value)?;
         rest = next;
     }
@@ -590,6 +619,7 @@ mod tests {
     use super::*;
     use crate::constants::{INS_IMPORT_ASYM, SW_SECURITY_NOT_SATISFIED};
     use crate::general_auth::tests::mgmt_handshake;
+    use elliptic_curve::sec1::ToSec1Point;
     use keyroost_piv::{
         CertInfo, PublicKey, SW_NOT_FOUND, Slot, encode_certificate, generate_key, get_data,
         parse_public_key, put_data,
@@ -638,7 +668,9 @@ mod tests {
     /// A raw GENERATE APDU with an arbitrary P2 (slot reference): case 4,
     /// `Le 0x00`, with a one-member P-256 AC control template.
     fn gen_raw_p2(p2: u8) -> Vec<u8> {
-        vec![0x00, 0x47, 0x00, p2, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00]
+        vec![
+            0x00, 0x47, 0x00, p2, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00,
+        ]
     }
 
     /// An IMPORT body: `06 <len> <scalar>` plus optional `AA`/`AB` members.
@@ -949,11 +981,7 @@ mod tests {
         // signing path signs the prehashed digest with the imported
         // scalar, verified under the point that scalar derives.
         let sk = SigningKey::from_slice(&scalar).expect("a valid scalar");
-        let point = sk
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec();
+        let point = sk.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         crate::general_auth::tests::card_signature(&mut app, 0x9E, &point, &[0x2B; 32]);
     }
 
@@ -1011,7 +1039,7 @@ mod tests {
     }
 
     fn host_rsa_1024() -> HostRsa {
-        let host = RsaPrivateKey::new(&mut rand_core::OsRng, 1024).expect("a 1024-bit key");
+        let host = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("a 1024-bit key");
         let (p, q) = (&host.primes()[0], &host.primes()[1]);
         let d = host.d().clone();
         let one = BigUint::from(1u32);
@@ -1407,11 +1435,10 @@ mod tests {
         );
         assert!(app.slots[0].imported);
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
         let expected_point = p384::SecretKey::from_slice(&scalar)
             .expect("a valid scalar")
             .public_key()
-            .to_encoded_point(false);
+            .to_sec1_point(false);
         let expected_point = expected_point.as_bytes();
         assert_eq!(
             app.process(&keyroost_piv::verify_pin(b"123456").unwrap())

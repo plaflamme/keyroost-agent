@@ -9,7 +9,7 @@ use crate::constants::{
     GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
     SW_WRONG_LENGTH,
 };
-use crate::slot::{slot_index, SlotKey};
+use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, Response, apdu_lc_body};
 
 impl PivApplet {
@@ -91,7 +91,9 @@ impl PivApplet {
         if p1 != key.alg.id() {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_lc, body, _)) = lc_body else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_lc, body, _)) = lc_body else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         let t = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -132,12 +134,10 @@ impl PivApplet {
     /// The 9B (management-key) half of GENERAL AUTHENTICATE: P1 selects the
     /// symmetric or an asymmetric algorithm, the body carries the
     /// dynamic-auth template.
-    fn ga_management(
-        &mut self,
-        p1: u8,
-        lc_body: Result<(usize, &[u8], &[u8]), ()>,
-    ) -> Response {
-        let Ok((_lc, body, _)) = lc_body else { return Response::sw(SW_WRONG_LENGTH) };
+    fn ga_management(&mut self, p1: u8, lc_body: Result<(usize, &[u8], &[u8]), ()>) -> Response {
+        let Ok((_lc, body, _)) = lc_body else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         let tmpl = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -259,11 +259,13 @@ fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
 fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     use num_bigint_dig::BigUint;
     use pkcs1::DecodeRsaPrivateKey;
-    use rsa::hazmat::rsa_decrypt;
     use rsa::RsaPrivateKey;
+    use rsa::hazmat::rsa_decrypt;
     use rsa::traits::PublicKeyParts;
 
-    let Ok(key) = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(key) = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
     let n = key.n().to_bytes_be();
     if block.len() != n.len() {
         return Response::sw(SW_WRONG_DATA);
@@ -272,7 +274,9 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     if &c >= key.n() {
         return Response::sw(SW_WRONG_DATA);
     }
-    let Ok(m) = rsa_decrypt::<rand_core::OsRng>(None, &key, &c) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(m) = rsa_decrypt::<rsa::rand_core::OsRng>(None, &key, &c) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
 
     // Zero-extend the residue to the full modulus size.
     let m_be = m.to_bytes_be();
@@ -286,26 +290,28 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
 /// head of the slot's uniform `66`-byte buffer.
 fn sign_p256(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
-    let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]) else { return Response::sw(SW_WRONG_DATA) };
+    let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
     // The annotation pins the `Signature<C>` impl: with the `der` feature
     // the `PrehashSigner` impl for `der::Signature<C>` is also in scope.
-    let sig: ecdsa::Signature<p256::NistP256> =
-        match signing.sign_prehash(digest) {
-            Ok(sig) => sig,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
+    let sig: ecdsa::Signature<p256::NistP256> = match signing.sign_prehash(digest) {
+        Ok(sig) => sig,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
     Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
 }
 
 /// The ECDSA half for P-384 (the host hashes with SHA-384).
 fn sign_p384(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
-    let Ok(signing) = ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]) else { return Response::sw(SW_WRONG_DATA) };
-    let sig: ecdsa::Signature<p384::NistP384> =
-        match signing.sign_prehash(digest) {
-            Ok(sig) => sig,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
+    let Ok(signing) = ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let sig: ecdsa::Signature<p384::NistP384> = match signing.sign_prehash(digest) {
+        Ok(sig) => sig,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
     Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
 }
 
@@ -315,12 +321,13 @@ fn sign_p521(key: &SlotKey, digest: &[u8]) -> Response {
     // `NistP521` does not implement the `ecdsa` crate's generic signing
     // bounds (no `DigestPrimitive` impl), so the curve's own key type
     // signs instead — the same `PrehashSigner` trait.
-    let Ok(signing) = p521::ecdsa::SigningKey::from_slice(&key.secret[..]) else { return Response::sw(SW_WRONG_DATA) };
-    let sig: ecdsa::Signature<p521::NistP521> =
-        match signing.sign_prehash(digest) {
-            Ok(sig) => sig,
-            Err(_) => return Response::sw(SW_WRONG_DATA),
-        };
+    let Ok(signing) = p521::ecdsa::SigningKey::from_slice(&key.secret[..]) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let sig: ecdsa::Signature<p521::NistP521> = match signing.sign_prehash(digest) {
+        Ok(sig) => sig,
+        Err(_) => return Response::sw(SW_WRONG_DATA),
+    };
     Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
 }
 
@@ -341,28 +348,40 @@ fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
 /// point under `85` and the card answers the shared secret's x-coordinate
 /// under `82`.
 fn ecdh_p256(key: &SlotKey, peer: &[u8]) -> Response {
-    let Ok(secret) = elliptic_curve::SecretKey::<p256::NistP256>::from_slice(&key.secret[..32]) else { return Response::sw(SW_WRONG_DATA) };
-    let Ok(peer) = elliptic_curve::PublicKey::<p256::NistP256>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
-    let shared =
-        elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    let Ok(secret) = elliptic_curve::SecretKey::<p256::NistP256>::from_slice(&key.secret[..32])
+    else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let Ok(peer) = elliptic_curve::PublicKey::<p256::NistP256>::from_sec1_bytes(peer) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
 }
 
 /// The ECDH half for P-384: the shared secret is the 48-byte x-coordinate.
 fn ecdh_p384(key: &SlotKey, peer: &[u8]) -> Response {
-    let Ok(secret) = elliptic_curve::SecretKey::<p384::NistP384>::from_slice(&key.secret[..48]) else { return Response::sw(SW_WRONG_DATA) };
-    let Ok(peer) = elliptic_curve::PublicKey::<p384::NistP384>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
-    let shared =
-        elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    let Ok(secret) = elliptic_curve::SecretKey::<p384::NistP384>::from_slice(&key.secret[..48])
+    else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let Ok(peer) = elliptic_curve::PublicKey::<p384::NistP384>::from_sec1_bytes(peer) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
 }
 
 /// The ECDH half for P-521: the shared secret is the 66-byte x-coordinate.
 fn ecdh_p521(key: &SlotKey, peer: &[u8]) -> Response {
-    let Ok(secret) = elliptic_curve::SecretKey::<p521::NistP521>::from_slice(&key.secret[..]) else { return Response::sw(SW_WRONG_DATA) };
-    let Ok(peer) = elliptic_curve::PublicKey::<p521::NistP521>::from_sec1_bytes(peer) else { return Response::sw(SW_WRONG_DATA) };
-    let shared =
-        elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    let Ok(secret) = elliptic_curve::SecretKey::<p521::NistP521>::from_slice(&key.secret[..])
+    else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let Ok(peer) = elliptic_curve::PublicKey::<p521::NistP521>::from_sec1_bytes(peer) else {
+        return Response::sw(SW_WRONG_DATA);
+    };
+    let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
     Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
 }
 
@@ -508,7 +527,9 @@ pub(crate) mod tests {
         DEFAULT_MGMT_KEY, DEFAULT_PUK_TRIES, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED,
     };
     use crate::tries_sw;
-    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::cipher::{BlockCipherDecrypt, KeyInit};
+    use elliptic_curve::Generate;
+    use elliptic_curve::sec1::ToSec1Point;
 
     /// The GA dynamic-auth body: `7C` wrapping the given tagged members.
     pub(crate) fn ga_body(members: &[&[u8]]) -> Vec<u8> {
@@ -567,7 +588,7 @@ pub(crate) mod tests {
     /// Decrypt an 8-byte block with the stored 3DES management key.
     fn des_decrypt(data: &[u8]) -> [u8; 8] {
         let c = des::TdesEde3::new_from_slice(&DEFAULT_MGMT_KEY).unwrap();
-        let mut block = cipher::generic_array::GenericArray::clone_from_slice(data);
+        let mut block = cipher::Array::try_from(data).expect("can clone slice");
         c.decrypt_block(&mut block);
         block.into()
     }
@@ -776,7 +797,11 @@ pub(crate) mod tests {
 
     /// Management unlock plus a key of `alg` in `slot`; returns the
     /// uncompressed public point the card announced.
-    fn slot_with_key(applet: &mut PivApplet, slot: keyroost_piv::Slot, alg: keyroost_piv::KeyAlg) -> Vec<u8> {
+    fn slot_with_key(
+        applet: &mut PivApplet,
+        slot: keyroost_piv::Slot,
+        alg: keyroost_piv::KeyAlg,
+    ) -> Vec<u8> {
         mgmt_handshake(applet);
         let r = applet.process(&keyroost_piv::generate_key(
             slot,
@@ -798,7 +823,12 @@ pub(crate) mod tests {
 
     /// Run the host's signing GA against the slot and verify the card's
     /// DER signature under the point the card announced.
-    pub(crate) fn card_signature(applet: &mut PivApplet, key_ref: u8, point: &[u8], digest: &[u8; 32]) {
+    pub(crate) fn card_signature(
+        applet: &mut PivApplet,
+        key_ref: u8,
+        point: &[u8],
+        digest: &[u8; 32],
+    ) {
         use p256::ecdsa::signature::hazmat::PrehashVerifier;
         let r = applet.process(&keyroost_piv::general_auth_sign(
             keyroost_piv::KeyAlg::EccP256.id(),
@@ -817,7 +847,9 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication); // 9A: ONCE
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         card_signature(&mut applet, 0x9A, &point, &[0x2B; 32]);
@@ -827,13 +859,11 @@ pub(crate) mod tests {
     fn ga_slot_ecdh_answers_the_shared_x_coordinate() {
         let mut applet = PivApplet::new();
         let point = slot_with_p256(&mut applet, keyroost_piv::Slot::CardAuthentication); // 9E: NEVER
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        let mut rng = rand_core::OsRng;
-        let peer = p256::ecdh::EphemeralSecret::random(&mut rng);
+        let peer = p256::ecdh::EphemeralSecret::generate_from_rng(&mut rand::rng());
         let r = applet.process(&keyroost_piv::general_auth_key_agree(
             keyroost_piv::KeyAlg::EccP256.id(),
             0x9E,
-            peer.public_key().to_encoded_point(false).as_bytes(),
+            peer.public_key().to_sec1_point(false).as_bytes(),
         ));
         assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
         let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
@@ -853,7 +883,9 @@ pub(crate) mod tests {
         );
         assert_eq!(point.len(), 97);
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         let digest = [0x2C; 48];
@@ -880,7 +912,9 @@ pub(crate) mod tests {
         );
         assert_eq!(point.len(), 133);
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         // The host hashes the TBS with SHA-512: a 64-byte digest, two bytes
@@ -907,13 +941,11 @@ pub(crate) mod tests {
             keyroost_piv::Slot::CardAuthentication, // 9E: NEVER
             keyroost_piv::KeyAlg::EccP384,
         );
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
-        let mut rng = rand_core::OsRng;
-        let peer = p384::ecdh::EphemeralSecret::random(&mut rng);
+        let peer = p384::ecdh::EphemeralSecret::generate_from_rng(&mut rand::rng());
         let r = applet.process(&keyroost_piv::general_auth_key_agree(
             keyroost_piv::KeyAlg::EccP384.id(),
             0x9E,
-            peer.public_key().to_encoded_point(false).as_bytes(),
+            peer.public_key().to_sec1_point(false).as_bytes(),
         ));
         assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
         let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
@@ -934,13 +966,11 @@ pub(crate) mod tests {
         // A P-521 uncompressed point is `04 || X || Y` = 1 + 66 + 66 = 133
         // bytes, not the 1 + 64 + 64 a SHA-512-sized coordinate would give.
         assert_eq!(point.len(), 133);
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
-        let mut rng = rand_core::OsRng;
-        let peer = p521::ecdh::EphemeralSecret::random(&mut rng);
+        let peer = p521::ecdh::EphemeralSecret::generate_from_rng(&mut rand::rng());
         let r = applet.process(&keyroost_piv::general_auth_key_agree(
             keyroost_piv::KeyAlg::EccP521.id(),
             0x9E,
-            peer.public_key().to_encoded_point(false).as_bytes(),
+            peer.public_key().to_sec1_point(false).as_bytes(),
         ));
         assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
         let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
@@ -964,7 +994,9 @@ pub(crate) mod tests {
         assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
         // A VERIFY followed by another APDU consumes the latch: gated again.
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         assert_eq!(applet.process(&keyroost_piv::select_full()).sw, SW_OK);
@@ -977,7 +1009,9 @@ pub(crate) mod tests {
         // A VERIFY immediately followed by the GA: the signature verifies
         // under the announced point.
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         card_signature(&mut applet, 0x9C, &point, &digest);
@@ -988,7 +1022,9 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
@@ -1039,7 +1075,11 @@ pub(crate) mod tests {
         let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &block));
         assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
         let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
-        assert_eq!(s.len(), n.len(), "the answer is zero-extended to the modulus size");
+        assert_eq!(
+            s.len(),
+            n.len(),
+            "the answer is zero-extended to the modulus size"
+        );
         use num_bigint_dig::BigUint;
         assert_eq!(
             BigUint::from_bytes_be(s)
@@ -1075,7 +1115,9 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
@@ -1113,12 +1155,25 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let _point = slot_with_p256(&mut applet, keyroost_piv::Slot::Authentication);
         assert_eq!(
-            applet.process(&keyroost_piv::verify_pin(b"123456").unwrap()).sw,
+            applet
+                .process(&keyroost_piv::verify_pin(b"123456").unwrap())
+                .sw,
             SW_OK
         );
         let digest = [0x2B; 32];
         // A non-empty 82 member: not the one-shot slot shape.
-        let mut body = vec![0x7C, 3 + 4 + 34, 0x82, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x81, 0x20];
+        let mut body = vec![
+            0x7C,
+            3 + 4 + 34,
+            0x82,
+            0x04,
+            0xDE,
+            0xAD,
+            0xBE,
+            0xEF,
+            0x81,
+            0x20,
+        ];
         body.extend_from_slice(&digest);
         let mut apdu = vec![0x00, 0x87, 0x11, 0x9A, body.len() as u8];
         apdu.extend_from_slice(&body);
@@ -1161,6 +1216,9 @@ pub(crate) mod tests {
         assert_eq!(read_tlv_length(&[0x82, 0x01]), Err(SW_DATA_INVALID));
         // `80` and `83`+ are not valid PIV length bytes.
         assert_eq!(read_tlv_length(&[0x80]), Err(SW_DATA_INVALID));
-        assert_eq!(read_tlv_length(&[0x83, 0x00, 0x00, 0x00]), Err(SW_DATA_INVALID));
+        assert_eq!(
+            read_tlv_length(&[0x83, 0x00, 0x00, 0x00]),
+            Err(SW_DATA_INVALID)
+        );
     }
 }

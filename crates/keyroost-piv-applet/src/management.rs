@@ -8,7 +8,7 @@ use crate::constants::{
     SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 use crate::{Pin, PivApplet, Response, apdu_lc_body};
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -93,7 +93,7 @@ impl MgmtKey {
     /// never the stale tail.
     pub(crate) fn issue(&mut self) -> Vec<u8> {
         let mut buf = [0u8; 16];
-        getrandom::getrandom(&mut buf).expect("OsRng failure");
+        getrandom::fill(&mut buf).expect("OsRng failure");
         self.state = GaState::Challenged(buf);
         self.encrypt(&buf[..self.alg.block_size()])
     }
@@ -152,16 +152,15 @@ impl MgmtKey {
         }
     }
 
-    fn run_blocks<C: BlockEncrypt + BlockDecrypt>(
+    fn run_blocks<C: BlockCipherEncrypt + BlockCipherDecrypt>(
         c: &C,
         data: &[u8],
         bs: usize,
         decrypt: bool,
     ) -> Vec<u8> {
-        use cipher::generic_array::GenericArray;
         let mut out = Vec::with_capacity(data.len());
         for chunk in data.chunks(bs) {
-            let mut block = GenericArray::clone_from_slice(chunk);
+            let mut block = cipher::Array::try_from(chunk).expect("can clone slice");
             if decrypt {
                 c.decrypt_block(&mut block);
             } else {
@@ -200,7 +199,9 @@ impl PivApplet {
         if !self.mgmt.unlocked() {
             return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        let Ok((_lc, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_lc, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         if body.len() < 4 {
             return Response::sw(SW_WRONG_DATA);
         }

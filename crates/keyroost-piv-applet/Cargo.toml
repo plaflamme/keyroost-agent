@@ -15,17 +15,17 @@ keyroost-proto = "0.14.0"
 # with: the same crates (and feature paths) the root host crate uses. The
 # `ecdh` feature adds the shared-secret computation the slot key-agreement
 # half of GENERAL AUTHENTICATE answers.
-p256 = { version = "0.13.0", features = ["ecdh"] }
+p256 = { version = "0.14.0", features = ["ecdh"] }
 # The P-384 and P-521 slots (T9): the same curve-crate family as p256.
-p384 = { version = "0.13.0", features = ["ecdh"] }
-p521 = { version = "0.13.0", features = ["ecdh"] }
+p384 = { version = "0.14.0", features = ["ecdh"] }
+p521 = { version = "0.14.0", features = ["ecdh"] }
 # The generic secret-key / prime-curve API the three NIST curves share
 # (the same elliptic-curve major the 0.13 curve crates are built on).
-elliptic-curve = "0.13"
-ecdsa = { version = "0.16.0", features = ["der"] }
+elliptic-curve = "0.14"
+ecdsa = { version = "0.17.0", features = ["der"] }
 # SHA-256 of the attestation TBS certificate (the ecdsa-with-SHA-256
 # signature algorithm the `F9` key signs with).
-sha2 = "0.10"
+sha2 = "0.11"
 # RSA slots (T10, staged by spike keyroost-agent-rpx): the RustCrypto RSA
 # line. Both crates are already in the workspace lockfile (ssh-key pulls
 # rsa 0.9.10), so this resolves offline with no new versions.
@@ -55,18 +55,19 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # The RustCrypto block-cipher line for the 9B management-key symmetric auth
 # (GENERAL AUTHENTICATE witness/challenge round) — the same crates the
 # host's keyroost-transport uses for its half of the exchange.
-aes = "0.8"
-cipher = "0.4"
-des = "0.8"
+aes = "0.9"
+cipher = "0.5"
+des = "0.9"
 # The CSPRNG feeding p256's key generation (`rand_core::OsRng`); the same
 # pairing the GA witness/challenge values use.
-rand_core = { version = "0.6", features = ["getrandom"] }
-getrandom = "0.2"
+rand = { version = "0.10" }
+getrandom = "0.4"
 # CLI and logging for the `piv-vsmartcard` front end.
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0.229"
+x509-cert = { version = "0.3.0", features = ["builder"] }
 
 [lints.clippy]
 pedantic = "warn"
