@@ -74,32 +74,34 @@
             default = config.packages.keyroost-agent;
           };
 
-          checks = {
-            piv-info = pkgs.callPackage ./nix/checks/piv-info.nix {
-              inherit keyroost keyroost-piv-applet system;
+          checks =
+            { }
+            // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+              piv-info = pkgs.callPackage ./nix/checks/piv-info.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-pin-change = pkgs.callPackage ./nix/checks/piv-pin-change.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-puk-change = pkgs.callPackage ./nix/checks/piv-puk-change.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-pin-block = pkgs.callPackage ./nix/checks/piv-pin-block.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-reset = pkgs.callPackage ./nix/checks/piv-reset.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-algorithms = pkgs.callPackage ./nix/checks/piv-algorithms.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-multi-slot = pkgs.callPackage ./nix/checks/piv-multi-slot.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
+              piv-attest = pkgs.callPackage ./nix/checks/piv-attest.nix {
+                inherit keyroost keyroost-piv-applet system;
+              };
             };
-            piv-pin-change = pkgs.callPackage ./nix/checks/piv-pin-change.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-puk-change = pkgs.callPackage ./nix/checks/piv-puk-change.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-pin-block = pkgs.callPackage ./nix/checks/piv-pin-block.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-reset = pkgs.callPackage ./nix/checks/piv-reset.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-algorithms = pkgs.callPackage ./nix/checks/piv-algorithms.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-multi-slot = pkgs.callPackage ./nix/checks/piv-multi-slot.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-            piv-attest = pkgs.callPackage ./nix/checks/piv-attest.nix {
-              inherit keyroost keyroost-piv-applet system;
-            };
-          };
 
           devShells.default = config.devShells.rust;
         };
