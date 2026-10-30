@@ -43,7 +43,6 @@
           ...
         }:
         let
-          jcardengine = pkgs.callPackage ./nix/jcardengine.nix { };
           keyroost-piv-applet = config.packages.keyroost-piv-applet;
         in
         {
@@ -72,8 +71,7 @@
           };
 
           packages = {
-            # default = config.packages.keyroost-agent;
-            jcardengine = jcardengine;
+            default = config.packages.keyroost-agent;
           };
 
           checks = {
