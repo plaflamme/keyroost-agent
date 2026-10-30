@@ -20,10 +20,12 @@ use elliptic_curve::Generate;
 use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 use p256::ecdsa::SigningKey;
 use rsa::pkcs8::EncodePublicKey;
-use x509_cert::builder::Builder;
+use x509_cert::builder::{Builder, Profile};
 use x509_cert::der::asn1::OctetString;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::ext::Extension;
+use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+use x509_cert::spki::ObjectIdentifier;
 
 use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_WRONG_LENGTH, VERSION};
 use crate::slot::{SlotKey, slot_index};
@@ -31,10 +33,15 @@ use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 
+const OID_YUBICO_FIRMWARE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.3");
+const OID_YUBICO_SERIAL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.7");
+const OID_YUBICO_POLICY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.8");
+
 /// The card's attestation state: the `F9` key's P-256 secret scalar and its
 /// own self-signed certificate in the `70`-wrapped storage form.
 pub(crate) struct Attestation {
     pub(crate) secret_key: elliptic_curve::SecretKey<p256::NistP256>,
+    /// Option because after replacing the secret key (via keygen), the certificate that was in place is no longer valid until a new one is stored in its place.
     pub(crate) cert: Option<x509_cert::Certificate>,
 }
 
@@ -90,6 +97,7 @@ impl PivApplet {
         let Some(cert) = attestation_cert(
             &self.attestation.secret_key,
             slot,
+            self.serial,
             spki,
             pin_policy,
             touch_policy,
@@ -137,6 +145,7 @@ fn target_public_key(key: &SlotKey) -> Option<x509_cert::SubjectPublicKeyInfo> {
         _ => None,
     }
 }
+
 struct YubicoPivAttestationProfile {
     pub slot: keyroost_piv::Slot,
     pub issuer: x509_cert::name::Name,
@@ -165,14 +174,6 @@ impl x509_cert::builder::Profile for YubicoPivAttestationProfile {
         _issuer_spk: p256::pkcs8::SubjectPublicKeyInfoRef<'_>,
         _tbs: &x509_cert::TbsCertificate,
     ) -> x509_cert::builder::Result<std::vec::Vec<x509_cert::ext::Extension>> {
-        use x509_cert::spki::ObjectIdentifier;
-        const OID_YUBICO_FIRMWARE: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.3");
-        const OID_YUBICO_SERIAL: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.7");
-        const OID_YUBICO_POLICY: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.8");
-
         let mut extensions = Vec::new();
 
         // 1. Firmware Extension: Encodings require a 3-byte OctetString wrapping the version payload
@@ -209,14 +210,64 @@ impl x509_cert::builder::Profile for YubicoPivAttestationProfile {
     }
 }
 
+/// Profile for the certificate stored in F9 by default.
+///
+struct YubicoRootProfile;
+impl x509_cert::builder::Profile for YubicoRootProfile {
+    fn get_issuer(&self, _subject: &x509_cert::name::Name) -> x509_cert::name::Name {
+        self.get_subject()
+    }
+
+    fn get_subject(&self) -> x509_cert::name::Name {
+        x509_cert::name::Name::from_str("CN=Yubico PIV Attestation").expect("valid name")
+    }
+
+    fn build_extensions(
+        &self,
+        _spk: p256::pkcs8::SubjectPublicKeyInfoRef<'_>,
+        _issuer_spk: p256::pkcs8::SubjectPublicKeyInfoRef<'_>,
+        tbs: &x509_cert::TbsCertificate,
+    ) -> x509_cert::builder::Result<std::vec::Vec<Extension>> {
+        use x509_cert::ext::ToExtension;
+        let mut extensions = Vec::new();
+
+        extensions.push(
+            BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            }
+            .to_extension(tbs.subject(), &extensions)?,
+        );
+
+        // ## keyUsage MUST
+        // Spec: 7.1.2.10.7 CA Certificate Key Usage
+        extensions.push(
+            KeyUsage(KeyUsages::KeyCertSign | KeyUsages::CRLSign)
+                .to_extension(tbs.subject(), &extensions)?,
+        );
+
+        // 1. Firmware Extension: Encodings require a 3-byte OctetString wrapping the version payload
+        let fw_payload = OctetString::new(VERSION)?;
+        let fw_der = fw_payload.to_der()?;
+
+        extensions.push(Extension {
+            extn_id: OID_YUBICO_FIRMWARE,
+            critical: false,
+            extn_value: OctetString::new(fw_der)?,
+        });
+        Ok(extensions)
+    }
+}
+
 /// Build the self-signed X.509 v3 attestation certificate: the reference
 /// applet's `writeX509CertInfo` layout, signed by the `F9` attestation key
 /// over SHA-256 of the TBS certificate.
 ///
 /// See <https://developers.yubico.com/PIV/Introduction/PIV_attestation.html#_implementation>
-pub(crate) fn attestation_cert(
+fn attestation_cert(
     secret_key: &p256::SecretKey,
     slot: keyroost_piv::Slot,
+    yubikey_serial: u32,
     spki: x509_cert::SubjectPublicKeyInfo,
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
@@ -224,9 +275,9 @@ pub(crate) fn attestation_cert(
     x509_cert::builder::CertificateBuilder::new(
         YubicoPivAttestationProfile {
             slot,
-            issuer: x509_cert::name::Name::from_str("CN=PIV Applet Cert").expect("valid name"), // TODO: this is self.attest.cert.subject
+            issuer: YubicoRootProfile.get_subject(),
             firmware_version: VERSION,
-            yubikey_serial: 42, // TODO
+            yubikey_serial,
             pin_policy,
             touch_policy,
         },
@@ -250,12 +301,7 @@ pub(crate) fn fresh_attestation() -> Result<Attestation, Box<dyn std::error::Err
         elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
     let signing = ecdsa::SigningKey::<p256::NistP256>::from(&secret_key);
     let cert = x509_cert::builder::CertificateBuilder::new(
-        x509_cert::builder::profile::cabf::Root::new(
-            false,
-            x509_cert::name::Name::from_str(
-                "CN=PIV applet attestation certificate,O=PIV Applet Org,C=Canada",
-            )?,
-        )?,
+        YubicoRootProfile,
         x509_cert::serial_number::SerialNumber::generate(&mut rand::rng()),
         x509_cert::time::Validity::from_now(std::time::Duration::from_hours(24 * 30)).unwrap(), // TODO: this is the signing certificate's validity
         x509_cert::SubjectPublicKeyInfo::from_key(&secret_key.public_key())
