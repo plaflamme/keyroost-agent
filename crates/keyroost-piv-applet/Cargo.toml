@@ -36,19 +36,6 @@ rsa = { version = "0.9", features = ["serde", "hazmat"] }
 # each operation. `alloc` for the byte-vector document API, `pkcs8` for the
 # blanket `Encode/DecodeRsaPrivateKey` impls the `rsa` crate relies on.
 pkcs1 = { version = "0.7", features = ["alloc", "pkcs8"] }
-# The BigUint crate rsa 0.9 depends on (as `num_bigint`), as a direct dep
-# for the numeric checks on the imported RSA components (`p * q == n`,
-# the `dP`/`dQ` consistency residues) that `rsa` itself leaves to the
-# caller. Default features off: rsa enables the features this crate needs,
-# and `std` would drag in `rand/std` + `serde` for no benefit (the BigUint
-# core is no-std).
-num-bigint-dig = { version = "0.8", default-features = false }
-# `num-integer` for the `Integer::is_even` primality pre-checks on the
-# imported RSA factors, `num-traits` for `is_zero`/`is_one`; both are
-# already in the tree through `num-bigint-dig`. `default-features = false`
-# keeps `std` out of the BigInt stack.
-num-integer = { version = "0.1", default-features = false }
-num-traits = { version = "0.2", default-features = false }
 # Secret card state (PIN/PUK, management key, private key material) lives in
 # Zeroizing containers.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }

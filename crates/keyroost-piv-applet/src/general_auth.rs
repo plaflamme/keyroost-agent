@@ -257,8 +257,8 @@ fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
 /// (`rng = None`), no check — which works the key's CRT exponents when
 /// they are present and falls back to `c^d mod n` otherwise.
 fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
-    use num_bigint_dig::BigUint;
     use pkcs1::DecodeRsaPrivateKey;
+    use rsa::BigUint;
     use rsa::RsaPrivateKey;
     use rsa::hazmat::rsa_decrypt;
     use rsa::traits::PublicKeyParts;
@@ -1080,7 +1080,7 @@ pub(crate) mod tests {
             n.len(),
             "the answer is zero-extended to the modulus size"
         );
-        use num_bigint_dig::BigUint;
+        use rsa::BigUint;
         assert_eq!(
             BigUint::from_bytes_be(s)
                 .modpow(&BigUint::from_bytes_be(&e), &BigUint::from_bytes_be(&n)),

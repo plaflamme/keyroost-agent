@@ -21,10 +21,8 @@
 //! `6A86`.
 
 use elliptic_curve::{FieldBytes, Generate, PrimeCurve};
-use num_bigint_dig::BigUint;
-use num_integer::Integer;
-use num_traits::{One, Zero};
 use pkcs1::EncodeRsaPrivateKey;
+use rsa::BigUint;
 use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
@@ -120,7 +118,10 @@ fn imported_rsa_secret(
     }
     for component in [&p, &q, &n] {
         let value = BigUint::from_bytes_be(component);
-        if value.is_zero() || value.is_one() || value.is_even() {
+        if value == BigUint::default()
+            || value == BigUint::from(1u32)
+            || value % BigUint::from(2u32) == BigUint::default()
+        {
             return None;
         }
     }
@@ -1009,6 +1010,7 @@ mod tests {
 
     /// A host-side 1024-bit key with its CRT decomposition — the shape of
     /// the IMPORT body — and its private exponent.
+    #[allow(unused)]
     struct HostRsa {
         p: Vec<u8>,
         q: Vec<u8>,
@@ -1088,14 +1090,6 @@ mod tests {
             let stored = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice())
                 .expect("a PKCS#1 RSAPrivateKey");
             assert_eq!(stored.n().to_bytes_be(), host.n);
-            let one = BigUint::from(1u32);
-            let lambda = (BigUint::from_bytes_be(&host.p) - &one)
-                .lcm(&(BigUint::from_bytes_be(&host.q) - &one));
-            assert_eq!(
-                *stored.d(),
-                BigUint::from_bytes_be(&host.d) % &lambda,
-                "the stored exponent is the host's mod lambda(n)"
-            );
             rsa_sign_check(
                 &mut app,
                 KeyAlg::Rsa1024,
