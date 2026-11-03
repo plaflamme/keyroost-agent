@@ -58,6 +58,7 @@ mod management;
 mod select;
 mod slot;
 mod state;
+mod yubico;
 
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
 
@@ -67,10 +68,12 @@ use constants::{
     SW_INS_NOT_SUPPORTED, SW_OK,
 };
 use data::PivData;
-use keyroost_piv::Instruction;
+use iso7816::Instruction;
 use management::MgmtKey;
 use slot::{Slot, factory_slots};
 use state::Pin;
+
+use crate::yubico::YubicoInstruction;
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
 /// status word that always terminates the answer.
@@ -212,28 +215,33 @@ impl PivApplet {
         let pin_presentation = *ins == keyroost_piv::Instruction::Verify as u8
             && apdu.get(2) == Some(&0x00)
             && matches!(apdu_lc_body(apdu), Ok((_, body, _)) if body.len() == 8);
-        let response = match Instruction::from_code(*ins) {
-            Some(Instruction::Select) => self.process_select(apdu),
-            Some(Instruction::Verify) => self.process_verify(apdu),
-            Some(Instruction::GetData) => self.process_get_data(apdu),
-            Some(Instruction::GetResponse) => self.process_get_response(apdu),
-            Some(Instruction::GeneralAuthenticate) => self.process_general_authenticate(apdu),
-            Some(Instruction::GenerateKeyPair) => self.process_generate_key_pair(apdu),
-            Some(Instruction::PutData) => self.process_put_data(apdu),
-            Some(Instruction::ChangeReference) => self.process_change_reference(apdu),
-            Some(Instruction::ResetRetryCounter) => self.process_reset_retry_counter(apdu),
-            Some(Instruction::GetVersion) => self.process_get_version(apdu),
-            Some(Instruction::GetSerial) => self.process_get_serial(apdu),
-            Some(Instruction::GetMetadata) => self.process_get_metadata(apdu),
-            Some(Instruction::MoveKey) => self.process_move_key(apdu),
-            Some(Instruction::SetManagementKey) => self.process_set_management_key(apdu),
-            Some(Instruction::SetPinRetries) => self.process_set_pin_retries(apdu),
-            Some(Instruction::Reset) => self.process_reset(apdu),
-            Some(Instruction::Attest) => self.process_attest(apdu),
-            // Not in `Instruction`: the host byte layer has no builder for
-            // it yet, so `from_code` cannot name it.
-            None if *ins == INS_IMPORT_ASYM => self.process_import_key(apdu),
-            _ => Response::sw(SW_INS_NOT_SUPPORTED),
+        #[allow(clippy::match_same_arms)]
+        let response = match Instruction::from(*ins) {
+            Instruction::Select => self.process_select(apdu),
+            Instruction::Verify => self.process_verify(apdu),
+            Instruction::GetData => self.process_get_data(apdu),
+            Instruction::GetResponse => self.process_get_response(apdu),
+            Instruction::GeneralAuthenticate => self.process_general_authenticate(apdu),
+            Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(apdu),
+            Instruction::PutData => self.process_put_data(apdu),
+            Instruction::ChangeReferenceData => self.process_change_reference(apdu),
+            Instruction::ResetRetryCounter => self.process_reset_retry_counter(apdu),
+            Instruction::ReadBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
+            Instruction::WriteBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
+            Instruction::Unknown(code) if let Some(yi) = YubicoInstruction::from_code(code) => {
+                match yi {
+                    YubicoInstruction::GetVersion => self.process_get_version(apdu),
+                    YubicoInstruction::GetSerial => self.process_get_serial(apdu),
+                    YubicoInstruction::GetMetadata => self.process_get_metadata(apdu),
+                    YubicoInstruction::ImportAsymmetricKey => self.process_import_key(apdu),
+                    YubicoInstruction::MoveKey => self.process_move_key(apdu),
+                    YubicoInstruction::SetManagementKey => self.process_set_management_key(apdu),
+                    YubicoInstruction::SetPinRetries => self.process_set_pin_retries(apdu),
+                    YubicoInstruction::Reset => self.process_reset(apdu),
+                    YubicoInstruction::Attest => self.process_attest(apdu),
+                }
+            }
+            Instruction::Unknown(_code) => Response::sw(SW_INS_NOT_SUPPORTED),
         };
         // The PIN/ALWAYS latch is consumed by the APDU after the one that
         // armed it. A successful PIN presentation is the one APDU that arms
