@@ -561,15 +561,15 @@ pub(crate) mod tests {
     pub(crate) fn mgmt_handshake(applet: &mut PivApplet) -> (Vec<u8>, [u8; 8]) {
         // Step 1 (general_auth_request_witness): 7C 02 80 00.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_OK, "witness round: {r:?}");
-        assert_eq!(r.data[0], 0x7C);
+        assert_eq!(r.status(), SW_OK, "witness round: {r:?}");
+        assert_eq!(r.data()[0], 0x7C);
         // The 7C wraps tag + length + 8-byte value: 2 + 8.
-        assert_eq!(r.data[1], 10);
-        assert_eq!(r.data[2], 0x80);
-        assert_eq!(r.data[3], 8);
+        assert_eq!(r.data()[1], 10);
+        assert_eq!(r.data()[2], 0x80);
+        assert_eq!(r.data()[3], 8);
         // The host decrypts the witness with the management key — the
         // clear challenge is the key proof.
-        let witness = des_decrypt(&r.data[4..12]);
+        let witness = des_decrypt(&r.data()[4..12]);
         // Step 2 (general_auth_mutual): the clear witness plus a fresh
         // host challenge; the card answers 7C .. 82 .. <enc(challenge)>.
         let challenge: [u8; 8] = [0x42; 8];
@@ -578,11 +578,11 @@ pub(crate) mod tests {
         members.extend_from_slice(&[0x81, 0x08]);
         members.extend_from_slice(&challenge);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&members])));
-        assert_eq!(r.sw, SW_OK, "mutual round: {r:?}");
-        assert_eq!(r.data[0], 0x7C);
-        assert_eq!(r.data[2], 0x82);
-        assert_eq!(r.data[3], 8);
-        (r.data, challenge)
+        assert_eq!(r.status(), SW_OK, "mutual round: {r:?}");
+        assert_eq!(r.data()[0], 0x7C);
+        assert_eq!(r.data()[2], 0x82);
+        assert_eq!(r.data()[3], 8);
+        (Vec::from(r.data()), challenge)
     }
 
     /// Decrypt an 8-byte block with the stored 3DES management key.
@@ -598,7 +598,7 @@ pub(crate) mod tests {
     pub(crate) fn block_puk(applet: &mut PivApplet) {
         for tries in (1..=DEFAULT_PUK_TRIES).rev() {
             let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"123456").unwrap());
-            assert_eq!(resp.sw, tries_sw(tries - 1));
+            assert_eq!(resp.status(), tries_sw(tries - 1));
         }
     }
 
@@ -606,12 +606,12 @@ pub(crate) mod tests {
     fn ga_witness_round_answers_an_encrypted_challenge() {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.sw, SW_OK);
-        assert_eq!(r1.data.len(), 12);
+        assert_eq!(r1.status(), SW_OK);
+        assert_eq!(r1.data().len(), 12);
         let r2 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r2.sw, SW_OK);
+        assert_eq!(r2.status(), SW_OK);
         // A fresh challenge every time — the witnesses differ.
-        assert_ne!(&r1.data[4..12], &r2.data[4..12]);
+        assert_ne!(&r1.data()[4..12], &r2.data()[4..12]);
     }
 
     #[test]
@@ -638,13 +638,17 @@ pub(crate) mod tests {
         // The session is unlocked: a management write goes through.
         let apdu = set_mgmt_key_apdu();
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_OK, "unlocked session: {r:?}");
+        assert_eq!(r.status(), SW_OK, "unlocked session: {r:?}");
         // A witness request re-locks the slot (issue() clears the flag)...
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         // ...so the same write now fails until a full mutual auth again.
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED, "re-locked: {r:?}");
+        assert_eq!(
+            r.status(),
+            SW_SECURITY_STATUS_NOT_SATISFIED,
+            "re-locked: {r:?}"
+        );
     }
 
     #[test]
@@ -657,7 +661,7 @@ pub(crate) mod tests {
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // After a handshake the answer is the same — the shape, not the
         // state, is what is refused.
         mgmt_handshake(&mut applet);
@@ -665,25 +669,25 @@ pub(crate) mod tests {
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
     fn ga_wrong_witness_is_wrong_data_and_consumes_the_challenge() {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.sw, SW_OK);
+        assert_eq!(r1.status(), SW_OK);
         // A corrupted witness — the applet's challenge is consumed.
         let mut bad = vec![0x80, 0x08];
-        bad.extend_from_slice(&r1.data[4..12]);
+        bad.extend_from_slice(&r1.data()[4..12]);
         bad[2] ^= 1;
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&bad])));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // The real witness no longer verifies — the challenge is gone.
         let mut good = vec![0x80, 0x08];
-        good.extend_from_slice(&r1.data[4..12]);
+        good.extend_from_slice(&r1.data()[4..12]);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&good])));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -691,13 +695,13 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
         let r2 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.sw, SW_OK);
-        assert_eq!(r2.sw, SW_OK);
+        assert_eq!(r1.status(), SW_OK);
+        assert_eq!(r2.status(), SW_OK);
         // Presenting the first witness fails — the second issued it away.
         let mut body = vec![0x80, 0x08];
-        body.extend_from_slice(&r1.data[4..12]);
+        body.extend_from_slice(&r1.data()[4..12]);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&body])));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -707,7 +711,7 @@ pub(crate) mod tests {
         // ciphertext proves nothing, so its length is never even looked at.
         let body = ga_body(&[&[0x82, 4, 0, 1, 2, 3]]);
         let r = applet.process(&ga_apdu(0x03, &body));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -715,12 +719,12 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // The applet is 3DES; P1 = AES-256 is not its algorithm.
         let r = applet.process(&ga_apdu(0x0C, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // And an asymmetric P1 with a signing-shaped body too.
         let mut members = vec![0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7];
         members.extend_from_slice(&[0x82, 0x00]);
         let r = applet.process(&ga_apdu(0x14, &ga_body(&[&members])));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -729,30 +733,30 @@ pub(crate) mod tests {
         // Non-slot P2s: `6B00` outright.
         for p2 in [0x58u8, 0x00u8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.sw, SW_INCORRECT_P1P2);
+            assert_eq!(r.status(), SW_INCORRECT_P1P2);
         }
         // 9E is a slot (factory NEVER) — ungated, refused for the missing
         // key.
         let r = applet.process(&ga_apdu_for_p2(0x9E));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // 9A/9C/9D and the retired slots: PIN-gated — locked first.
         for p2 in [0x9Au8, 0x9Cu8, 0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+            assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         }
         // After the PIN is verified the applet has no key material for
         // them. The ONCE slots pass on the session flag; the ALWAYS latch
         // is consumed by the first slot APDU, so the 9C GA that does not
         // follow the VERIFY is gated again.
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let r = applet.process(&ga_apdu_for_p2(0x9A));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         let r = applet.process(&ga_apdu_for_p2(0x9C));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         for p2 in [0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.sw, SW_INCORRECT_P1P2);
+            assert_eq!(r.status(), SW_INCORRECT_P1P2);
         }
     }
 
@@ -766,24 +770,24 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // Lc overrunning the APDU.
         let r = applet.process(&[0x00, 0x87, 0x03, KEY_REF_MANAGEMENT, 0x08, 0x7C, 0x00]);
-        assert_eq!(r.sw, SW_WRONG_LENGTH);
+        assert_eq!(r.status(), SW_WRONG_LENGTH);
         // No 7C wrapper at all.
         let r = applet.process(&ga_apdu(0x03, &[0x80, 0x00]));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // Two empty tags.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00], &[0x81, 0x00]])));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // An unknown empty tag.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x85, 0x00]])));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // A member that overruns the body.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x81, 0x08, 0, 1, 2]])));
-        assert_eq!(r.sw, SW_DATA_INVALID);
+        assert_eq!(r.status(), SW_DATA_INVALID);
         // The 7C wrapper's length underdeclared: the scan still runs to the
         // end of the body — here to a second empty tag, a protocol error.
         let body = vec![0x7C, 0x02, 0x80, 0x00, 0x81, 0x00];
         let r = applet.process(&ga_apdu(0x03, &body));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -792,7 +796,7 @@ pub(crate) mod tests {
         let mut apdu = ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]]));
         apdu[0] = 0x80;
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_CLA_NOT_SUPPORTED);
+        assert_eq!(r.status(), SW_CLA_NOT_SUPPORTED);
     }
 
     /// Management unlock plus a key of `alg` in `slot`; returns the
@@ -809,8 +813,8 @@ pub(crate) mod tests {
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
-        assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
-        match keyroost_piv::parse_public_key(&r.data).expect("a well-formed public-key template") {
+        assert_eq!(r.status(), SW_OK, "GENERATE: {r:?}");
+        match keyroost_piv::parse_public_key(r.data()).expect("a well-formed public-key template") {
             keyroost_piv::PublicKey::Ecc { point } => point,
             keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
@@ -835,8 +839,8 @@ pub(crate) mod tests {
             key_ref,
             digest,
         ));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point).expect("the announced point");
         let sig = p256::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
         vk.verify_prehash(digest, &sig).expect("a valid signature");
@@ -849,7 +853,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         card_signature(&mut applet, 0x9A, &point, &[0x2B; 32]);
@@ -865,8 +869,8 @@ pub(crate) mod tests {
             0x9E,
             peer.public_key().to_sec1_point(false).as_bytes(),
         ));
-        assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
-        let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "key agree(ment GA: {r:?}");
+        let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(z.len(), 32);
         let card_pub = p256::PublicKey::from_sec1_bytes(&point).expect("the announced point");
         let expected = peer.diffie_hellman(&card_pub);
@@ -885,7 +889,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         let digest = [0x2C; 48];
@@ -894,8 +898,8 @@ pub(crate) mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("the announced point");
         let sig = p384::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
@@ -914,7 +918,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         // The host hashes the TBS with SHA-512: a 64-byte digest, two bytes
@@ -925,8 +929,8 @@ pub(crate) mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         use p521::ecdsa::signature::hazmat::PrehashVerifier;
         let vk = p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("the announced point");
         let sig = p521::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
@@ -947,8 +951,8 @@ pub(crate) mod tests {
             0x9E,
             peer.public_key().to_sec1_point(false).as_bytes(),
         ));
-        assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
-        let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "key agreement GA: {r:?}");
+        let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(z.len(), 48);
         let card_pub = p384::PublicKey::from_sec1_bytes(&point).expect("the announced point");
         let expected = peer.diffie_hellman(&card_pub);
@@ -972,8 +976,8 @@ pub(crate) mod tests {
             0x9E,
             peer.public_key().to_sec1_point(false).as_bytes(),
         ));
-        assert_eq!(r.sw, SW_OK, "key agreement GA: {r:?}");
-        let z = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "key agreement GA: {r:?}");
+        let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(z.len(), 66);
         let card_pub = p521::PublicKey::from_sec1_bytes(&point).expect("the announced point");
         let expected = peer.diffie_hellman(&card_pub);
@@ -991,27 +995,27 @@ pub(crate) mod tests {
             0x9C,
             &digest,
         ));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         // A VERIFY followed by another APDU consumes the latch: gated again.
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
-        assert_eq!(applet.process(&keyroost_piv::select_full()).sw, SW_OK);
+        assert_eq!(applet.process(&keyroost_piv::select_full()).status(), SW_OK);
         let r = applet.process(&keyroost_piv::general_auth_sign(
             keyroost_piv::KeyAlg::EccP256.id(),
             0x9C,
             &digest,
         ));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         // A VERIFY immediately followed by the GA: the signature verifies
         // under the announced point.
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         card_signature(&mut applet, 0x9C, &point, &digest);
@@ -1024,7 +1028,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
@@ -1032,7 +1036,7 @@ pub(crate) mod tests {
             0x9A,
             &[0x2B; 32],
         ));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -1064,8 +1068,8 @@ pub(crate) mod tests {
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
-        assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
-        let (n, e) = match keyroost_piv::parse_public_key(&r.data).expect("a template") {
+        assert_eq!(r.status(), SW_OK, "GENERATE: {r:?}");
+        let (n, e) = match keyroost_piv::parse_public_key(r.data()).expect("a template") {
             keyroost_piv::PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
             keyroost_piv::PublicKey::Ecc { .. } => panic!("expected an RSA modulus"),
         };
@@ -1073,8 +1077,8 @@ pub(crate) mod tests {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = 0x2B;
         let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &block));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let s = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(
             s.len(),
             n.len(),
@@ -1093,10 +1097,10 @@ pub(crate) mod tests {
             0x9E,
             &block[..block.len() - 1],
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // A block >= n is not a valid residue.
         let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &n));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -1107,7 +1111,7 @@ pub(crate) mod tests {
             0xF9,
             &[0x2B; 32],
         ));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -1117,7 +1121,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
@@ -1125,7 +1129,7 @@ pub(crate) mod tests {
             0x9A,
             &[0x2B; 20],
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -1138,7 +1142,7 @@ pub(crate) mod tests {
             0x9E,
             &[0x04; 64],
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // 65 bytes but off the curve.
         let mut off_curve = [0x11; 65];
         off_curve[0] = 0x04;
@@ -1147,7 +1151,7 @@ pub(crate) mod tests {
             0x9E,
             &off_curve,
         ));
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
@@ -1157,7 +1161,7 @@ pub(crate) mod tests {
         assert_eq!(
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         let digest = [0x2B; 32];
@@ -1179,7 +1183,7 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&body);
         apdu.push(0x00);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // Both an 81 and an 85 member: not the one-shot slot shape.
         let mut body = vec![0x7C, 3 + 34 + 2 + 65, 0x81, 0x20];
         body.extend_from_slice(&digest);
@@ -1189,11 +1193,11 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&body);
         apdu.push(0x00);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // A lone empty 82 (no data member at all): not the one-shot slot
         // shape.
         let r = applet.process(&[0x00, 0x87, 0x11, 0x9A, 0x04, 0x7C, 0x02, 0x82, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The key-slot key commands: GENERATE ASYMMETRIC KEY PAIR (`0x47`),
-//! IMPORT ASYMMETRIC KEY (`0x86`) and MOVE KEY / DELETE (`0xF6`), the
+//! IMPORT ASYMMETRIC KEY (`0xFE`) and MOVE KEY / DELETE (`0xF6`), the
 //! first two for the NIST curves P-256, P-384 and P-521.
 //!
 //! Both commands need the 9B management session unlocked and both replace
@@ -262,8 +262,8 @@ impl PivApplet {
         Response::ok(data)
     }
 
-    /// IMPORT ASYMMETRIC KEY (`0x86`): the host's
-    /// `ykpriv`/`import` APDU, `00 86 <alg> <slot> Lc 06 20 <scalar>
+    /// IMPORT ASYMMETRIC KEY (`0xFE`): the host's
+    /// `ykpriv`/`import` APDU, `00 FE <alg> <slot> Lc 06 20 <scalar>
     /// [AA 01 <pin>] [AB 01 <touch>]`, case 3 — no `Le`, the host keeps
     /// the key it sends and answers are bare `9000`.
     ///
@@ -598,8 +598,9 @@ impl PivApplet {
 #[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
-    use crate::constants::{INS_IMPORT_ASYM, SW_SECURITY_NOT_SATISFIED};
+    use crate::constants::SW_SECURITY_NOT_SATISFIED;
     use crate::general_auth::tests::mgmt_handshake;
+    use crate::yubico::YubicoInstruction;
     use elliptic_curve::sec1::ToSec1Point;
     use keyroost_piv::{
         CertInfo, PublicKey, SW_NOT_FOUND, Slot, encode_certificate, generate_key, get_data,
@@ -669,7 +670,12 @@ mod tests {
 
     /// A raw IMPORT ASYMMETRIC KEY APDU.
     fn import_apdu(alg: u8, slot: u8, body: &[u8]) -> Vec<u8> {
-        let mut apdu = vec![0x00, INS_IMPORT_ASYM, alg, slot];
+        let mut apdu = vec![
+            0x00,
+            YubicoInstruction::ImportAsymmetricKey.to_code(),
+            alg,
+            slot,
+        ];
         if body.len() <= 255 {
             apdu.push(body.len() as u8);
         } else {
@@ -688,7 +694,7 @@ mod tests {
 
     /// The uncompressed point in the `7F 49 86` template.
     fn point_of(r: &Response) -> Vec<u8> {
-        match parse_public_key(&r.data).expect("a well-formed public-key template") {
+        match parse_public_key(r.data()).expect("a well-formed public-key template") {
             PublicKey::Ecc { point } => point,
             PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
@@ -698,13 +704,13 @@ mod tests {
     fn generate_answers_the_uncompressed_point() {
         let mut app = unlocked();
         let r = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let point = point_of(&r);
         assert_eq!(point.len(), 65);
         assert_eq!(point[0], 0x04);
         // A second generate on the same slot regenerates: a different point.
         let r2 = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(r2.sw, SW_OK);
+        assert_eq!(r2.status(), SW_OK);
         assert_ne!(point_of(&r2), point);
     }
 
@@ -713,7 +719,7 @@ mod tests {
         // The management gate is checked before anything else.
         let mut app = PivApplet::new();
         assert_eq!(
-            app.process(&gen_apdu(Slot::Authentication)).sw,
+            app.process(&gen_apdu(Slot::Authentication)).status(),
             SW_SECURITY_NOT_SATISFIED
         );
 
@@ -721,14 +727,14 @@ mod tests {
         // A non-zero P1 is refused.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[2] = 0x01;
-        assert_eq!(app.process(&apdu).sw, SW_INCORRECT_P1P2);
+        assert_eq!(app.process(&apdu).status(), SW_INCORRECT_P1P2);
         // Non-slot P2s: the vendor-extension and PIN references.
         // `9B` (management) and `F9` (attestation) are valid GENERATE
         // targets — `F9` in particular, see
         // `attest::tests::generate_on_f9_mints_a_fresh_ca`.
         for p2 in [0xE0, 0xE1, 0x80, 0x00u8] {
             assert_eq!(
-                app.process(&gen_raw_p2(p2)).sw,
+                app.process(&gen_raw_p2(p2)).status(),
                 SW_INCORRECT_P1P2,
                 "P2 {p2:02X}",
             );
@@ -738,11 +744,11 @@ mod tests {
         let f9_p384 = vec![
             0x00u8, 0x47, 0x00, 0xF9, 0x00, 0x00, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x14, 0x00,
         ];
-        assert_eq!(app.process(&f9_p384).sw, SW_WRONG_DATA);
+        assert_eq!(app.process(&f9_p384).status(), SW_WRONG_DATA);
         // A non-PIV CLA.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[0] = 0x80;
-        assert_eq!(app.process(&apdu).sw, SW_CLA_NOT_SUPPORTED);
+        assert_eq!(app.process(&apdu).status(), SW_CLA_NOT_SUPPORTED);
         // Broken control templates: missing or truncated `80`, trailing
         // garbage, repeated members, unknown members.
         let broken: [&[u8]; 8] = [
@@ -758,7 +764,7 @@ mod tests {
         for control in broken {
             assert_eq!(
                 app.process(&gen_control_apdu(Slot::Authentication, control))
-                    .sw,
+                    .status(),
                 SW_WRONG_DATA,
                 "control template {control:02X?}",
             );
@@ -766,7 +772,7 @@ mod tests {
         // An Lc overrun.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[4] = 0x10;
-        assert_eq!(app.process(&apdu).sw, SW_WRONG_LENGTH);
+        assert_eq!(app.process(&apdu).status(), SW_WRONG_LENGTH);
     }
 
     #[test]
@@ -777,7 +783,7 @@ mod tests {
             PinPolicy::Always,
             TouchPolicy::Always,
         ));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let slot = &app.slots[0];
         assert!(slot.key.is_some());
         assert_eq!(slot.pin_policy, PinPolicy::Always);
@@ -785,7 +791,7 @@ mod tests {
         assert!(!slot.imported);
 
         // Absent policy requests keep the slot's current policies.
-        assert_eq!(app.process(&gen_apdu(Slot::Authentication)).sw, SW_OK);
+        assert_eq!(app.process(&gen_apdu(Slot::Authentication)).status(), SW_OK);
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Always);
         assert_eq!(app.slots[0].touch_policy, TouchPolicy::Always);
 
@@ -793,7 +799,7 @@ mod tests {
         let control = [0x80, 0x01, 0x11, 0xAA, 0x01, 0x00, 0xAB, 0x01, 0x00];
         assert_eq!(
             app.process(&gen_control_apdu(Slot::Authentication, &control))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Once); // 9A's factory
@@ -806,16 +812,16 @@ mod tests {
         let der: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
         let cert = encode_certificate(&der, CertInfo::Uncompressed);
         let tag = Slot::Authentication.cert_object_tag();
-        assert_eq!(app.process(&put_data(&tag, &cert)).sw, SW_OK);
+        assert_eq!(app.process(&put_data(&tag, &cert)).status(), SW_OK);
 
         let first = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(first.sw, SW_OK);
+        assert_eq!(first.status(), SW_OK);
         let second = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(second.sw, SW_OK);
+        assert_eq!(second.status(), SW_OK);
         assert_ne!(point_of(&second), point_of(&first));
 
         // R5: the certificate object is cleared on regenerate.
-        assert_eq!(app.process(&get_data(&tag)).sw, SW_NOT_FOUND);
+        assert_eq!(app.process(&get_data(&tag)).status(), SW_NOT_FOUND);
     }
 
     #[test]
@@ -824,15 +830,15 @@ mod tests {
         let scalar = fixed_scalar();
         let cert = encode_certificate(&[0x30, 0x82, 0x01, 0x00], CertInfo::Uncompressed);
         let tag = Slot::Authentication.cert_object_tag();
-        assert_eq!(app.process(&put_data(&tag, &cert)).sw, SW_OK);
+        assert_eq!(app.process(&put_data(&tag, &cert)).status(), SW_OK);
 
         let r = app.process(&import_apdu(
             0x11,
             0x9A,
             &ec_body(&scalar, Some(0x02), Some(0x02)),
         ));
-        assert_eq!(r.sw, SW_OK);
-        assert_eq!(r.data, [] as [u8; 0]);
+        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.data(), [] as [u8; 0]);
 
         let slot = &app.slots[0];
         let key = slot.key.as_ref().expect("the imported key");
@@ -843,7 +849,7 @@ mod tests {
         assert_eq!(slot.touch_policy, TouchPolicy::Always);
 
         // R5: import clears the stored certificate.
-        assert_eq!(app.process(&get_data(&tag)).sw, SW_NOT_FOUND);
+        assert_eq!(app.process(&get_data(&tag)).status(), SW_NOT_FOUND);
     }
 
     #[test]
@@ -853,7 +859,7 @@ mod tests {
         let mut app = PivApplet::new();
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
-                .sw,
+                .status(),
             SW_SECURITY_NOT_SATISFIED
         );
 
@@ -866,7 +872,7 @@ mod tests {
         ] {
             assert_eq!(
                 app.process(&import_apdu(alg, 0x9A, &ec_body(&scalar, None, None)))
-                    .sw,
+                    .status(),
                 SW_WRONG_DATA
             );
         }
@@ -874,14 +880,14 @@ mod tests {
         for p2 in [0x9B, 0xF9u8] {
             assert_eq!(
                 app.process(&import_apdu(0x11, p2, &ec_body(&scalar, None, None)))
-                    .sw,
+                    .status(),
                 SW_INCORRECT_P1P2
             );
         }
         // A non-PIV CLA.
         let mut apdu = import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None));
         apdu[0] = 0x80;
-        assert_eq!(app.process(&apdu).sw, SW_CLA_NOT_SUPPORTED);
+        assert_eq!(app.process(&apdu).status(), SW_CLA_NOT_SUPPORTED);
         // Broken bodies: no scalar, wrong lengths, trailing garbage,
         // repeated and unknown members.
         let mut with_trailing = ec_body(&scalar, None, None);
@@ -901,14 +907,14 @@ mod tests {
         ];
         for body in broken {
             assert_eq!(
-                app.process(&import_apdu(0x11, 0x9A, body)).sw,
+                app.process(&import_apdu(0x11, 0x9A, body)).status(),
                 SW_WRONG_DATA
             );
         }
         // An Lc overrun.
         let mut apdu = import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None));
         apdu[4] = 0x30;
-        assert_eq!(app.process(&apdu).sw, SW_WRONG_LENGTH);
+        assert_eq!(app.process(&apdu).status(), SW_WRONG_LENGTH);
         // Refusals leave the slot empty.
         assert!(app.slots[0].key.is_none());
     }
@@ -922,7 +928,7 @@ mod tests {
         above[31] += 1;
         for scalar in [zero, order, above] {
             let r = app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)));
-            assert_eq!(r.sw, SW_WRONG_DATA, "{scalar:02X?}");
+            assert_eq!(r.status(), SW_WRONG_DATA, "{scalar:02X?}");
         }
         assert!(app.slots[0].key.is_none());
     }
@@ -933,7 +939,7 @@ mod tests {
         let scalar = fixed_scalar();
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
-                .sw,
+                .status(),
             SW_OK
         );
         // The stored scalar is the ECDSA secret for the point the slot
@@ -955,7 +961,7 @@ mod tests {
         let scalar = fixed_scalar();
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9E, &ec_body(&scalar, None, None)))
-                .sw,
+                .status(),
             SW_OK
         );
         // 9E is `NEVER` at the factory, so no VERIFY is needed: the GA
@@ -969,7 +975,7 @@ mod tests {
     /// The `81` modulus and `82` exponent in the `7F 49` template of an
     /// RSA GENERATE response.
     fn rsa_public_of(r: &Response) -> (Vec<u8>, Vec<u8>) {
-        match parse_public_key(&r.data).expect("a well-formed public-key template") {
+        match parse_public_key(r.data()).expect("a well-formed public-key template") {
             PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
             PublicKey::Ecc { .. } => panic!("expected an RSA modulus"),
         }
@@ -983,8 +989,8 @@ mod tests {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = m;
         let r = app.process(&keyroost_piv::general_auth_sign(alg.id(), slot, &block));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let s = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let s = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(
             s.len(),
             n.len(),
@@ -1046,7 +1052,7 @@ mod tests {
             PinPolicy::Default,
             TouchPolicy::Default,
         ));
-        assert_eq!(r.sw, SW_OK, "GENERATE: {r:?}");
+        assert_eq!(r.status(), SW_OK, "GENERATE: {r:?}");
         let (n, e) = rsa_public_of(&r);
         assert_eq!(n.len(), 128);
         assert_ne!(n[127] & 1, 0, "the modulus is odd");
@@ -1076,7 +1082,7 @@ mod tests {
             ]);
             assert_eq!(
                 app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, &body))
-                    .sw,
+                    .status(),
                 SW_OK,
                 "IMPORT"
             );
@@ -1160,7 +1166,7 @@ mod tests {
         for body in &bodies {
             assert_eq!(
                 app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, body))
-                    .sw,
+                    .status(),
                 SW_WRONG_DATA,
                 "body {body:02X?}"
             );
@@ -1172,8 +1178,8 @@ mod tests {
     /// values are all small, so no `61xx` continuation is expected.
     fn read_object(app: &mut PivApplet, tag: &[u8]) -> Vec<u8> {
         let r = app.process(&keyroost_piv::get_data(tag));
-        assert_eq!(r.sw, SW_OK, "GET DATA {tag:?}");
-        keyroost_piv::unwrap_data_object(&r.data)
+        assert_eq!(r.status(), SW_OK, "GET DATA {tag:?}");
+        keyroost_piv::unwrap_data_object(r.data())
             .expect("a well-formed 53 template")
             .to_vec()
     }
@@ -1189,19 +1195,19 @@ mod tests {
                 0x9C,
                 &ec_body(&scalar, Some(0x02), Some(0x02))
             ))
-            .sw,
+            .status(),
             SW_OK
         );
         let cert_a = b"source-cert";
         let cert_b = b"dest-cert";
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0A], cert_a))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0D], cert_b))
-                .sw,
+                .status(),
             SW_OK
         );
 
@@ -1210,7 +1216,7 @@ mod tests {
                 keyroost_piv::Slot::Signature,
                 keyroost_piv::Slot::retired(1).expect("retired 1"),
             ))
-            .sw,
+            .status(),
             SW_OK,
             "move"
         );
@@ -1236,12 +1242,12 @@ mod tests {
         let scalar = fixed_scalar();
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x05], b"auth-cert"))
-                .sw,
+                .status(),
             SW_OK
         );
 
@@ -1249,7 +1255,7 @@ mod tests {
             app.process(&keyroost_piv::delete_key(
                 keyroost_piv::Slot::Authentication
             ))
-            .sw,
+            .status(),
             SW_OK,
             "delete"
         );
@@ -1258,7 +1264,7 @@ mod tests {
         assert_eq!(slot.pin_policy, PinPolicy::Once, "the policy is untouched");
         assert!(slot.cert.is_some(), "the certificate is untouched");
         assert_eq!(
-            app.process(&keyroost_piv::get_metadata(0x9A)).sw,
+            app.process(&keyroost_piv::get_metadata(0x9A)).status(),
             keyroost_piv::SW_REFERENCE_NOT_FOUND,
             "no key, so metadata reports the slot empty"
         );
@@ -1274,12 +1280,12 @@ mod tests {
                 keyroost_piv::Slot::KeyManagement,
                 keyroost_piv::Slot::Authentication,
             ))
-            .sw,
+            .status(),
             SW_NOT_FOUND
         );
         assert_eq!(
             app.process(&keyroost_piv::delete_key(keyroost_piv::Slot::KeyManagement))
-                .sw,
+                .status(),
             SW_NOT_FOUND
         );
     }
@@ -1288,16 +1294,25 @@ mod tests {
     fn move_key_refusals() {
         let mut app = PivApplet::new();
         assert_eq!(
-            app.process(&[0x00, 0xF6, 0x9C, 0x9A]).sw,
+            app.process(&[0x00, 0xF6, 0x9C, 0x9A]).status(),
             SW_SECURITY_NOT_SATISFIED
         );
         mgmt_handshake(&mut app);
         // F9 is not in the slot table, in either position; neither is 9B.
-        assert_eq!(app.process(&[0x00, 0xF6, 0xF9, 0x9A]).sw, SW_INCORRECT_P1P2);
-        assert_eq!(app.process(&[0x00, 0xF6, 0x9C, 0xF9]).sw, SW_INCORRECT_P1P2);
-        assert_eq!(app.process(&[0x00, 0xF6, 0x9B, 0x9A]).sw, SW_INCORRECT_P1P2);
         assert_eq!(
-            app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).sw,
+            app.process(&[0x00, 0xF6, 0xF9, 0x9A]).status(),
+            SW_INCORRECT_P1P2
+        );
+        assert_eq!(
+            app.process(&[0x00, 0xF6, 0x9C, 0xF9]).status(),
+            SW_INCORRECT_P1P2
+        );
+        assert_eq!(
+            app.process(&[0x00, 0xF6, 0x9B, 0x9A]).status(),
+            SW_INCORRECT_P1P2
+        );
+        assert_eq!(
+            app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).status(),
             SW_CLA_NOT_SUPPORTED
         );
     }
@@ -1310,12 +1325,12 @@ mod tests {
         let other = [0x5E; 32];
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, None, None)))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9D, &ec_body(&other, None, None)))
-                .sw,
+                .status(),
             SW_OK
         );
 
@@ -1326,7 +1341,7 @@ mod tests {
                 keyroost_piv::Slot::Signature,
                 keyroost_piv::Slot::KeyManagement,
             ))
-            .sw,
+            .status(),
             SW_WRONG_DATA
         );
         assert_eq!(
@@ -1334,7 +1349,7 @@ mod tests {
                 keyroost_piv::Slot::Signature,
                 keyroost_piv::Slot::Signature,
             ))
-            .sw,
+            .status(),
             SW_WRONG_DATA
         );
         let source = &app.slots[slot_index(0x9C).expect("9C")];
@@ -1363,7 +1378,7 @@ mod tests {
             keyroost_piv::Slot::Signature,
             KeyAlg::EccP384,
         ));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let point = point_of(&r);
         assert_eq!(point.len(), 97);
         p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-384 point");
@@ -1377,7 +1392,7 @@ mod tests {
             keyroost_piv::Slot::KeyManagement,
             KeyAlg::EccP521,
         ));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let point = point_of(&r);
         assert_eq!(point.len(), 133);
         p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-521 point");
@@ -1400,7 +1415,7 @@ mod tests {
         let body = ec_body(&scalar, None, None);
         assert_eq!(
             app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9A, &body))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(
@@ -1416,7 +1431,7 @@ mod tests {
         let expected_point = expected_point.as_bytes();
         assert_eq!(
             app.process(&keyroost_piv::verify_pin(b"123456").unwrap())
-                .sw,
+                .status(),
             SW_OK
         );
         let digest = [0x2C; 48];
@@ -1425,8 +1440,8 @@ mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(r.sw, SW_OK, "signing GA: {r:?}");
-        let sig_der = keyroost_piv::parse_general_auth(&r.data, 0x82).expect("an 82 answer");
+        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(expected_point).expect("the point");
         let sig = p384::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
         vk.verify_prehash(&digest, &sig).expect("a valid signature");
@@ -1441,7 +1456,7 @@ mod tests {
         let body = ec_body(&scalar, None, None);
         assert_eq!(
             app.process(&import_apdu(KeyAlg::EccP521.id(), 0x82, &body))
-                .sw,
+                .status(),
             SW_OK
         );
         assert_eq!(
@@ -1465,7 +1480,7 @@ mod tests {
                 0x9C,
                 &ec_body(&long, None, None)
             ))
-            .sw,
+            .status(),
             SW_WRONG_DATA
         );
         assert_eq!(
@@ -1474,7 +1489,7 @@ mod tests {
                 0x9C,
                 &ec_body(&short, None, None)
             ))
-            .sw,
+            .status(),
             SW_WRONG_DATA
         );
         assert_eq!(
@@ -1483,7 +1498,7 @@ mod tests {
                 0x9C,
                 &ec_body(&mid, None, None)
             ))
-            .sw,
+            .status(),
             SW_WRONG_DATA
         );
         // Zero scalars and group orders, per curve: the range check refuses
@@ -1496,7 +1511,7 @@ mod tests {
             let zero = vec![0u8; size];
             assert_eq!(
                 app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&zero, None, None)))
-                    .sw,
+                    .status(),
                 SW_WRONG_DATA
             );
             let order = match alg {
@@ -1507,7 +1522,7 @@ mod tests {
             };
             assert_eq!(
                 app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&order, None, None)))
-                    .sw,
+                    .status(),
                 SW_WRONG_DATA
             );
         }

@@ -368,7 +368,7 @@ mod tests {
         assert!(applet.management_unlocked().is_ok());
         // A witness request re-locks the session — the gate locks with it.
         let r = applet.process(&[0x00, 0x87, 0x03, 0x9B, 0x04, 0x7C, 0x02, 0x80, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         assert_eq!(applet.management_unlocked(), Err(SW_SECURITY_NOT_SATISFIED));
     }
 
@@ -382,7 +382,7 @@ mod tests {
         );
         // ...and open after.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         assert!(applet.slot_pin_gate(&applet.slots[0]).is_ok());
     }
 
@@ -398,13 +398,13 @@ mod tests {
         // gets through: the latch is set by the VERIFY and still set when
         // this slot GA runs.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2, "arm survives the VERIFY");
+        assert_eq!(r.status(), SW_INCORRECT_P1P2, "arm survives the VERIFY");
         // The arm is consumed by that APDU: the next one is gated again
         // even though the PIN is still verified.
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
     }
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
         // 9E is NEVER: no PIN, no arm, always open.
         assert!(applet.slot_pin_gate(&applet.slots[3]).is_ok());
         let r = applet.process(&ga_apdu(0x9E));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -423,14 +423,14 @@ mod tests {
         for (ref_, index) in [(0x82u8, 4usize), (0x95u8, 23usize)] {
             assert_eq!(slot_index(ref_), Some(index));
             assert_eq!(
-                applet.process(&ga_apdu(ref_)).sw,
+                applet.process(&ga_apdu(ref_)).status(),
                 SW_SECURITY_STATUS_NOT_SATISFIED
             );
         }
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
-        assert_eq!(applet.process(&ga_apdu(0x82)).sw, SW_INCORRECT_P1P2);
-        assert_eq!(applet.process(&ga_apdu(0x95)).sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_OK);
+        assert_eq!(applet.process(&ga_apdu(0x82)).status(), SW_INCORRECT_P1P2);
+        assert_eq!(applet.process(&ga_apdu(0x95)).status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -440,15 +440,15 @@ mod tests {
         assert!(!applet.pin_always_armed);
         // A wrong PIN does not set it...
         let r = applet.process(&verify_pin(b"000000"));
-        assert_eq!(r.sw, 0x63C4);
+        assert_eq!(r.status(), 0x63C4);
         assert!(!applet.pin_always_armed);
         // ...nor does a status query, even though both can answer 9000.
         let r = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(r.sw, 0x63C4);
+        assert_eq!(r.status(), 0x63C4);
         assert!(!applet.pin_always_armed);
         // A successful PIN presentation does.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         assert!(applet.pin_always_armed);
     }
 
@@ -457,10 +457,10 @@ mod tests {
         let mut applet = PivApplet::new();
         // One burned try (5 -> 4).
         let r = applet.process(&verify_pin(b"000000"));
-        assert_eq!(r.sw, 0x63C4);
+        assert_eq!(r.status(), 0x63C4);
         assert!(!applet.pin_always_armed);
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
     }
 
     #[test]
@@ -469,13 +469,13 @@ mod tests {
         // A stray GET RESPONSE with nothing pending is not a continuation
         // of any command: it is a new APDU and consumes the arm.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let r = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
         assert!(!applet.pin_always_armed);
         // And the ALWAYS slot is gated.
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
     }
 
     #[test]
@@ -487,24 +487,24 @@ mod tests {
         select.extend_from_slice(&AID_FULL);
         select.push(0x05);
         let first = applet.process(&select);
-        assert_eq!(first.sw, 0x610E); // 19 - 5 = 14 remain
+        assert_eq!(first.status(), 0x610E); // 19 - 5 = 14 remain
         // A successful VERIFY arms the latch... The GET RESPONSE is a
         // continuation of the SELECT, not a new command: it must not
         // consume the arm.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data.len(), 14);
-        assert_eq!(rest.sw, SW_OK);
+        assert_eq!(rest.data().len(), 14);
+        assert_eq!(rest.status(), SW_OK);
         // The arm survives: the ALWAYS slot is still open.
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // A stray GET RESPONSE with nothing pending is not a continuation:
         // it is a new command, and the 9C GA after it is gated again.
         let r = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
     }
 
     #[test]
@@ -513,12 +513,12 @@ mod tests {
         // 9B: the management path — a bare APDU carries no witness member,
         // the shape is refused.
         let r = applet.process(&[0x00, 0x87, 0x03, 0x9B]);
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // The vendor-extension references are not slots: refused, and
         // ungated (no PIN needed).
         for p2 in [0xE0u8, 0xE1u8, 0xF9u8] {
             let r = applet.process(&ga_apdu(p2));
-            assert_eq!(r.sw, SW_INCORRECT_P1P2);
+            assert_eq!(r.status(), SW_INCORRECT_P1P2);
         }
     }
 }

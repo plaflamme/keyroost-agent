@@ -329,7 +329,7 @@ mod tests {
     /// The point the GENERATE reply announced (the `86` member of the
     /// `7F49` template) from the reply's data field.
     fn announced_point(response: &Response) -> Vec<u8> {
-        match keyroost_piv::parse_public_key(&response.data) {
+        match keyroost_piv::parse_public_key(response.data()) {
             Ok(keyroost_piv::PublicKey::Ecc { point }) => point,
             other => panic!("the GENERATE reply is a public-key template: {other:?}"),
         }
@@ -374,13 +374,14 @@ mod tests {
         // 256 bytes splits over 61xx / GET RESPONSE.
         let apdu = keyroost_piv::attest(keyroost_piv::Slot::Authentication.key_ref());
         let first = applet.process(&apdu);
-        let (_cert_data, cert_sw) = if first.sw >> 8 == 0x61 {
+        let mut cert_data = Vec::new();
+        cert_data.extend_from_slice(first.data());
+        let cert_sw = if first.status() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-            let mut data = first.data;
-            data.extend(remainder.data);
-            (data, remainder.sw)
+            cert_data.extend_from_slice(remainder.data());
+            remainder.status()
         } else {
-            (first.data, first.sw)
+            first.status()
         };
         assert_eq!(cert_sw, SW_OK, "ATTEST answers 9000 (sw 0x{cert_sw:04x})");
 
@@ -442,7 +443,7 @@ mod tests {
         for ref_ in [0x9B, 0xF9, 0x96, 0x00, 0x80, 0xE0, 0x58] {
             let apdu = vec![0x00, 0xF9, ref_, 0x00, 0x00];
             let response = applet.process(&apdu);
-            assert_eq!(response.sw, SW_INCORRECT_P1P2, "ref {ref_:02X}");
+            assert_eq!(response.status(), SW_INCORRECT_P1P2, "ref {ref_:02X}");
         }
     }
 
@@ -451,7 +452,13 @@ mod tests {
         let mut applet = PivApplet::new();
         let apdu = vec![0x00, 0xF9, 0x9A, 0x01, 0x00];
         let response = applet.process(&apdu);
-        assert_eq!(response.sw, SW_INCORRECT_P1P2);
+        assert_eq!(
+            response.status(),
+            SW_INCORRECT_P1P2,
+            "status {:02X} != {:02X}",
+            response.status(),
+            SW_INCORRECT_P1P2
+        );
     }
 
     #[test]
@@ -459,7 +466,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let apdu = keyroost_piv::attest(0x9A);
         let response = applet.process(&apdu);
-        assert_eq!(response.sw, keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        assert_eq!(response.status(), keyroost_piv::SW_REFERENCE_NOT_FOUND);
     }
 
     #[test]
@@ -474,19 +481,18 @@ mod tests {
             keyroost_piv::TouchPolicy::Default,
         );
         let response = applet.process(&apdu);
-        assert_eq!(response.sw, SW_OK);
+        assert_eq!(response.status(), SW_OK);
         let announced = announced_point(&response);
         let apdu = keyroost_piv::attest(0x84);
         let first = applet.process(&apdu);
-        let cert_data = if first.sw >> 8 == 0x61 {
+        let mut cert_data = Vec::new();
+        cert_data.extend_from_slice(first.data());
+        let _cert_sw = if first.status() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-            let mut data = first.data;
-            data.extend(remainder.data);
-            assert_eq!(remainder.sw, SW_OK);
-            data
+            cert_data.extend_from_slice(remainder.data());
+            remainder.status()
         } else {
-            assert_eq!(first.sw, SW_OK);
-            first.data
+            first.status()
         };
         let (alg, point) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert_data)
             .expect("the P-521 certificate parses");
@@ -512,7 +518,7 @@ mod tests {
             0x00, // Le
         ];
         let response = applet.process(&apdu);
-        assert_eq!(response.sw, SW_OK);
+        assert_eq!(response.status(), SW_OK);
         // The old key is gone and the old certificate describes it no more.
         assert_ne!(
             applet.attestation.cert.as_ref().expect("re-minted"),
@@ -528,15 +534,15 @@ mod tests {
         let mut applet = PivApplet::new();
         let apdu = keyroost_piv::get_data(&[0x5F, 0xFF, 0x01]);
         let first = applet.process(&apdu);
-        let (data, sw) = if first.sw >> 8 == 0x61 {
+        let mut data = Vec::from(first.data());
+        let cert_sw = if first.status() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-            let mut data = first.data;
-            data.extend(remainder.data);
-            (data, remainder.sw)
+            data.extend_from_slice(remainder.data());
+            remainder.status()
         } else {
-            (first.data, first.sw)
+            first.status()
         };
-        assert_eq!(sw, SW_OK);
+        assert_eq!(cert_sw, SW_OK);
         let value = keyroost_piv::unwrap_data_object(&data).expect("a 53 template");
         let cert =
             x509_cert::Certificate::from_der(value).expect("is DER-encoded X509 certificate");

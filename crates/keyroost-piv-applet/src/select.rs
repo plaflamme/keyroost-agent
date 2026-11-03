@@ -47,11 +47,15 @@ impl PivApplet {
             Some(&lc) => (lc, &apdu[5..]),
             None => (0, &apdu[4..]),
         };
-        let Some(aid) = body.get(..usize::from(lc)) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Some(aid) = body.get(..usize::from(lc)) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         if !(aid.len() >= AID_RID.len() && AID_FULL.starts_with(aid)) {
             return Response::sw(keyroost_piv::SW_NOT_FOUND);
         }
-        let Ok(le) = apdu_le(&body[aid.len()..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok(le) = apdu_le(&body[aid.len()..]) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         self.split_for_le(Self::select_response(), le)
     }
 
@@ -93,8 +97,12 @@ impl PivApplet {
         if cla & 0x90 != 0 {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
-        let Some(tail) = self.get_response_tail.take() else { return Response::sw(SW_CONDITIONS_NOT_SATISFIED) };
-        let Ok(le) = apdu_le(&apdu[4..]) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Some(tail) = self.get_response_tail.take() else {
+            return Response::sw(SW_CONDITIONS_NOT_SATISFIED);
+        };
+        let Ok(le) = apdu_le(&apdu[4..]) else {
+            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+        };
         self.split_for_le(tail, le)
     }
 }
@@ -126,16 +134,16 @@ mod tests {
     fn select_full_aid_answers_the_yubico_template() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&AID_FULL, Some(0)));
-        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.data(), YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.status(), keyroost_piv::SW_OK);
     }
 
     #[test]
     fn select_rid_prefix_selects() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&AID_RID, Some(0)));
-        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.data(), YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.status(), keyroost_piv::SW_OK);
     }
 
     #[test]
@@ -144,24 +152,24 @@ mod tests {
         let aid: [u8; 9] = AID_FULL[..9].try_into().unwrap();
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&aid, Some(0)));
-        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.data(), YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.status(), keyroost_piv::SW_OK);
     }
 
     #[test]
     fn select_case3_sends_the_whole_template() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&AID_FULL, None));
-        assert_eq!(resp.data, YUBIKEY5_SELECT_BODY);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.data(), YUBIKEY5_SELECT_BODY);
+        assert_eq!(resp.status(), keyroost_piv::SW_OK);
     }
 
     #[test]
     fn select_aid_shorter_than_rid_is_not_found() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&AID_FULL[..4], Some(0)));
-        assert_eq!(resp.data, Vec::new());
-        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+        assert_eq!(resp.data(), Vec::new());
+        assert_eq!(resp.status(), keyroost_piv::SW_NOT_FOUND);
     }
 
     #[test]
@@ -170,7 +178,7 @@ mod tests {
         long.push(0x00);
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&long, Some(0)));
-        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+        assert_eq!(resp.status(), keyroost_piv::SW_NOT_FOUND);
     }
 
     #[test]
@@ -178,14 +186,14 @@ mod tests {
         let aid = [0xA0, 0x00, 0x00, 0x03, 0x09];
         let mut applet = PivApplet::new();
         let resp = applet.process(&select_with_aid(&aid, Some(0)));
-        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+        assert_eq!(resp.status(), keyroost_piv::SW_NOT_FOUND);
     }
 
     #[test]
     fn select_not_by_aid_is_not_found() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x00, 0xA4, 0x00, 0x00]);
-        assert_eq!(resp.sw, keyroost_piv::SW_NOT_FOUND);
+        assert_eq!(resp.status(), keyroost_piv::SW_NOT_FOUND);
     }
 
     #[test]
@@ -195,7 +203,7 @@ mod tests {
             let mut apdu = select_with_aid(&AID_FULL, Some(0));
             apdu[0] = cla;
             let resp = applet.process(&apdu);
-            assert_eq!(resp.sw, SW_CLA_NOT_SUPPORTED);
+            assert_eq!(resp.status(), SW_CLA_NOT_SUPPORTED);
         }
     }
 
@@ -204,22 +212,22 @@ mod tests {
         let mut applet = PivApplet::new();
         // Lc claims 11 bytes, only 5 AID bytes are present.
         let resp = applet.process(&[0x00, 0xA4, 0x04, 0x00, 0x0B, 0xA0, 0x00, 0x00, 0x03, 0x08]);
-        assert_eq!(resp.sw, keyroost_piv::SW_WRONG_LENGTH);
+        assert_eq!(resp.status(), keyroost_piv::SW_WRONG_LENGTH);
     }
 
     #[test]
     fn select_small_le_truncates_and_get_response_completes() {
         let mut applet = PivApplet::new();
         let first = applet.process(&select_with_aid(&AID_FULL, Some(5)));
-        assert_eq!(first.data, &YUBIKEY5_SELECT_BODY[..5]);
-        assert_eq!(first.sw, 0x610E); // 19 - 5 = 14 remain
+        assert_eq!(first.data(), &YUBIKEY5_SELECT_BODY[..5]);
+        assert_eq!(first.status(), 0x610E); // 19 - 5 = 14 remain
         let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data, &YUBIKEY5_SELECT_BODY[5..]);
-        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+        assert_eq!(rest.data(), &YUBIKEY5_SELECT_BODY[5..]);
+        assert_eq!(rest.status(), keyroost_piv::SW_OK);
         // Nothing pending any more.
         let none = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(none.data, Vec::new());
-        assert_eq!(none.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(none.data(), Vec::new());
+        assert_eq!(none.status(), SW_CONDITIONS_NOT_SATISFIED);
     }
 
     #[test]
@@ -227,10 +235,10 @@ mod tests {
         let mut applet = PivApplet::new();
         applet.process(&select_with_aid(&AID_FULL, Some(5)));
         let first = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x04]);
-        assert_eq!(first.data, &YUBIKEY5_SELECT_BODY[5..9]);
-        assert_eq!(first.sw, 0x610A); // 14 - 4 = 10 remain
+        assert_eq!(first.data(), &YUBIKEY5_SELECT_BODY[5..9]);
+        assert_eq!(first.status(), 0x610A); // 14 - 4 = 10 remain
         let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data, &YUBIKEY5_SELECT_BODY[9..]);
-        assert_eq!(rest.sw, keyroost_piv::SW_OK);
+        assert_eq!(rest.data(), &YUBIKEY5_SELECT_BODY[9..]);
+        assert_eq!(rest.status(), keyroost_piv::SW_OK);
     }
 }

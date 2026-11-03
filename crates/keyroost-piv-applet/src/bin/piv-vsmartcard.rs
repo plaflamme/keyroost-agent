@@ -153,13 +153,24 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
             applet.process(&msg)
         };
 
+        // Extract data and status from iso7816::Response
+        let (response_data, response_sw) = match &response {
+            Response::Data(data) => {
+                (data, 0x9000) // Status is implied to be 9000 for Data variant
+            }
+            Response::More(data, remain) => {
+                (data, iso7816::Status::MoreAvailable(*remain).to_u16())
+            }
+            Response::Status(status) => (&Vec::new(), status.to_u16()),
+        };
+
         trace!(
             apdu = hex(&msg),
-            sw = format!("{:04X}", response.sw),
+            sw = format!("{:04X}", response_sw),
             "command APDU"
         );
-        let mut out = response.data;
-        out.extend_from_slice(&response.sw.to_be_bytes());
+        let mut out = response_data.clone();
+        out.extend_from_slice(&response_sw.to_be_bytes());
         write_msg(&mut stream, &out)?;
     }
 }

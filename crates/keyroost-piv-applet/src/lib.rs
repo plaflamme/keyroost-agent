@@ -60,7 +60,7 @@ mod slot;
 mod state;
 mod yubico;
 
-pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, INS_IMPORT_ASYM, VERSION};
+pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, VERSION};
 
 use attest::Attestation;
 use constants::{
@@ -68,7 +68,7 @@ use constants::{
     SW_INS_NOT_SUPPORTED, SW_OK,
 };
 use data::PivData;
-use iso7816::Instruction;
+use iso7816::{Instruction, response::Status};
 use management::MgmtKey;
 use slot::{Slot, factory_slots};
 use state::Pin;
@@ -77,30 +77,44 @@ use crate::yubico::YubicoInstruction;
 
 /// A card response: the data the applet returns plus the 2-byte ISO 7816-4
 /// status word that always terminates the answer.
+///
+/// This wraps the `Response` type from the iso7816 crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Response {
-    /// Response data (empty for a status-only answer).
-    pub data: Vec<u8>,
-    /// The ISO 7816-4 status word (`0x9000` for success).
-    pub sw: u16,
+pub enum Response {
+    Data(Vec<u8>),
+    More(Vec<u8>, u8),
+    Status(Status),
 }
 
 impl Response {
     /// A success (`0x9000`) response carrying `data`.
     #[must_use]
     pub fn ok(data: Vec<u8>) -> Self {
-        Self {
-            data,
-            sw: iso7816::response::status::SUCCESS,
-        }
+        Self::Data(data)
     }
 
     /// A status-only response (no data).
     #[must_use]
     pub fn sw(sw: u16) -> Self {
-        Self {
-            data: Vec::new(),
-            sw,
+        Self::Status(Status::from_u16(sw))
+    }
+
+    /// Access the response data as a slice.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        match &self {
+            Response::Data(d) | Response::More(d, _) => d.as_slice(),
+            Response::Status(_) => &[],
+        }
+    }
+
+    /// Access the status word as u16.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match &self {
+            Response::Data(_) => 0x9000,
+            Response::More(_, remain) => Status::MoreAvailable(*remain).to_u16(),
+            Response::Status(s) => s.to_u16(),
         }
     }
 }
@@ -200,23 +214,23 @@ impl PivApplet {
                 apdu.len()
             );
         };
+        let ins = Instruction::from(*ins);
         // A GET RESPONSE with a pending tail is a chained continuation of
         // its parent APDU: it inherits the parent's gate results, so it
         // does not consume the PIN/ALWAYS latch. Any other APDU — including
         // a stray GET RESPONSE with nothing pending — is a new command and
         // consumes the latch: an `ALWAYS`-policy slot operation must be the
         // APDU right after a successful VERIFY.
-        let chained = *ins == keyroost_piv::Instruction::GetResponse as u8
-            && self.get_response_tail.is_some();
+        let chained = ins == Instruction::GetResponse && self.get_response_tail.is_some();
         // A VERIFY carrying an 8-byte body is a real PIN presentation —
         // the status query (no body) is not, even though both can answer
         // 9000. Only a presentation that the card accepts re-arms the
         // PIN/ALWAYS latch.
-        let pin_presentation = *ins == keyroost_piv::Instruction::Verify as u8
+        let pin_presentation = ins == Instruction::Verify
             && apdu.get(2) == Some(&0x00)
             && matches!(apdu_lc_body(apdu), Ok((_, body, _)) if body.len() == 8);
         #[allow(clippy::match_same_arms)]
-        let response = match Instruction::from(*ins) {
+        let response = match ins {
             Instruction::Select => self.process_select(apdu),
             Instruction::Verify => self.process_verify(apdu),
             Instruction::GetData => self.process_get_data(apdu),
@@ -247,7 +261,7 @@ impl PivApplet {
         // armed it. A successful PIN presentation is the one APDU that arms
         // it — and it must not consume the arm it just set: the arm survives
         // until the next command.
-        let armed_this_apdu = pin_presentation && response.sw == SW_OK;
+        let armed_this_apdu = pin_presentation && response.status() == SW_OK;
         if !chained && !armed_this_apdu {
             self.pin_always_armed = false;
         }
@@ -268,11 +282,10 @@ impl PivApplet {
             Some(cap) if full.len() > cap => {
                 self.get_response_tail = Some(full[cap..].to_vec());
                 #[allow(clippy::cast_possible_truncation)]
-                let remaining = u16::from((full.len() - cap).min(255) as u8);
-                Response {
-                    data: full[..cap].to_vec(),
-                    sw: iso7816::response::status::MORE_AVAILABLE_MIN + remaining,
-                }
+                let remaining = (full.len() - cap).min(255) as u8;
+                let mut d = Vec::new();
+                d.extend_from_slice(&full[..cap]);
+                Response::More(d, remaining)
             }
             _ => Response::ok(full),
         }

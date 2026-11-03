@@ -298,7 +298,7 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, 4];
         apdu.extend_from_slice(&[0x0C, KEY_REF_MANAGEMENT, 0x20]);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         // A handshake with the unchanged factory key still works.
         mgmt_handshake(&mut applet);
     }
@@ -309,7 +309,7 @@ pub(crate) mod tests {
         mgmt_handshake(&mut applet);
         let apdu = [0x00u8, 0xFF, 0x00, 0x00, 0];
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
     }
 
     #[test]
@@ -322,16 +322,16 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         // The old algorithm is gone.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         // The new algorithm answers a 16-byte witness.
         let r = applet.process(&ga_apdu(0x0C, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_OK);
-        assert_eq!(r.data[1], 18);
-        assert_eq!(r.data[3], 16);
-        assert_eq!(r.data.len(), 20);
+        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.data()[1], 18);
+        assert_eq!(r.data()[3], 16);
+        assert_eq!(r.data().len(), 20);
     }
 
     #[test]
@@ -343,40 +343,40 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&[0x03, 0x58, 0x18]);
         apdu.extend_from_slice(&[0x00u8; 24]);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // A declared key length the algorithm does not take.
         let mut body = vec![0x03, KEY_REF_MANAGEMENT, 0x10];
         body.extend_from_slice(&[0x00u8; 16]);
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
         // A body shorter than the header: `lc < 4` in the reference.
         let r = applet.process(&[0x00, 0xFF, 0xFF, 0xFF, 0x03, 0x03, KEY_REF_MANAGEMENT, 0x18]);
-        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert_eq!(r.status(), SW_WRONG_DATA);
     }
 
     #[test]
     fn set_pin_retries_needs_the_unlocked_session_and_verified_pin() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFA, 0x08, 0x08]);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         mgmt_handshake(&mut applet);
         // Unlocked but the PIN is not verified yet.
         let r = applet.process(&[0x00, 0xFA, 0x08, 0x08]);
-        assert_eq!(r.sw, SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         let r = applet.process(&[0x00, 0xFA, 0x01, 0x05]);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         // The counters are set and the values reset to the factory defaults:
         // one PIN try left, and a wrong PIN burns it (blocking the counter).
         let r = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(r.sw, tries_sw(0));
+        assert_eq!(r.status(), tries_sw(0));
         // The PUK counter too.
         for tries in (2..=5).rev() {
             let r = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"12345678").unwrap());
-            assert_eq!(r.sw, tries_sw(tries - 1));
+            assert_eq!(r.status(), tries_sw(tries - 1));
         }
     }
 
@@ -384,18 +384,18 @@ pub(crate) mod tests {
     fn reset_needs_both_counters_blocked() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
         block_pin(&mut applet);
         // PIN blocked, PUK not.
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         // Factory state: PIN and PUK restored, management key back to the
         // Yubico 3DES default.
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         mgmt_handshake(&mut applet);
     }
 
@@ -409,16 +409,16 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         block_pin(&mut applet);
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, SW_OK);
+        assert_eq!(r.status(), SW_OK);
         // The AES-128 key is gone — the factory 3DES one answers again.
         let r = applet.process(&ga_apdu(0x08, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), SW_INCORRECT_P1P2);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.sw, SW_OK);
-        assert_eq!(r.data[3], 8);
+        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.data()[3], 8);
     }
 }

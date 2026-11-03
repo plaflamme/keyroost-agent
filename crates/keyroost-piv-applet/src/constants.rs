@@ -2,9 +2,6 @@
 //! the SP 800-73-4 dynamic-authentication tags, and the factory default
 //! values.
 
-/// Yubico extension: IMPORT ASYMMETRIC KEY.
-pub const INS_IMPORT_ASYM: u8 = 0x86;
-
 /// ISO 7816-4 status word: instruction not supported.
 pub(crate) const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 /// ISO 7816-4 status word: CLA not supported.
