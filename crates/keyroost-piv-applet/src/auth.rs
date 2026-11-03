@@ -1,7 +1,7 @@
 //! VERIFY (0x20), CHANGE REFERENCE DATA (0x24) and RESET RETRY COUNTER
 //! (0x2C): the PIN/PUK reference-data commands.
 
-use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_WRONG_DATA};
+use crate::constants::{SW_AUTH_BLOCKED, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_REFERENCE_NOT_FOUND, SW_WRONG_DATA, SW_WRONG_LENGTH};
 use crate::{PivApplet, Response, apdu_lc_body, tries_sw};
 use keyroost_piv::{PIN_REF_APPLICATION, PIN_REF_PUK};
 
@@ -39,11 +39,11 @@ impl PivApplet {
         let pin = if *p2 == PIN_REF_APPLICATION {
             &mut self.pin
         } else {
-            return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
+            return Response::sw(SW_REFERENCE_NOT_FOUND);
         };
-        let Ok((lc, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok((lc, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         if pin.tries == 0 {
-            return Response::sw(keyroost_piv::SW_AUTH_BLOCKED);
+            return Response::sw(SW_AUTH_BLOCKED);
         }
         if *p1 == 0xFF {
             // "Set security status to false": a verified PIN is reset
@@ -51,12 +51,12 @@ impl PivApplet {
             if pin.verified {
                 pin.reset();
             }
-            return Response::sw(keyroost_piv::SW_OK);
+            return Response::sw(SW_OK);
         }
         if lc == 0 {
             // Status query: `9000` when verified, else `63Cx`.
             return if pin.verified {
-                Response::sw(keyroost_piv::SW_OK)
+                Response::sw(SW_OK)
             } else {
                 Response::sw(tries_sw(pin.tries))
             };
@@ -70,7 +70,7 @@ impl PivApplet {
             // The latch is consumed by the next non-chained APDU — cleared
             // in `process`, where the APDU that armed it survives intact.
             self.pin_always_armed = true;
-            Response::sw(keyroost_piv::SW_OK)
+            Response::sw(SW_OK)
         } else {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; the applet has no key slots yet.
@@ -102,14 +102,14 @@ impl PivApplet {
         let target = match *p2 {
             PIN_REF_APPLICATION => &mut self.pin,
             PIN_REF_PUK => &mut self.puk,
-            _ => return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND),
+            _ => return Response::sw(SW_REFERENCE_NOT_FOUND),
         };
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
         if target.tries == 0 {
-            return Response::sw(keyroost_piv::SW_AUTH_BLOCKED);
+            return Response::sw(SW_AUTH_BLOCKED);
         }
         let new_value: [u8; 8] = body[8..].try_into().unwrap();
         if !target.check(&body[..8]) {
@@ -121,7 +121,7 @@ impl PivApplet {
             return Response::sw(SW_WRONG_DATA);
         }
         target.set_value(new_value);
-        Response::sw(keyroost_piv::SW_OK)
+        Response::sw(SW_OK)
     }
 
     /// RESET RETRY COUNTER (0x2C): unblock the PIN (P2=`80`) using the PUK
@@ -147,14 +147,14 @@ impl PivApplet {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         if *p2 != PIN_REF_APPLICATION {
-            return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
+            return Response::sw(SW_REFERENCE_NOT_FOUND);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(keyroost_piv::SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
         if self.puk.tries == 0 {
-            return Response::sw(keyroost_piv::SW_AUTH_BLOCKED);
+            return Response::sw(SW_AUTH_BLOCKED);
         }
         let new_pin: [u8; 8] = body[8..].try_into().unwrap();
         if !self.puk.check(&body[..8]) {
@@ -167,7 +167,7 @@ impl PivApplet {
         }
         self.pin.set_value(new_pin);
         self.pin.reset();
-        Response::sw(keyroost_piv::SW_OK)
+        Response::sw(SW_OK)
     }
 }
 
@@ -208,7 +208,7 @@ pub(crate) mod tests {
     fn verify_factory_pin_succeeds() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -225,9 +225,9 @@ pub(crate) mod tests {
     fn verify_status_is_ok_after_a_verify() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -241,11 +241,11 @@ pub(crate) mod tests {
     fn verify_failed_try_keeps_a_verified_session() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PIN_TRIES - 1));
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -260,7 +260,7 @@ pub(crate) mod tests {
         ];
         for form in forms {
             let resp = applet.process(form);
-            assert_eq!(resp.sw, keyroost_piv::SW_AUTH_BLOCKED);
+            assert_eq!(resp.sw, SW_AUTH_BLOCKED);
         }
     }
 
@@ -268,9 +268,9 @@ pub(crate) mod tests {
     fn verify_unverify_clears_a_verified_pin() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&[0x00, 0x20, 0xFF, 0x80]);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
         assert_eq!(resp.sw, tries_sw(DEFAULT_PIN_TRIES));
     }
@@ -283,7 +283,7 @@ pub(crate) mod tests {
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PIN_TRIES - 2));
         let resp = applet.process(&[0x00, 0x20, 0xFF, 0x80]);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
         assert_eq!(resp.sw, tries_sw(DEFAULT_PIN_TRIES - 2));
     }
@@ -292,7 +292,7 @@ pub(crate) mod tests {
     fn verify_rejects_the_puk_reference() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&case3(0x20, 0x00, PIN_REF_PUK, 8));
-        assert_eq!(resp.sw, keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        assert_eq!(resp.sw, SW_REFERENCE_NOT_FOUND);
     }
 
     #[test]
@@ -315,7 +315,7 @@ pub(crate) mod tests {
     fn verify_lc_overrun_is_wrong_length() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80, 0x09, 0x31, 0x32, 0x33, 0x34]);
-        assert_eq!(resp.sw, keyroost_piv::SW_WRONG_LENGTH);
+        assert_eq!(resp.sw, SW_WRONG_LENGTH);
     }
 
     #[test]
@@ -324,9 +324,9 @@ pub(crate) mod tests {
         let resp = applet.process(
             &keyroost_piv::change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap(),
         );
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::verify_pin(b"654321").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -335,9 +335,9 @@ pub(crate) mod tests {
         let resp = applet.process(
             &keyroost_piv::change_reference(PIN_REF_PUK, b"12345678", b"87654321").unwrap(),
         );
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::unblock_pin(b"87654321", b"111111").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -348,7 +348,7 @@ pub(crate) mod tests {
         );
         assert_eq!(resp.sw, tries_sw(DEFAULT_PIN_TRIES - 1));
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -377,7 +377,7 @@ pub(crate) mod tests {
         // The PIN is unchanged; nothing was burned (the old value was
         // correct and the new one was never stored).
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     /// Send a CHANGE REFERENCE DATA APDU with the given 16-byte body and
@@ -410,9 +410,9 @@ pub(crate) mod tests {
         let resp = applet.process(
             &keyroost_piv::change_reference(PIN_REF_APPLICATION, b"123456", b"6543217").unwrap(),
         );
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::verify_pin(b"6543217").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -429,7 +429,7 @@ pub(crate) mod tests {
         let resp = applet.process(
             &keyroost_piv::change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap(),
         );
-        assert_eq!(resp.sw, keyroost_piv::SW_AUTH_BLOCKED);
+        assert_eq!(resp.sw, SW_AUTH_BLOCKED);
         // The card checks the body length before the blocked state.
         let resp = applet.process(&case3(0x24, 0x00, PIN_REF_APPLICATION, 15));
         assert_eq!(resp.sw, SW_WRONG_DATA);
@@ -441,7 +441,7 @@ pub(crate) mod tests {
         let resp = applet.process(&case3(0x24, 0x01, PIN_REF_APPLICATION, 16));
         assert_eq!(resp.sw, SW_INCORRECT_P1P2);
         let resp = applet.process(&case3(0x24, 0x00, 0x82, 16));
-        assert_eq!(resp.sw, keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        assert_eq!(resp.sw, SW_REFERENCE_NOT_FOUND);
     }
 
     #[test]
@@ -450,7 +450,7 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0x24, 0x00, 0x80, 0x11];
         apdu.extend_from_slice(&[0x31u8; 10]);
         let resp = applet.process(&apdu);
-        assert_eq!(resp.sw, keyroost_piv::SW_WRONG_LENGTH);
+        assert_eq!(resp.sw, SW_WRONG_LENGTH);
     }
 
     #[test]
@@ -458,11 +458,11 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         block_pin(&mut applet);
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::verify_pin(b"999999").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -471,7 +471,7 @@ pub(crate) mod tests {
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PUK_TRIES - 1));
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
     }
 
     #[test]
@@ -482,7 +482,7 @@ pub(crate) mod tests {
             assert_eq!(resp.sw, tries_sw(tries - 1));
         }
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_AUTH_BLOCKED);
+        assert_eq!(resp.sw, SW_AUTH_BLOCKED);
     }
 
     #[test]
@@ -493,7 +493,7 @@ pub(crate) mod tests {
         assert_eq!(resp.sw, SW_WRONG_DATA);
         // The PIN is still blocked; nothing was set.
         let resp = applet.process(&keyroost_piv::verify_pin(b"99999a").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_AUTH_BLOCKED);
+        assert_eq!(resp.sw, SW_AUTH_BLOCKED);
     }
 
     #[test]
@@ -502,7 +502,7 @@ pub(crate) mod tests {
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PUK_TRIES - 1));
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         // The counter was reset to its limit: one wrong PUK answers `63C2`,
         // not `63C0`.
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
@@ -515,7 +515,7 @@ pub(crate) mod tests {
         let resp = applet.process(&case3(0x2C, 0x01, PIN_REF_APPLICATION, 16));
         assert_eq!(resp.sw, SW_INCORRECT_P1P2);
         let resp = applet.process(&case3(0x2C, 0x00, PIN_REF_PUK, 16));
-        assert_eq!(resp.sw, keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        assert_eq!(resp.sw, SW_REFERENCE_NOT_FOUND);
         let resp = applet.process(&case3(0x2C, 0x00, PIN_REF_APPLICATION, 15));
         assert_eq!(resp.sw, SW_WRONG_DATA);
     }
@@ -530,13 +530,13 @@ pub(crate) mod tests {
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PUK_TRIES - 1));
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_OK);
+        assert_eq!(resp.sw, SW_OK);
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
         assert_eq!(resp.sw, tries_sw(DEFAULT_PUK_TRIES - 2));
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
         assert_eq!(resp.sw, tries_sw(0));
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
-        assert_eq!(resp.sw, keyroost_piv::SW_AUTH_BLOCKED);
+        assert_eq!(resp.sw, SW_AUTH_BLOCKED);
     }
 
     #[test]

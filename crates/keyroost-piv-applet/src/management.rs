@@ -4,8 +4,8 @@
 
 use crate::constants::{
     DEFAULT_MGMT_KEY, DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
-    SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED,
-    SW_WRONG_DATA, SW_WRONG_LENGTH,
+    SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK,
+    SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 use crate::{Pin, PivApplet, Response, apdu_lc_body};
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
@@ -274,7 +274,7 @@ impl PivApplet {
             // Yubico's documented answer for this precondition is 6985
             // (conditions of use not satisfied); the host only recognises
             // 6982/6983/6985 as "block the PIN and PUK first".
-            return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
+            return Response::sw(SW_CONDITIONS_NOT_SATISFIED);
         }
         self.mgmt.set_key(MgmtAlg::TripleDes, &DEFAULT_MGMT_KEY);
         self.pin = Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES);
@@ -384,11 +384,11 @@ pub(crate) mod tests {
     fn reset_needs_both_counters_blocked() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
         block_pin(&mut applet);
         // PIN blocked, PUK not.
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.sw, keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(r.sw, SW_OK);

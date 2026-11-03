@@ -88,7 +88,7 @@ impl Response {
     pub fn ok(data: Vec<u8>) -> Self {
         Self {
             data,
-            sw: keyroost_piv::SW_OK,
+            sw: iso7816::response::status::SUCCESS,
         }
     }
 
@@ -263,7 +263,7 @@ impl PivApplet {
                 let remaining = u16::from((full.len() - cap).min(255) as u8);
                 Response {
                     data: full[..cap].to_vec(),
-                    sw: (u16::from(keyroost_piv::SW_MORE_DATA) << 8) | remaining,
+                    sw: iso7816::response::status::MORE_AVAILABLE_MIN + remaining,
                 }
             }
             _ => Response::ok(full),
