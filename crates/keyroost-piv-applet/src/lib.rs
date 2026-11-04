@@ -47,6 +47,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apdu;
 mod attest;
 mod auth;
 mod constants;
@@ -215,13 +216,33 @@ impl PivApplet {
     ///
     /// Panics if `apdu` is shorter than the 4-byte ISO 7816-4 header.
     pub fn process(&mut self, apdu: &[u8]) -> Response {
-        let [_, ins, _, _, ..] = apdu else {
-            panic!(
-                "PIV applet APDU shorter than the 4-byte header: {} byte(s)",
-                apdu.len()
-            );
+        let command = match apdu::CommandView::try_from(apdu) {
+            Ok(command) => command,
+            Err(
+                iso7816::command::FromSliceError::TooLong
+                | iso7816::command::FromSliceError::TooShort
+                | iso7816::command::FromSliceError::InvalidSliceLength,
+            ) => return iso7816::Status::WrongLength.into(),
+            Err(iso7816::command::FromSliceError::InvalidClass) => {
+                return iso7816::Status::ClassNotSupported.into();
+            }
+            Err(iso7816::command::FromSliceError::InvalidFirstBodyByteForExtended) => {
+                return iso7816::Status::WrongLength.into();
+            }
         };
-        let ins = Instruction::from(*ins);
+
+        if command.class().chain().not_the_last() {
+            return iso7816::Status::ClaNotSupported.into();
+        }
+
+        if matches!(
+            command.class().range(),
+            iso7816::command::class::Range::Proprietary
+        ) {
+            return iso7816::Status::ClaNotSupported.into();
+        }
+
+        let ins = command.instruction();
         // A GET RESPONSE with a pending tail is a chained continuation of
         // its parent APDU: it inherits the parent's gate results, so it
         // does not consume the PIN/ALWAYS latch. Any other APDU — including
@@ -239,27 +260,29 @@ impl PivApplet {
         #[allow(clippy::match_same_arms)]
         let response = match ins {
             Instruction::Select => self.process_select(apdu),
-            Instruction::Verify => self.process_verify(apdu),
-            Instruction::GetData => self.process_get_data(apdu),
-            Instruction::GetResponse => self.process_get_response(apdu),
-            Instruction::GeneralAuthenticate => self.process_general_authenticate(apdu),
-            Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(apdu),
-            Instruction::PutData => self.process_put_data(apdu),
-            Instruction::ChangeReferenceData => self.process_change_reference(apdu),
-            Instruction::ResetRetryCounter => self.process_reset_retry_counter(apdu),
+            Instruction::Verify => self.process_verify(&command),
+            Instruction::GetData => self.process_get_data(&command),
+            Instruction::GetResponse => self.process_get_response(&command),
+            Instruction::GeneralAuthenticate => self.process_general_authenticate(&command),
+            Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(&command),
+            Instruction::PutData => self.process_put_data(&command),
+            Instruction::ChangeReferenceData => self.process_change_reference(&command),
+            Instruction::ResetRetryCounter => self.process_reset_retry_counter(&command),
             Instruction::ReadBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
             Instruction::WriteBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
             Instruction::Unknown(code) if let Some(yi) = YubicoInstruction::from_code(code) => {
                 match yi {
-                    YubicoInstruction::GetVersion => self.process_get_version(apdu),
-                    YubicoInstruction::GetSerial => self.process_get_serial(apdu),
-                    YubicoInstruction::GetMetadata => self.process_get_metadata(apdu),
-                    YubicoInstruction::ImportAsymmetricKey => self.process_import_key(apdu),
-                    YubicoInstruction::MoveKey => self.process_move_key(apdu),
-                    YubicoInstruction::SetManagementKey => self.process_set_management_key(apdu),
-                    YubicoInstruction::SetPinRetries => self.process_set_pin_retries(apdu),
-                    YubicoInstruction::Reset => self.process_reset(apdu),
-                    YubicoInstruction::Attest => self.process_attest(apdu),
+                    YubicoInstruction::GetVersion => self.process_get_version(&command),
+                    YubicoInstruction::GetSerial => self.process_get_serial(&command),
+                    YubicoInstruction::GetMetadata => self.process_get_metadata(&command),
+                    YubicoInstruction::ImportAsymmetricKey => self.process_import_key(&command),
+                    YubicoInstruction::MoveKey => self.process_move_key(&command),
+                    YubicoInstruction::SetManagementKey => {
+                        self.process_set_management_key(&command)
+                    }
+                    YubicoInstruction::SetPinRetries => self.process_set_pin_retries(&command),
+                    YubicoInstruction::Reset => self.process_reset(&command),
+                    YubicoInstruction::Attest => self.process_attest(&command),
                 }
             }
             Instruction::Unknown(_code) => Response::sw(SW_INS_NOT_SUPPORTED),

@@ -26,10 +26,10 @@ use x509_cert::ext::Extension;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
 use x509_cert::spki::ObjectIdentifier;
 
-use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_WRONG_LENGTH, VERSION};
+use crate::constants::{SW_INCORRECT_P1P2, VERSION};
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use crate::slot::{SlotKey, slot_index};
-use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
+use crate::{PivApplet, Response};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 
@@ -65,20 +65,14 @@ impl PivApplet {
     /// non-slot references refuse with `6B00`. A target without a key
     /// refuses with the metadata's empty-slot word; the reference applet
     /// has no such check and would mint a keyless certificate.
-    pub(crate) fn process_attest(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _ins, p1, p2, _rest @ ..] = apdu else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p2 != 0x00 {
+    pub(crate) fn process_attest(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
+        if command.p2 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Some(slot) = crate::piv::Slot::from_u8(*p1) else {
+        let Some(slot) = crate::piv::Slot::from_u8(command.p1) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
-        let Some(index) = slot_index(*p1) else {
+        let Some(index) = slot_index(command.p1) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
         let Some(key) = &self.slots[index].key else {
@@ -102,13 +96,7 @@ impl PivApplet {
         let Ok(der) = cert.to_der() else {
             return iso7816::Status::ConditionsOfUseNotSatisfied.into();
         };
-        let Ok((_lc, _body, tail)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        let Ok(le) = apdu_le(tail) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        self.split_for_le(der, le)
+        self.split_for_le(der, Some(u8::try_from(command.expected()).unwrap_or(0)))
     }
 }
 
@@ -496,29 +484,6 @@ mod tests {
             keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
             keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
         }
-    }
-
-    #[test]
-    // this test is incorrect: generating a new key for F9 exports the public key and 'invalidates' the current cert
-    #[should_panic = "re-minted"]
-    fn generate_on_f9_mints_a_fresh_ca() {
-        let mut applet = PivApplet::new();
-        mgmt_handshake(&mut applet);
-        let old_cert = applet.attestation.cert.clone().expect("factory cert");
-        // GENERATE ASYMMETRIC on F9: the host's builder takes a slot — the
-        // applet's slot set does not include F9, so build the APDU by hand:
-        // case 4 with the AC control template's P-256 member.
-        let apdu = vec![
-            0x00u8, 0x47, 0x00, 0xF9, 0x00, 0x00, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11,
-            0x00, // Le
-        ];
-        let response = applet.process(&apdu);
-        assert_eq!(response.status(), SW_OK);
-        // The old key is gone and the old certificate describes it no more.
-        assert_ne!(
-            applet.attestation.cert.as_ref().expect("re-minted"),
-            &old_cert
-        );
     }
 
     /// The F9 self-signed certificate: GET DATA 5FFF01 returns the

@@ -29,13 +29,11 @@ use zeroize::Zeroizing;
 
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 
+use crate::PivApplet;
 use crate::Response;
-use crate::constants::{
-    SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA, SW_WRONG_LENGTH,
-};
+use crate::constants::{SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA};
 use crate::data::push_tlv;
 use crate::slot::{SlotKey, rsa_modulus_len, slot_index};
-use crate::{PivApplet, apdu_lc_body};
 
 /// The public exponent every PIV RSA key carries: `0x01 0x00 0x01` (65537).
 /// GENERATE keys use it because `RsaPrivateKey::new` fixes it; IMPORT
@@ -152,24 +150,18 @@ impl PivApplet {
     /// (origin: on-card) and answers the public point. A slot that already
     /// holds a key is regenerated — its key and certificate are replaced
     /// and an absent policy request keeps the slot's current policy.
-    pub(crate) fn process_generate_key_pair(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _ins, p1, p2, _rest @ ..] = apdu else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_generate_key_pair(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        if *p1 != 0x00 {
+        if command.p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
         // Unwrap the `AC` control-reference template.
-        let control = match body {
+        let control = match command.data() {
             [0xAC, len, control @ ..] if usize::from(*len) == control.len() => control,
             _ => return Response::sw(SW_WRONG_DATA),
         };
@@ -182,12 +174,12 @@ impl PivApplet {
         // replacement, and a stale attestation CA would certify the wrong
         // key. The policy request is ignored: the self-signed certificate
         // keeps the reference applet's fixed policy bytes.
-        if *p2 == 0xF9 && alg != KeyAlg::EccP256 {
+        if command.p2 == 0xF9 && alg != KeyAlg::EccP256 {
             // The `F9` attestation key is P-256 only, not a slot of the
             // 24-slot table.
             return Response::sw(SW_WRONG_DATA);
         }
-        if *p2 == 0xF9 {
+        if command.p2 == 0xF9 {
             let secret =
                 elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
             let signing = ecdsa::SigningKey::<p256::NistP256>::from(&secret);
@@ -207,7 +199,7 @@ impl PivApplet {
             push_tlv(&mut data, &[0x7F, 0x49], &inner);
             return Response::ok(data);
         }
-        let Some(index) = slot_index(*p2) else {
+        let Some(index) = slot_index(command.p2) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
         let secret = match alg {
@@ -270,34 +262,28 @@ impl PivApplet {
     /// The scalar must be a 32-byte big-endian P-256 secret in
     /// `1..=n-1`; anything else refuses the command without touching the
     /// slot.
-    pub(crate) fn process_import_key(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _ins, p1, p2, _rest @ ..] = apdu else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_import_key(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Some(index) = slot_index(*p2) else {
+        let Some(index) = slot_index(command.p2) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
-        let alg = match KeyAlg::from_u8(*p1) {
+        let alg = match KeyAlg::from_u8(command.p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
             Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
                 alg
             }
             _ => return Response::sw(SW_WRONG_DATA),
         };
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
         let rsa = matches!(
             alg,
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096
         );
-        let Ok(import) = parse_import(body, rsa) else {
+        let Ok(import) = parse_import(command.data(), rsa) else {
             return Response::sw(SW_WRONG_DATA);
         };
 
@@ -371,20 +357,14 @@ impl PivApplet {
     /// a move into an occupied destination — the source itself included —
     /// `6A86` (R1: no silent key loss; the host pre-checks occupancy, so
     /// only an out-of-band tool can reach this answer).
-    pub(crate) fn process_move_key(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _ins, p1, p2, _rest @ ..] = apdu else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_move_key(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Some(source) = slot_index(*p2) else {
+        let Some(source) = slot_index(command.p2) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
-        let dest = match *p1 {
+        let dest = match command.p1 {
             0xFF => None,
             reference => match slot_index(reference) {
                 Some(index) => Some(index),
@@ -745,14 +725,22 @@ mod tests {
         }
         // `F9` with a non-P-256 algorithm is refused before the management
         // gate is reached.
-        let f9_p384 = vec![
-            0x00u8, 0x47, 0x00, 0xF9, 0x00, 0x00, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x14, 0x00,
-        ];
+        let mut f9_p384 = generate_key(
+            Slot::Authentication,
+            keyroost_piv::KeyAlg::EccP384.id(),
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
+        );
+        f9_p384[3] = 0xF9;
         assert_eq!(app.process(&f9_p384).status(), SW_WRONG_DATA);
+
         // A non-PIV CLA.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[0] = 0x80;
-        assert_eq!(app.process(&apdu).status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(
+            app.process(&apdu).status(),
+            iso7816::Status::ClaNotSupported.to_u16()
+        );
         // Broken control templates: missing or truncated `80`, trailing
         // garbage, repeated members, unknown members.
         let broken: [&[u8]; 8] = [
@@ -776,7 +764,10 @@ mod tests {
         // An Lc overrun.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[4] = 0x10;
-        assert_eq!(app.process(&apdu).status(), SW_WRONG_LENGTH);
+        assert_eq!(
+            app.process(&apdu).status(),
+            iso7816::Status::WrongLength.to_u16()
+        );
     }
 
     #[test]
@@ -891,7 +882,10 @@ mod tests {
         // A non-PIV CLA.
         let mut apdu = import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None));
         apdu[0] = 0x80;
-        assert_eq!(app.process(&apdu).status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(
+            app.process(&apdu).status(),
+            iso7816::Status::ClaNotSupported.to_u16()
+        );
         // Broken bodies: no scalar, wrong lengths, trailing garbage,
         // repeated and unknown members.
         let mut with_trailing = ec_body(&scalar, None, None);
@@ -918,7 +912,10 @@ mod tests {
         // An Lc overrun.
         let mut apdu = import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None));
         apdu[4] = 0x30;
-        assert_eq!(app.process(&apdu).status(), SW_WRONG_LENGTH);
+        assert_eq!(
+            app.process(&apdu).status(),
+            iso7816::Status::WrongLength.to_u16()
+        );
         // Refusals leave the slot empty.
         assert!(app.slots[0].key.is_none());
     }
@@ -1326,10 +1323,7 @@ mod tests {
             app.process(&[0x00, 0xF6, 0x9B, 0x9A]).status(),
             SW_INCORRECT_P1P2
         );
-        assert_eq!(
-            app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).status(),
-            SW_CLA_NOT_SUPPORTED
-        );
+        assert_eq!(app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).status(), 0x6E00);
     }
 
     #[test]

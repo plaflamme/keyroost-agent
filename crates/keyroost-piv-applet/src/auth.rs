@@ -2,10 +2,9 @@
 //! (0x2C): the PIN/PUK reference-data commands.
 
 use crate::constants::{
-    SW_AUTH_BLOCKED, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_REFERENCE_NOT_FOUND,
-    SW_WRONG_DATA, SW_WRONG_LENGTH,
+    SW_AUTH_BLOCKED, SW_INCORRECT_P1P2, SW_OK, SW_REFERENCE_NOT_FOUND, SW_WRONG_DATA,
 };
-use crate::{PivApplet, Response, apdu_lc_body, tries_sw};
+use crate::{PivApplet, Response, tries_sw};
 
 /// PIN reference (P2) for the PIV application PIN.
 const PIN_REF_APPLICATION: u8 = 0x80;
@@ -32,29 +31,21 @@ impl PivApplet {
     ///
     /// The card also syncs the key slots' security status from the verified
     /// state on every VERIFY; this applet has no key slots yet.
-    pub(crate) fn process_verify(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            // `process` guarantees the 4-byte header.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0x00 && *p1 != 0xFF {
+    pub(crate) fn process_verify(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
+        if command.p1 != 0x00 && command.p1 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let pin = if *p2 == PIN_REF_APPLICATION {
+        let pin = if command.p2 == PIN_REF_APPLICATION {
             &mut self.pin
         } else {
             return Response::sw(SW_REFERENCE_NOT_FOUND);
         };
-        let Ok((lc, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+        let body = command.data();
+        let lc = body.len();
         if pin.tries == 0 {
             return Response::sw(SW_AUTH_BLOCKED);
         }
-        if *p1 == 0xFF {
+        if command.p1 == 0xFF {
             // "Set security status to false": a verified PIN is reset
             // (counter and flag); an unverified one is left alone.
             if pin.verified {
@@ -98,24 +89,19 @@ impl PivApplet {
     /// or 0xFF — or the card answers `6A86` without changing anything. A
     /// successful change leaves the session verified (the check that set
     /// it).
-    pub(crate) fn process_change_reference(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0x00 {
+    pub(crate) fn process_change_reference(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        if command.p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let target = match *p2 {
+        let target = match command.p2 {
             PIN_REF_APPLICATION => &mut self.pin,
             PIN_REF_PUK => &mut self.puk,
             _ => return Response::sw(SW_REFERENCE_NOT_FOUND),
         };
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+        let body = command.data();
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
@@ -147,22 +133,17 @@ impl PivApplet {
     /// limit, and its verified state is cleared. (The card's `is_default`
     /// flag is not cleared by an unblock — a quirk worth keeping if GET
     /// METADATA ever reports it.)
-    pub(crate) fn process_reset_retry_counter(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0x00 {
+    pub(crate) fn process_reset_retry_counter(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        if command.p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        if *p2 != PIN_REF_APPLICATION {
+        if command.p2 != PIN_REF_APPLICATION {
             return Response::sw(SW_REFERENCE_NOT_FOUND);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+        let body = command.data();
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
@@ -328,7 +309,7 @@ pub(crate) mod tests {
     fn verify_lc_overrun_is_wrong_length() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80, 0x09, 0x31, 0x32, 0x33, 0x34]);
-        assert_eq!(resp.status(), SW_WRONG_LENGTH);
+        assert_eq!(resp.status(), iso7816::Status::WrongLength.to_u16());
     }
 
     #[test]
@@ -463,7 +444,7 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0x24, 0x00, 0x80, 0x11];
         apdu.extend_from_slice(&[0x31u8; 10]);
         let resp = applet.process(&apdu);
-        assert_eq!(resp.status(), SW_WRONG_LENGTH);
+        assert_eq!(resp.status(), iso7816::Status::WrongLength.to_u16());
     }
 
     #[test]
@@ -558,7 +539,7 @@ pub(crate) mod tests {
         for (cla, ins) in [(0x80u8, 0x20u8), (0x80u8, 0x24u8), (0x80u8, 0x2Cu8)] {
             let apdu = [cla, ins, 0x00, 0x80];
             let resp = applet.process(&apdu);
-            assert_eq!(resp.status(), SW_CLA_NOT_SUPPORTED);
+            assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
         }
     }
 }

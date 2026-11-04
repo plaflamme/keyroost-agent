@@ -4,11 +4,11 @@
 
 use crate::constants::{
     DEFAULT_MGMT_KEY, DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
-    SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK,
-    SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA, SW_WRONG_LENGTH,
+    SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED,
+    SW_WRONG_DATA,
 };
 use crate::piv::MgmtAlg;
-use crate::{Pin, PivApplet, Response, apdu_lc_body};
+use crate::{Pin, PivApplet, Response};
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -187,23 +187,17 @@ impl PivApplet {
     /// algorithm does not take (`03`→24, `08`→16, `0A`→24, `0C`→32); on
     /// success the key is replaced (old material zeroed first) and `9000`
     /// is answered.
-    pub(crate) fn process_set_management_key(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            // `process` guarantees the 4-byte header.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0xFF || *p2 != 0xFF {
+    pub(crate) fn process_set_management_key(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        if command.p1 != 0xFF || command.p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         if !self.mgmt.unlocked() {
             return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        let Ok((_lc, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+        let body = command.data();
         if body.len() < 4 {
             return Response::sw(SW_WRONG_DATA);
         }
@@ -233,22 +227,18 @@ impl PivApplet {
     /// the verified state cleared. A count of `00` blocks the counter
     /// immediately. `6986` until the 9B slot is unlocked and the PIN is
     /// verified in this session; `6400` on a non-standard CLA.
-    pub(crate) fn process_set_pin_retries(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            // `process` guarantees the 4-byte header.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_set_pin_retries(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
         if !self.mgmt.unlocked() {
             return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
         }
         if !self.pin.verified {
             return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        self.pin = Pin::factory(DEFAULT_PIN_VALUE, *p1);
-        self.puk = Pin::factory(DEFAULT_PUK_VALUE, *p2);
+        self.pin = Pin::factory(DEFAULT_PIN_VALUE, command.p1);
+        self.puk = Pin::factory(DEFAULT_PUK_VALUE, command.p2);
         Response::sw(SW_OK)
     }
 
@@ -264,14 +254,7 @@ impl PivApplet {
     /// does not model), and the pending GA challenge is left alone.
     /// `6986` until both counters are blocked; `6400` on a non-standard
     /// CLA.
-    pub(crate) fn process_reset(&mut self, apdu: &[u8]) -> Response {
-        let [cla, ..] = apdu else {
-            // `process` guarantees the 4-byte header.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_reset(&mut self, _command: &crate::apdu::CommandView<'_>) -> Response {
         if self.pin.tries != 0 || self.puk.tries != 0 {
             // Yubico's documented answer for this precondition is 6985
             // (conditions of use not satisfied); the host only recognises
@@ -297,7 +280,7 @@ pub(crate) mod tests {
     fn set_management_key_locked_is_security_status() {
         let mut applet = PivApplet::new();
         // 0C | 9B | 20 | 32-byte AES-256 key — refused while locked.
-        let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, 4];
+        let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, 3];
         apdu.extend_from_slice(&[0x0C, KEY_REF_MANAGEMENT, 0x20]);
         let r = applet.process(&apdu);
         assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);

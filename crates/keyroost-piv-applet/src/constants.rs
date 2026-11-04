@@ -5,7 +5,7 @@
 /// ISO 7816-4 status word: instruction not supported.
 pub(crate) const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 /// ISO 7816-4 status word: CLA not supported.
-pub(crate) const SW_CLA_NOT_SUPPORTED: u16 = 0x6400;
+pub(crate) const SW_CLA_NOT_SUPPORTED: u16 = 0x6800;
 /// ISO 7816-4 status word: incorrect P1/P2 — the `JavaCard`
 /// `ISO7816.SW_INCORRECT_P1P2` word the card answers for an unexpected P1.
 pub(crate) const SW_INCORRECT_P1P2: u16 = 0x6B00;
@@ -23,8 +23,6 @@ pub(crate) const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6986;
 pub(crate) const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 /// ISO 7816-4 status word: success — the card's `9000`.
 pub(crate) const SW_OK: u16 = 0x9000;
-/// ISO 7816-4 status word: wrong length — `Lc` overrunning the APDU.
-pub(crate) const SW_WRONG_LENGTH: u16 = 0x6700;
 /// ISO 7816-4 status word: file/app not found — `0x6A82`.
 /// ISO 7816-4 status word: reference not found — `0x6A88`.
 pub(crate) const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;

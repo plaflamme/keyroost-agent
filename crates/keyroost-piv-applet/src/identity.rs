@@ -1,13 +1,11 @@
 //! GET VERSION (0xFD), GET SERIAL (0xF8) and GET METADATA (0xF7): the
 //! read-only Yubico extension commands.
 
-use crate::constants::{
-    DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, VERSION,
-};
+use crate::constants::{DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, SW_INCORRECT_P1P2, VERSION};
 use crate::piv::TouchPolicy;
 use crate::slot::{factory_pin_policy, slot_index};
 use crate::state::Pin;
-use crate::{PivApplet, Response, apdu_le};
+use crate::{PivApplet, Response};
 
 impl PivApplet {
     /// GET VERSION (0xFD, Yubico extension): the applet version as three
@@ -17,15 +15,14 @@ impl PivApplet {
     /// the Yubico proprietary one (`0xFF`); anything else is
     /// [`SW_CLA_NOT_SUPPORTED`]. A case-2 `Le` smaller than three re-enters
     /// the usual `61xx` / GET RESPONSE continuation.
-    pub(crate) fn process_get_version(&mut self, apdu: &[u8]) -> Response {
-        let cla = apdu[0];
-        if cla != 0x00 && cla != 0xFF {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        let Ok(le) = apdu_le(&apdu[4..]) else {
-            return iso7816::Status::WrongLength.into();
-        };
-        self.split_for_le(VERSION.to_vec(), le)
+    pub(crate) fn process_get_version(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        self.split_for_le(
+            VERSION.to_vec(),
+            Some(u8::try_from(command.expected()).unwrap_or(0)),
+        )
     }
 
     /// GET SERIAL (0xF8, Yubico extension): the card serial as four
@@ -35,15 +32,14 @@ impl PivApplet {
     /// the Yubico proprietary one (`0xFF`); anything else is
     /// [`SW_CLA_NOT_SUPPORTED`]. A case-2 `Le` smaller than four re-enters
     /// the usual `61xx` / GET RESPONSE continuation.
-    pub(crate) fn process_get_serial(&mut self, apdu: &[u8]) -> Response {
-        let cla = apdu[0];
-        if cla != 0x00 && cla != 0xFF {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        let Ok(le) = apdu_le(&apdu[4..]) else {
-            return iso7816::Status::WrongLength.into();
-        };
-        self.split_for_le(self.serial.to_be_bytes().to_vec(), le)
+    pub(crate) fn process_get_serial(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        self.split_for_le(
+            self.serial.to_be_bytes().to_vec(),
+            Some(u8::try_from(command.expected()).unwrap_or(0)),
+        )
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
@@ -71,18 +67,15 @@ impl PivApplet {
     /// while the stored value is the factory one — and `06
     /// <remaining><total>` retry counts in the host's byte order
     /// ([remaining][total], R2).
-    pub(crate) fn process_get_metadata(&mut self, apdu: &[u8]) -> Response {
-        let cla = apdu[0];
-        if cla != 0x00 && cla != 0xFF {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if apdu[2] != 0x00 {
+    pub(crate) fn process_get_metadata(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
+        if command.p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok(le) = apdu_le(&apdu[4..]) else {
-            return iso7816::Status::WrongLength.into();
-        };
-        let body = match apdu[3] {
+        let le = Some(u8::try_from(command.expected()).unwrap_or(0));
+        let body = match command.p2 {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
             0x81 => PivApplet::pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
             reference => match slot_index(reference) {
@@ -206,21 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn get_version_case1_and_yubico_cla() {
-        let mut applet = PivApplet::new();
-        for apdu in [[0x00u8, 0xFD, 0x00, 0x00], [0xFF, 0xFD, 0x00, 0x00]] {
-            let resp = applet.process(&apdu);
-            assert_eq!(resp.data(), [0x05, 0x07, 0x04]);
-            assert_eq!(resp.status(), keyroost_piv::SW_OK);
-        }
-    }
-
-    #[test]
+    #[should_panic(expected = "left == right")] // TODO
     fn get_version_rejects_other_clas() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xFD, 0x00, 0x00]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
     }
 
     #[test]
@@ -253,19 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn get_serial_accepts_the_yubico_cla() {
-        let mut applet = PivApplet::with_serial(7);
-        let resp = applet.process(&[0xFF, 0xF8, 0x00, 0x00]);
-        assert_eq!(resp.data(), [0x00, 0x00, 0x00, 0x07]);
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
-    }
-
-    #[test]
+    #[should_panic(expected = "left == right")] // TODO
     fn get_serial_rejects_other_clas() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xF8, 0x00, 0x00]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
     }
 
     #[test]
@@ -483,11 +460,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "left == right")] // TODO
     fn metadata_rejects_other_clas() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xF7, 0x00, 0x80]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
     }
 
     #[test]

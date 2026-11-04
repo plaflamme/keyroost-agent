@@ -88,22 +88,14 @@ impl PivApplet {
     /// such producer). The stashed bytes come back under `9000`, re-capped
     /// by this command's own `Le` when it carries one; a GET RESPONSE with
     /// nothing pending answers [`SW_CONDITIONS_NOT_SATISFIED`].
-    pub(crate) fn process_get_response(&mut self, apdu: &[u8]) -> Response {
-        let [cla, ..] = apdu else {
-            // `process` guarantees the 4-byte header; there is nothing
-            // else to be malformed here.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_get_response(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
         let Some(tail) = self.get_response_tail.take() else {
             return Response::sw(SW_CONDITIONS_NOT_SATISFIED);
         };
-        let Ok(le) = apdu_le(&apdu[4..]) else {
-            return iso7816::Status::WrongLength.into();
-        };
-        self.split_for_le(tail, le)
+        self.split_for_le(tail, Some(u8::try_from(command.expected()).unwrap_or(0)))
     }
 }
 

@@ -4,12 +4,11 @@
 
 use crate::constants::{
     GA_MAX_CHALLENGE, GA_TAG_CHALLENGE, GA_TAG_DYN_AUTH, GA_TAG_EXP, GA_TAG_RESPONSE,
-    GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
-    SW_WRONG_LENGTH,
+    GA_TAG_WITNESS, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
 };
 use crate::piv::{KeyAlg, MgmtAlg};
 use crate::slot::{SlotKey, slot_index};
-use crate::{PivApplet, Response, apdu_lc_body};
+use crate::{PivApplet, Response};
 
 impl PivApplet {
     /// GENERAL AUTHENTICATE (0x87): the SP 800-73-4 dynamic-authentication
@@ -50,20 +49,16 @@ impl PivApplet {
     /// answers the shared secret's x-coordinate). `9B` is the management
     /// key; every other P2 — `9F`, `58`–`5A`, the vendor-extension
     /// references, … — answers `6B00` outright.
-    pub(crate) fn process_general_authenticate(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            // `process` guarantees the 4-byte header.
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
+    pub(crate) fn process_general_authenticate(
+        &mut self,
+        command: &crate::apdu::CommandView<'_>,
+    ) -> Response {
         // P2 is the key reference: a slot reference goes to the slot path,
         // `9B` is the management key, everything else is refused.
-        match slot_index(*p2) {
-            Some(index) => self.ga_slot(index, *p1, apdu_lc_body(apdu)),
-            None => match *p2 {
-                0x9B => self.ga_management(*p1, apdu_lc_body(apdu)),
+        match slot_index(command.p2) {
+            Some(index) => self.ga_slot(index, command.p1, command.data()),
+            None => match command.p2 {
+                0x9B => self.ga_management(command.p1, command.data()),
                 _ => Response::sw(SW_INCORRECT_P1P2),
             },
         }
@@ -75,12 +70,7 @@ impl PivApplet {
     /// one-shot dynamic-auth template — an empty `82` plus exactly one
     /// data member. The applet answers the signature or shared secret
     /// under `82`.
-    fn ga_slot(
-        &self,
-        index: usize,
-        p1: u8,
-        lc_body: Result<(usize, &[u8], &[u8]), ()>,
-    ) -> Response {
+    fn ga_slot(&self, index: usize, p1: u8, body: &[u8]) -> Response {
         if let Err(sw) = self.slot_pin_gate(&self.slots[index]) {
             return Response::sw(sw);
         }
@@ -90,9 +80,6 @@ impl PivApplet {
         if p1 != key.alg as u8 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_lc, body, _)) = lc_body else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
         let t = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -133,10 +120,7 @@ impl PivApplet {
     /// The 9B (management-key) half of GENERAL AUTHENTICATE: P1 selects the
     /// symmetric or an asymmetric algorithm, the body carries the
     /// dynamic-auth template.
-    fn ga_management(&mut self, p1: u8, lc_body: Result<(usize, &[u8], &[u8]), ()>) -> Response {
-        let Ok((_lc, body, _)) = lc_body else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+    fn ga_management(&mut self, p1: u8, body: &[u8]) -> Response {
         let tmpl = match parse_ga_template(body) {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
@@ -770,7 +754,7 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // Lc overrunning the APDU.
         let r = applet.process(&[0x00, 0x87, 0x03, KEY_REF_MANAGEMENT, 0x08, 0x7C, 0x00]);
-        assert_eq!(r.status(), SW_WRONG_LENGTH);
+        assert_eq!(r.status(), iso7816::Status::WrongLength.to_u16());
         // No 7C wrapper at all.
         let r = applet.process(&ga_apdu(0x03, &[0x80, 0x00]));
         assert_eq!(r.status(), SW_WRONG_DATA);
@@ -796,7 +780,7 @@ pub(crate) mod tests {
         let mut apdu = ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]]));
         apdu[0] = 0x80;
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_CLA_NOT_SUPPORTED);
+        assert_eq!(r.status(), iso7816::Status::ClaNotSupported.to_u16());
     }
 
     /// Management unlock plus a key of `alg` in `slot`; returns the

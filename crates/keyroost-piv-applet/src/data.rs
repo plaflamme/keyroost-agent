@@ -10,10 +10,8 @@
 //! [`keyroost_piv::encode_certificate`] (DER or gzip, `CertInfo` `0x00`/`0x01`)
 //! reads back byte-identical.
 
-use crate::constants::{
-    SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_LENGTH,
-};
-use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
+use crate::constants::{SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_OK};
+use crate::{PivApplet, Response};
 use x509_cert::der::{Decode, Encode};
 
 const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
@@ -96,22 +94,12 @@ impl PivApplet {
     /// The value is served verbatim, however it was written. A case-4 `Le`
     /// smaller than the wrapped value re-enters the usual `61xx` / GET
     /// RESPONSE continuation; a tag no object exists under answers `6A82`.
-    pub(crate) fn process_get_data(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0x3F || *p2 != 0xFF {
+    pub(crate) fn process_get_data(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
+        if command.p1 != 0x3F || command.p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let Ok((_lc, body, tail)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        let Ok(le) = apdu_le(tail) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
+        let body = command.data();
+        let le = command.expected();
         let Some(tag) = selector_tag(body) else {
             return Response::sw(SW_DATA_INVALID);
         };
@@ -119,7 +107,7 @@ impl PivApplet {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
                 push_tlv(&mut full, &[0x53], &value);
-                self.split_for_le(full, le)
+                self.split_for_le(full, Some(u8::try_from(le).unwrap_or(0)))
             }
             None => iso7816::Status::NotFound.into(),
         }
@@ -132,23 +120,14 @@ impl PivApplet {
     /// session unlocked, else `6982`). The value is the `53` template's
     /// content, stored verbatim: writing the empty value is how the host
     /// clears a slot certificate.
-    pub(crate) fn process_put_data(&mut self, apdu: &[u8]) -> Response {
-        let [cla, _, p1, p2, ..] = apdu else {
-            unreachable!("process guarantees the 4-byte header");
-        };
-        if cla & 0x90 != 0 {
-            return Response::sw(SW_CLA_NOT_SUPPORTED);
-        }
-        if *p1 != 0x3F || *p2 != 0xFF {
+    pub(crate) fn process_put_data(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
+        if command.p1 != 0x3F || command.p2 != 0xFF {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
-            return Response::sw(SW_WRONG_LENGTH);
-        };
-        let Some((tag, value)) = parse_put_body(body) else {
+        let Some((tag, value)) = parse_put_body(command.data()) else {
             return Response::sw(SW_DATA_INVALID);
         };
         if self.store_data_object(tag, value) {
