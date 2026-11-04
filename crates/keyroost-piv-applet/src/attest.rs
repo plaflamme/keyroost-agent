@@ -17,7 +17,6 @@
 use std::str::FromStr;
 
 use elliptic_curve::Generate;
-use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 use p256::ecdsa::SigningKey;
 use rsa::pkcs8::EncodePublicKey;
 use x509_cert::builder::{Builder, Profile};
@@ -28,6 +27,7 @@ use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
 use x509_cert::spki::ObjectIdentifier;
 
 use crate::constants::{SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_WRONG_LENGTH, VERSION};
+use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
 use pkcs1::DecodeRsaPrivateKey;
@@ -75,24 +75,19 @@ impl PivApplet {
         if *p2 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let slot = match p1 {
-            0x9A => keyroost_piv::Slot::Authentication,
-            0x9C => keyroost_piv::Slot::Signature,
-            0x9D => keyroost_piv::Slot::KeyManagement,
-            0x9E => keyroost_piv::Slot::CardAuthentication,
-            r @ 0x82..=0x95 => keyroost_piv::Slot::Retired(r - 0x81), // Retired is 1-based
-            _ => return Response::sw(SW_INCORRECT_P1P2),
+        let Some(slot) = crate::piv::Slot::from_u8(*p1) else {
+            return Response::sw(SW_INCORRECT_P1P2);
         };
         let Some(index) = slot_index(*p1) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
         let Some(key) = &self.slots[index].key else {
-            return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
+            return iso7816::Status::KeyReferenceNotFound.into();
         };
         let pin_policy = self.slots[index].pin_policy;
         let touch_policy = self.slots[index].touch_policy;
         let Some(spki) = target_public_key(key) else {
-            return Response::sw(keyroost_piv::SW_REFERENCE_NOT_FOUND);
+            return iso7816::Status::KeyReferenceNotFound.into();
         };
         let Some(cert) = attestation_cert(
             &self.attestation.secret_key,
@@ -102,10 +97,10 @@ impl PivApplet {
             pin_policy,
             touch_policy,
         ) else {
-            return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
+            return iso7816::Status::ConditionsOfUseNotSatisfied.into();
         };
         let Ok(der) = cert.to_der() else {
-            return Response::sw(keyroost_piv::SW_CONDITIONS_NOT_SATISFIED);
+            return iso7816::Status::ConditionsOfUseNotSatisfied.into();
         };
         let Ok((_lc, _body, tail)) = apdu_lc_body(apdu) else {
             return Response::sw(SW_WRONG_LENGTH);
@@ -147,7 +142,7 @@ fn target_public_key(key: &SlotKey) -> Option<x509_cert::SubjectPublicKeyInfo> {
 }
 
 struct YubicoPivAttestationProfile {
-    pub slot: keyroost_piv::Slot,
+    pub slot: crate::piv::Slot,
     pub issuer: x509_cert::name::Name,
     pub firmware_version: [u8; 3], // e.g., [4, 3, 0] for 4.3.0
     pub yubikey_serial: u32,
@@ -163,7 +158,7 @@ impl x509_cert::builder::Profile for YubicoPivAttestationProfile {
     fn get_subject(&self) -> x509_cert::name::Name {
         x509_cert::name::Name::from_str(&format!(
             "CN=YubiKey PIV Attestation 0x{:02X}",
-            self.slot.key_ref()
+            self.slot.into_u8()
         ))
         .unwrap()
     }
@@ -196,7 +191,7 @@ impl x509_cert::builder::Profile for YubicoPivAttestationProfile {
         });
 
         // 3. Policy Extension: Two-byte configuration (Byte 0: PIN Policy, Byte 1: Touch Policy)
-        let policy_bytes = [self.pin_policy.id(), self.touch_policy.id()];
+        let policy_bytes = [self.pin_policy as u8, self.touch_policy as u8];
         let policy_payload = OctetString::new(policy_bytes)?;
         let policy_der = policy_payload.to_der()?;
 
@@ -266,7 +261,7 @@ impl x509_cert::builder::Profile for YubicoRootProfile {
 /// See <https://developers.yubico.com/PIV/Introduction/PIV_attestation.html#_implementation>
 fn attestation_cert(
     secret_key: &p256::SecretKey,
-    slot: keyroost_piv::Slot,
+    slot: crate::piv::Slot,
     yubikey_serial: u32,
     spki: x509_cert::SubjectPublicKeyInfo,
     pin_policy: PinPolicy,
@@ -496,7 +491,7 @@ mod tests {
         };
         let (alg, point) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert_data)
             .expect("the P-521 certificate parses");
-        assert_eq!(alg, KeyAlg::EccP521);
+        assert_eq!(alg, keyroost_piv::KeyAlg::EccP521);
         match point {
             keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
             keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),

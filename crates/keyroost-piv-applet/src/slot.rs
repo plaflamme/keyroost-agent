@@ -20,8 +20,8 @@
 //!   the session's `pin.verified` flag and the [`PivApplet::pin_always_armed`]
 //!   latch; [`SW_SECURITY_STATUS_NOT_SATISFIED`] otherwise.
 
+use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use elliptic_curve::sec1::ToSec1Point;
-use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -160,7 +160,7 @@ impl Slot {
         Slot {
             key: None,
             pin_policy,
-            touch_policy: TouchPolicy::Default,
+            touch_policy: TouchPolicy::Never,
             imported: false,
             cert: None,
         }
@@ -258,7 +258,9 @@ impl PivApplet {
             PinPolicy::Never => true,
             PinPolicy::Once => self.pin.verified,
             PinPolicy::Always => self.pin.verified && self.pin_always_armed,
-            PinPolicy::Default => unreachable!("slots never hold the DEFAULT policy"),
+            PinPolicy::Default => {
+                unreachable!("not possible, but TODO: make it statically impossible")
+            }
         };
         if satisfied {
             Ok(())
@@ -335,7 +337,7 @@ mod tests {
             assert!(slot.key.is_none());
             assert!(slot.cert.is_none());
             assert!(!slot.imported);
-            assert_eq!(slot.touch_policy, TouchPolicy::Default);
+            assert_eq!(slot.touch_policy, TouchPolicy::Never);
         }
     }
 

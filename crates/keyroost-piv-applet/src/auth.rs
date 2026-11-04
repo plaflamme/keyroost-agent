@@ -1,9 +1,16 @@
 //! VERIFY (0x20), CHANGE REFERENCE DATA (0x24) and RESET RETRY COUNTER
 //! (0x2C): the PIN/PUK reference-data commands.
 
-use crate::constants::{SW_AUTH_BLOCKED, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_REFERENCE_NOT_FOUND, SW_WRONG_DATA, SW_WRONG_LENGTH};
+use crate::constants::{
+    SW_AUTH_BLOCKED, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_OK, SW_REFERENCE_NOT_FOUND,
+    SW_WRONG_DATA, SW_WRONG_LENGTH,
+};
 use crate::{PivApplet, Response, apdu_lc_body, tries_sw};
-use keyroost_piv::{PIN_REF_APPLICATION, PIN_REF_PUK};
+
+/// PIN reference (P2) for the PIV application PIN.
+const PIN_REF_APPLICATION: u8 = 0x80;
+/// PIN reference (P2) for the PUK.
+const PIN_REF_PUK: u8 = 0x81;
 
 impl PivApplet {
     /// VERIFY (0x20): present the application PIN (P2=`80`) against the
@@ -41,7 +48,9 @@ impl PivApplet {
         } else {
             return Response::sw(SW_REFERENCE_NOT_FOUND);
         };
-        let Ok((lc, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((lc, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         if pin.tries == 0 {
             return Response::sw(SW_AUTH_BLOCKED);
         }
@@ -104,7 +113,9 @@ impl PivApplet {
             PIN_REF_PUK => &mut self.puk,
             _ => return Response::sw(SW_REFERENCE_NOT_FOUND),
         };
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }
@@ -149,7 +160,9 @@ impl PivApplet {
         if *p2 != PIN_REF_APPLICATION {
             return Response::sw(SW_REFERENCE_NOT_FOUND);
         }
-        let Ok((_, body, _)) = apdu_lc_body(apdu) else { return Response::sw(SW_WRONG_LENGTH) };
+        let Ok((_, body, _)) = apdu_lc_body(apdu) else {
+            return Response::sw(SW_WRONG_LENGTH);
+        };
         if body.len() != 16 {
             return Response::sw(SW_WRONG_DATA);
         }

@@ -4,10 +4,10 @@
 use crate::constants::{
     DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, SW_CLA_NOT_SUPPORTED, SW_INCORRECT_P1P2, VERSION,
 };
+use crate::piv::TouchPolicy;
 use crate::slot::{factory_pin_policy, slot_index};
 use crate::state::Pin;
 use crate::{PivApplet, Response, apdu_le};
-use keyroost_piv::{SW_REFERENCE_NOT_FOUND, TouchPolicy};
 
 impl PivApplet {
     /// GET VERSION (0xFD, Yubico extension): the applet version as three
@@ -23,7 +23,7 @@ impl PivApplet {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
         let Ok(le) = apdu_le(&apdu[4..]) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         self.split_for_le(VERSION.to_vec(), le)
     }
@@ -41,7 +41,7 @@ impl PivApplet {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
         let Ok(le) = apdu_le(&apdu[4..]) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         self.split_for_le(self.serial.to_be_bytes().to_vec(), le)
     }
@@ -80,7 +80,7 @@ impl PivApplet {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         let Ok(le) = apdu_le(&apdu[4..]) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         let body = match apdu[3] {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
@@ -88,7 +88,7 @@ impl PivApplet {
             reference => match slot_index(reference) {
                 Some(index) => match self.key_reference_metadata(index) {
                     Some(body) => body,
-                    None => return Response::sw(SW_REFERENCE_NOT_FOUND),
+                    None => return iso7816::Status::KeyReferenceNotFound.into(),
                 },
                 None => return Response::sw(SW_INCORRECT_P1P2),
             },
@@ -102,15 +102,15 @@ impl PivApplet {
     fn key_reference_metadata(&self, index: usize) -> Option<Vec<u8>> {
         let slot = &self.slots[index];
         let key = slot.key.as_ref()?;
-        let is_default = slot.pin_policy == factory_pin_policy(index)
-            && slot.touch_policy == TouchPolicy::Default;
+        let is_default =
+            slot.pin_policy == factory_pin_policy(index) && slot.touch_policy == TouchPolicy::Never;
         // The `7F49` inner TLVs, unwrapped from their template exactly as
         // the GENERATE response carries it: the `86` point for EC keys,
         // the `81` modulus and `82` exponent for RSA keys.
         let inner = key.public_inner()?;
         let mut body = Vec::new();
-        body.extend_from_slice(&[0x01, 0x01, key.alg.id()]);
-        body.extend_from_slice(&[0x02, 0x02, slot.pin_policy.id(), slot.touch_policy.id()]);
+        body.extend_from_slice(&[0x01, 0x01, key.alg as u8]);
+        body.extend_from_slice(&[0x02, 0x02, slot.pin_policy as u8, slot.touch_policy as u8]);
         body.extend_from_slice(&[0x03, 0x01, if slot.imported { 0x02 } else { 0x01 }]);
         body.push(0x04);
         push_ber_len(&mut body, inner.len());
@@ -350,7 +350,7 @@ mod tests {
         // a member is absent: 9C stays at its factory `ALWAYS`.
         assert_eq!(
             md.policy,
-            Some((PinPolicy::Always.id(), TouchPolicy::Default.id()))
+            Some((PinPolicy::Always.id(), TouchPolicy::Never.id()))
         );
         assert_eq!(md.origin, Some(1));
         // Still at the factory policies, so the flag is set.
@@ -435,7 +435,7 @@ mod tests {
         let md = metadata(&mut applet, 0x9A);
         assert_eq!(
             md.policy,
-            Some((PinPolicy::Once.id(), TouchPolicy::Default.id()))
+            Some((PinPolicy::Once.id(), TouchPolicy::Never.id()))
         );
         assert_eq!(md.is_default, Some(true));
         // ...and a non-factory policy clears it.
@@ -449,7 +449,7 @@ mod tests {
         let md = metadata(&mut applet, 0x9A);
         assert_eq!(
             md.policy,
-            Some((PinPolicy::Always.id(), TouchPolicy::Default.id()))
+            Some((PinPolicy::Always.id(), TouchPolicy::Never.id()))
         );
         assert_eq!(md.is_default, Some(false));
     }

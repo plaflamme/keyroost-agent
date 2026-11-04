@@ -40,7 +40,7 @@ impl PivApplet {
             return Response::sw(SW_CLA_NOT_SUPPORTED);
         }
         if apdu[2] != INS_SELECT_P1_BY_AID {
-            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+            return iso7816::Status::NotFound.into();
         }
         // Case-1/2 APDUs carry no length byte at all: no AID to match.
         let (lc, body) = match apdu.get(4) {
@@ -48,13 +48,13 @@ impl PivApplet {
             None => (0, &apdu[4..]),
         };
         let Some(aid) = body.get(..usize::from(lc)) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         if !(aid.len() >= AID_RID.len() && AID_FULL.starts_with(aid)) {
-            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+            return iso7816::Status::NotFound.into();
         }
         let Ok(le) = apdu_le(&body[aid.len()..]) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         self.split_for_le(Self::select_response(), le)
     }
@@ -101,7 +101,7 @@ impl PivApplet {
             return Response::sw(SW_CONDITIONS_NOT_SATISFIED);
         };
         let Ok(le) = apdu_le(&apdu[4..]) else {
-            return Response::sw(keyroost_piv::SW_WRONG_LENGTH);
+            return iso7816::Status::WrongLength.into();
         };
         self.split_for_le(tail, le)
     }

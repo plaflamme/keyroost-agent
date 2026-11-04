@@ -55,6 +55,7 @@ mod general_auth;
 mod identity;
 mod keygen;
 mod management;
+mod piv;
 mod select;
 mod slot;
 mod state;
@@ -116,6 +117,12 @@ impl Response {
             Response::More(_, remain) => Status::MoreAvailable(*remain).to_u16(),
             Response::Status(s) => s.to_u16(),
         }
+    }
+}
+
+impl From<iso7816::Status> for Response {
+    fn from(value: iso7816::Status) -> Self {
+        Self::Status(value)
     }
 }
 

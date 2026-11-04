@@ -2,13 +2,12 @@
 //! management-key witness / challenge exchange and the one-shot per-slot
 //! ECDSA signing and ECDH key agreement of the NIST-curve slots.
 
-use keyroost_piv::{KEY_REF_MANAGEMENT, KeyAlg, MgmtAlg};
-
 use crate::constants::{
     GA_MAX_CHALLENGE, GA_TAG_CHALLENGE, GA_TAG_DYN_AUTH, GA_TAG_EXP, GA_TAG_RESPONSE,
     GA_TAG_WITNESS, SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_WRONG_DATA,
     SW_WRONG_LENGTH,
 };
+use crate::piv::{KeyAlg, MgmtAlg};
 use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, Response, apdu_lc_body};
 
@@ -64,7 +63,7 @@ impl PivApplet {
         match slot_index(*p2) {
             Some(index) => self.ga_slot(index, *p1, apdu_lc_body(apdu)),
             None => match *p2 {
-                KEY_REF_MANAGEMENT => self.ga_management(*p1, apdu_lc_body(apdu)),
+                0x9B => self.ga_management(*p1, apdu_lc_body(apdu)),
                 _ => Response::sw(SW_INCORRECT_P1P2),
             },
         }
@@ -88,7 +87,7 @@ impl PivApplet {
         let Some(key) = self.slots[index].key.as_ref() else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
-        if p1 != key.alg.id() {
+        if p1 != key.alg as u8 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         let Ok((_lc, body, _)) = lc_body else {
@@ -142,7 +141,7 @@ impl PivApplet {
             Ok(t) => t,
             Err(sw) => return Response::sw(sw),
         };
-        match MgmtAlg::from_id(p1) {
+        match MgmtAlg::from_u8(p1) {
             Some(alg) => self.ga_sym(alg, &tmpl),
             // Asymmetric (or unknown) algorithm: no key slot, so no
             // exchange — the reference fails on the missing key.
@@ -530,6 +529,7 @@ pub(crate) mod tests {
     use aes::cipher::{BlockCipherDecrypt, KeyInit};
     use elliptic_curve::Generate;
     use elliptic_curve::sec1::ToSec1Point;
+    use keyroost_piv::KEY_REF_MANAGEMENT;
 
     /// The GA dynamic-auth body: `7C` wrapping the given tagged members.
     pub(crate) fn ga_body(members: &[&[u8]]) -> Vec<u8> {

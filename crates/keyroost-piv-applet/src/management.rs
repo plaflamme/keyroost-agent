@@ -7,10 +7,12 @@ use crate::constants::{
     SW_CLA_NOT_SUPPORTED, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK,
     SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
+use crate::piv::MgmtAlg;
 use crate::{Pin, PivApplet, Response, apdu_lc_body};
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use keyroost_piv::{KEY_REF_MANAGEMENT, MgmtAlg};
 use zeroize::{Zeroize, Zeroizing};
+
+const KEY_REF_MANAGEMENT: u8 = 0x9B;
 
 /// The 9B GA challenge state — the card's challenge transient and unlock
 /// flag as one machine. Only the first `block_size` bytes of a `Challenged`
@@ -212,7 +214,7 @@ impl PivApplet {
         if body[1] != KEY_REF_MANAGEMENT {
             return Response::sw(SW_WRONG_DATA);
         }
-        let alg = match MgmtAlg::from_id(body[0]) {
+        let alg = match MgmtAlg::from_u8(body[0]) {
             Some(alg) if alg.key_len() == key_len => alg,
             _ => return Response::sw(SW_WRONG_DATA),
         };

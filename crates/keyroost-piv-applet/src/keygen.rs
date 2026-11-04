@@ -27,7 +27,7 @@ use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
 
-use keyroost_piv::{KeyAlg, PinPolicy, TouchPolicy};
+use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 
 use crate::Response;
 use crate::constants::{
@@ -283,7 +283,7 @@ impl PivApplet {
         let Some(index) = slot_index(*p2) else {
             return Response::sw(SW_INCORRECT_P1P2);
         };
-        let alg = match KeyAlg::from_id(*p1) {
+        let alg = match KeyAlg::from_u8(*p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
             Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
                 alg
@@ -392,7 +392,7 @@ impl PivApplet {
             },
         };
         if self.slots[source].key.is_none() {
-            return Response::sw(keyroost_piv::SW_NOT_FOUND);
+            return iso7816::Status::NotFound.into();
         }
         if let Some(dest) = dest
             && self.slots[dest].key.is_some()
@@ -534,7 +534,7 @@ fn parse_alg(value: &[u8]) -> Result<KeyAlg, ()> {
     let [id] = value else {
         return Err(());
     };
-    KeyAlg::from_id(*id).ok_or(())
+    KeyAlg::from_u8(*id).ok_or(())
 }
 
 /// An `AA 01 <id>` pin-policy member.
@@ -542,7 +542,7 @@ fn parse_pin_policy(value: &[u8]) -> Result<PinPolicy, ()> {
     let [id] = value else {
         return Err(());
     };
-    PinPolicy::from_id(*id).ok_or(())
+    PinPolicy::from_u8(*id).ok_or(())
 }
 
 /// An `AB 01 <id>` touch-policy member.
@@ -550,7 +550,7 @@ fn parse_touch_policy(value: &[u8]) -> Result<TouchPolicy, ()> {
     let [id] = value else {
         return Err(());
     };
-    TouchPolicy::from_id(*id).ok_or(())
+    TouchPolicy::from_u8(*id).ok_or(())
 }
 
 /// A `06 <len> <scalar>` member: exactly the 32/48/66-byte big-endian
@@ -624,15 +624,19 @@ mod tests {
     fn gen_apdu(slot: Slot) -> Vec<u8> {
         generate_key(
             slot,
-            KeyAlg::EccP256.id(),
-            PinPolicy::Default,
-            TouchPolicy::Default,
+            keyroost_piv::KeyAlg::EccP256.id(),
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
         )
     }
 
     /// The host's `generate_key` APDU with explicit policies.
-    fn gen_policies_apdu(slot: Slot, pin: PinPolicy, touch: TouchPolicy) -> Vec<u8> {
-        generate_key(slot, KeyAlg::EccP256.id(), pin, touch)
+    fn gen_policies_apdu(
+        slot: Slot,
+        pin: keyroost_piv::PinPolicy,
+        touch: keyroost_piv::TouchPolicy,
+    ) -> Vec<u8> {
+        generate_key(slot, keyroost_piv::KeyAlg::EccP256.id(), pin, touch)
     }
 
     /// A GENERATE APDU with a raw control-reference template (the
@@ -780,8 +784,8 @@ mod tests {
         let mut app = unlocked();
         let r = app.process(&gen_policies_apdu(
             Slot::Authentication,
-            PinPolicy::Always,
-            TouchPolicy::Always,
+            keyroost_piv::PinPolicy::Always,
+            keyroost_piv::TouchPolicy::Always,
         ));
         assert_eq!(r.status(), SW_OK);
         let slot = &app.slots[0];
@@ -866,9 +870,9 @@ mod tests {
         let mut app = unlocked();
         // Non-P-256 algorithm ids.
         for alg in [
-            KeyAlg::Rsa3072.id(),
-            KeyAlg::EccP384.id(),
-            KeyAlg::Ed25519.id(),
+            keyroost_piv::KeyAlg::Rsa3072.id(),
+            keyroost_piv::KeyAlg::EccP384.id(),
+            keyroost_piv::KeyAlg::Ed25519.id(),
         ] {
             assert_eq!(
                 app.process(&import_apdu(alg, 0x9A, &ec_body(&scalar, None, None)))
@@ -985,7 +989,14 @@ mod tests {
     /// under the slot's algorithm id and the card's raw `m^d mod n` answer
     /// must satisfy `s^e == m (mod n)`.
     #[allow(clippy::many_single_char_names)]
-    fn rsa_sign_check(app: &mut PivApplet, alg: KeyAlg, slot: u8, n: &[u8], e: &[u8], m: u8) {
+    fn rsa_sign_check(
+        app: &mut PivApplet,
+        alg: keyroost_piv::KeyAlg,
+        slot: u8,
+        n: &[u8],
+        e: &[u8],
+        m: u8,
+    ) {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = m;
         let r = app.process(&keyroost_piv::general_auth_sign(alg.id(), slot, &block));
@@ -1044,13 +1055,13 @@ mod tests {
     #[test]
     fn generate_rsa1024_stores_pkcs1_and_signs() {
         let mut app = unlocked();
-        let alg = KeyAlg::Rsa1024;
+        let alg = keyroost_piv::KeyAlg::Rsa1024;
         // 9E is `NEVER` at the factory: the sign round trip needs no VERIFY.
         let r = app.process(&generate_key(
             Slot::CardAuthentication,
             alg.id(),
-            PinPolicy::Default,
-            TouchPolicy::Default,
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
         ));
         assert_eq!(r.status(), SW_OK, "GENERATE: {r:?}");
         let (n, e) = rsa_public_of(&r);
@@ -1081,8 +1092,12 @@ mod tests {
                 (0x05, &host.n),
             ]);
             assert_eq!(
-                app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, &body))
-                    .status(),
+                app.process(&import_apdu(
+                    keyroost_piv::KeyAlg::Rsa1024.id(),
+                    0x9E,
+                    &body
+                ))
+                .status(),
                 SW_OK,
                 "IMPORT"
             );
@@ -1098,7 +1113,7 @@ mod tests {
             assert_eq!(stored.n().to_bytes_be(), host.n);
             rsa_sign_check(
                 &mut app,
-                KeyAlg::Rsa1024,
+                keyroost_piv::KeyAlg::Rsa1024,
                 0x9E,
                 &host.n,
                 &[0x01, 0x00, 0x01],
@@ -1165,7 +1180,7 @@ mod tests {
         ];
         for body in &bodies {
             assert_eq!(
-                app.process(&import_apdu(KeyAlg::Rsa1024.id(), 0x9E, body))
+                app.process(&import_apdu(keyroost_piv::KeyAlg::Rsa1024.id(), 0x9E, body))
                     .status(),
                 SW_WRONG_DATA,
                 "body {body:02X?}"
@@ -1366,8 +1381,13 @@ mod tests {
 
     /// A GENERATE APDU for a specific algorithm and slot: the host's own
     /// builder, so the test rides the exact wire shape.
-    fn gen_apdu_for(slot: keyroost_piv::Slot, alg: KeyAlg) -> Vec<u8> {
-        keyroost_piv::generate_key(slot, alg.id(), PinPolicy::Default, TouchPolicy::Default)
+    fn gen_apdu_for(slot: keyroost_piv::Slot, alg: keyroost_piv::KeyAlg) -> Vec<u8> {
+        keyroost_piv::generate_key(
+            slot,
+            alg.id(),
+            keyroost_piv::PinPolicy::Default,
+            keyroost_piv::TouchPolicy::Default,
+        )
     }
 
     #[test]
@@ -1376,7 +1396,7 @@ mod tests {
         // 9C: P-384, a 97-byte point on the curve.
         let r = app.process(&gen_apdu_for(
             keyroost_piv::Slot::Signature,
-            KeyAlg::EccP384,
+            keyroost_piv::KeyAlg::EccP384,
         ));
         assert_eq!(r.status(), SW_OK);
         let point = point_of(&r);
@@ -1390,7 +1410,7 @@ mod tests {
         // 9D: P-521, a 133-byte point on the curve.
         let r = app.process(&gen_apdu_for(
             keyroost_piv::Slot::KeyManagement,
-            KeyAlg::EccP521,
+            keyroost_piv::KeyAlg::EccP521,
         ));
         assert_eq!(r.status(), SW_OK);
         let point = point_of(&r);
@@ -1414,8 +1434,12 @@ mod tests {
         };
         let body = ec_body(&scalar, None, None);
         assert_eq!(
-            app.process(&import_apdu(KeyAlg::EccP384.id(), 0x9A, &body))
-                .status(),
+            app.process(&import_apdu(
+                keyroost_piv::KeyAlg::EccP384.id(),
+                0x9A,
+                &body
+            ))
+            .status(),
             SW_OK
         );
         assert_eq!(
@@ -1436,7 +1460,7 @@ mod tests {
         );
         let digest = [0x2C; 48];
         let r = app.process(&keyroost_piv::general_auth_sign(
-            KeyAlg::EccP384.id(),
+            keyroost_piv::KeyAlg::EccP384.id(),
             0x9A,
             &digest,
         ));
@@ -1455,8 +1479,12 @@ mod tests {
         };
         let body = ec_body(&scalar, None, None);
         assert_eq!(
-            app.process(&import_apdu(KeyAlg::EccP521.id(), 0x82, &body))
-                .status(),
+            app.process(&import_apdu(
+                keyroost_piv::KeyAlg::EccP521.id(),
+                0x82,
+                &body
+            ))
+            .status(),
             SW_OK
         );
         assert_eq!(
@@ -1476,7 +1504,7 @@ mod tests {
         let mid: Vec<u8> = vec![0x2B; 48];
         assert_eq!(
             app.process(&import_apdu(
-                KeyAlg::EccP256.id(),
+                keyroost_piv::KeyAlg::EccP256.id(),
                 0x9C,
                 &ec_body(&long, None, None)
             ))
@@ -1485,7 +1513,7 @@ mod tests {
         );
         assert_eq!(
             app.process(&import_apdu(
-                KeyAlg::EccP384.id(),
+                keyroost_piv::KeyAlg::EccP384.id(),
                 0x9C,
                 &ec_body(&short, None, None)
             ))
@@ -1494,7 +1522,7 @@ mod tests {
         );
         assert_eq!(
             app.process(&import_apdu(
-                KeyAlg::EccP521.id(),
+                keyroost_piv::KeyAlg::EccP521.id(),
                 0x9C,
                 &ec_body(&mid, None, None)
             ))
@@ -1504,9 +1532,9 @@ mod tests {
         // Zero scalars and group orders, per curve: the range check refuses
         // them before the field conversion.
         for (alg, size) in [
-            (KeyAlg::EccP256, 32usize),
-            (KeyAlg::EccP384, 48usize),
-            (KeyAlg::EccP521, 66usize),
+            (keyroost_piv::KeyAlg::EccP256, 32usize),
+            (keyroost_piv::KeyAlg::EccP384, 48usize),
+            (keyroost_piv::KeyAlg::EccP521, 66usize),
         ] {
             let zero = vec![0u8; size];
             assert_eq!(
@@ -1515,9 +1543,9 @@ mod tests {
                 SW_WRONG_DATA
             );
             let order = match alg {
-                KeyAlg::EccP256 => P256_ORDER.to_vec(),
-                KeyAlg::EccP384 => P384_ORDER.to_vec(),
-                KeyAlg::EccP521 => P521_ORDER.to_vec(),
+                keyroost_piv::KeyAlg::EccP256 => P256_ORDER.to_vec(),
+                keyroost_piv::KeyAlg::EccP384 => P384_ORDER.to_vec(),
+                keyroost_piv::KeyAlg::EccP521 => P521_ORDER.to_vec(),
                 _ => unreachable!("a NIST curve"),
             };
             assert_eq!(

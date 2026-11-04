@@ -14,8 +14,11 @@ use crate::constants::{
     SW_CLA_NOT_SUPPORTED, SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_OK, SW_WRONG_LENGTH,
 };
 use crate::{PivApplet, Response, apdu_lc_body, apdu_le};
-use keyroost_piv::{OBJECT_ADMIN_DATA, OBJECT_CHUID, OBJECT_PIN_PROTECTED_DATA};
 use x509_cert::der::{Decode, Encode};
+
+const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
+const OBJECT_PIN_PROTECTED_DATA: [u8; 3] = [0x5F, 0xC1, 0x09];
+const OBJECT_ADMIN_DATA: [u8; 3] = [0x5F, 0xFF, 0x00];
 
 /// The `F9` attestation certificate object tag (the Yubico PIV Attestation
 /// Certificate), the one data object the applet mints at construction.
@@ -118,7 +121,7 @@ impl PivApplet {
                 push_tlv(&mut full, &[0x53], &value);
                 self.split_for_le(full, le)
             }
-            None => Response::sw(keyroost_piv::SW_NOT_FOUND),
+            None => iso7816::Status::NotFound.into(),
         }
     }
 
@@ -151,7 +154,7 @@ impl PivApplet {
         if self.store_data_object(tag, value) {
             Response::sw(SW_OK)
         } else {
-            Response::sw(keyroost_piv::SW_NOT_FOUND)
+            iso7816::Status::NotFound.into()
         }
     }
 
