@@ -207,14 +207,6 @@ impl PivApplet {
 
     /// The applet's entry point: dispatch a received host APDU to its
     /// instruction handler.
-    ///
-    /// The whole wire APDU (`CLA INS P1 P2 [Lc data] [Le]`) is handed to the
-    /// handler, which parses what it needs from it. An instruction this
-    /// applet does not implement answers [`SW_INS_NOT_SUPPORTED`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `apdu` is shorter than the 4-byte ISO 7816-4 header.
     pub fn process(&mut self, apdu: &[u8]) -> Response {
         let command = match apdu::CommandView::try_from(apdu) {
             Ok(command) => command,
@@ -230,7 +222,14 @@ impl PivApplet {
                 return iso7816::Status::WrongLength.into();
             }
         };
+        if command.instruction() == Instruction::Select {
+            self.process_select(apdu)
+        } else {
+            self.process_command(&command)
+        }
+    }
 
+    fn process_command(&mut self, command: &apdu::CommandView<'_>) -> Response {
         if command.class().chain().not_the_last() {
             return iso7816::Status::ClaNotSupported.into();
         }
@@ -254,35 +253,32 @@ impl PivApplet {
         // the status query (no body) is not, even though both can answer
         // 9000. Only a presentation that the card accepts re-arms the
         // PIN/ALWAYS latch.
-        let pin_presentation = ins == Instruction::Verify
-            && apdu.get(2) == Some(&0x00)
-            && matches!(apdu_lc_body(apdu), Ok((_, body, _)) if body.len() == 8);
+        let pin_presentation =
+            ins == Instruction::Verify && command.p1 == 0x00 && command.data().len() == 8;
         #[allow(clippy::match_same_arms)]
         let response = match ins {
-            Instruction::Select => self.process_select(apdu),
-            Instruction::Verify => self.process_verify(&command),
-            Instruction::GetData => self.process_get_data(&command),
-            Instruction::GetResponse => self.process_get_response(&command),
-            Instruction::GeneralAuthenticate => self.process_general_authenticate(&command),
-            Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(&command),
-            Instruction::PutData => self.process_put_data(&command),
-            Instruction::ChangeReferenceData => self.process_change_reference(&command),
-            Instruction::ResetRetryCounter => self.process_reset_retry_counter(&command),
+            Instruction::Select => unreachable!(),
+            Instruction::Verify => self.process_verify(command),
+            Instruction::GetData => self.process_get_data(command),
+            Instruction::GetResponse => self.process_get_response(command),
+            Instruction::GeneralAuthenticate => self.process_general_authenticate(command),
+            Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(command),
+            Instruction::PutData => self.process_put_data(command),
+            Instruction::ChangeReferenceData => self.process_change_reference(command),
+            Instruction::ResetRetryCounter => self.process_reset_retry_counter(command),
             Instruction::ReadBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
             Instruction::WriteBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
             Instruction::Unknown(code) if let Some(yi) = YubicoInstruction::from_code(code) => {
                 match yi {
-                    YubicoInstruction::GetVersion => self.process_get_version(&command),
-                    YubicoInstruction::GetSerial => self.process_get_serial(&command),
-                    YubicoInstruction::GetMetadata => self.process_get_metadata(&command),
-                    YubicoInstruction::ImportAsymmetricKey => self.process_import_key(&command),
-                    YubicoInstruction::MoveKey => self.process_move_key(&command),
-                    YubicoInstruction::SetManagementKey => {
-                        self.process_set_management_key(&command)
-                    }
-                    YubicoInstruction::SetPinRetries => self.process_set_pin_retries(&command),
-                    YubicoInstruction::Reset => self.process_reset(&command),
-                    YubicoInstruction::Attest => self.process_attest(&command),
+                    YubicoInstruction::GetVersion => self.process_get_version(command),
+                    YubicoInstruction::GetSerial => self.process_get_serial(command),
+                    YubicoInstruction::GetMetadata => self.process_get_metadata(command),
+                    YubicoInstruction::ImportAsymmetricKey => self.process_import_key(command),
+                    YubicoInstruction::MoveKey => self.process_move_key(command),
+                    YubicoInstruction::SetManagementKey => self.process_set_management_key(command),
+                    YubicoInstruction::SetPinRetries => self.process_set_pin_retries(command),
+                    YubicoInstruction::Reset => self.process_reset(command),
+                    YubicoInstruction::Attest => self.process_attest(command),
                 }
             }
             Instruction::Unknown(_code) => Response::sw(SW_INS_NOT_SUPPORTED),
@@ -333,42 +329,6 @@ pub(crate) fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
         [le] => Ok(Some(*le)),
         _ => Err(()),
     }
-}
-
-/// The `Lc`, body and trailing bytes of a case-3/4 APDU:
-/// `Ok((lc, body, tail))`, where `tail` is the remainder after the body —
-/// the `Le` byte of a case-4 APDU, for the caller to read through
-/// [`apdu_le`] — and `Err(())` when `Lc` overruns the APDU: the caller
-/// answers [`keyroost_piv::SW_WRONG_LENGTH`]. A case-1/2 APDU carries no
-/// length byte at all and reads as an empty body.
-///
-/// Both the short form and the extended form are accepted: a non-zero byte
-/// at index 4 is the short `Lc` with the body at byte 5; a `0x00` there is
-/// either a case-4 APDU carrying no command data (a `Le` follows, the APDU
-/// is at most 6 bytes) or the extended marker, with `Lc` as the two-byte
-/// value at bytes 5–6 and the body at byte 7 — the host's `build_apdu_ext`
-/// form, which the large PUT DATA and IMPORT ASYMMETRIC KEY bodies use.
-pub(crate) fn apdu_lc_body(apdu: &[u8]) -> Result<(usize, &[u8], &[u8]), ()> {
-    let Some(&first) = apdu.get(4) else {
-        return Ok((0, &[], &[]));
-    };
-    if first != 0 {
-        let lc = usize::from(first);
-        let Some(body) = apdu.get(5..5 + lc) else {
-            return Err(());
-        };
-        return Ok((lc, body, &apdu[5 + lc..]));
-    }
-    // The zero leading length byte: a case-4 APDU with no command data, or
-    // (at 7 bytes and up) the extended marker.
-    if apdu.len() < 7 {
-        return Ok((0, &[], &apdu[5..]));
-    }
-    let lc = (usize::from(apdu[5]) << 8) | usize::from(apdu[6]);
-    let Some(body) = apdu.get(7..7 + lc) else {
-        return Err(());
-    };
-    Ok((lc, body, &apdu[7 + lc..]))
 }
 
 /// The `63Cx` status word carrying `tries` remaining in the low nibble of
