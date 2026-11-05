@@ -96,7 +96,7 @@ impl PivApplet {
         let Ok(der) = cert.to_der() else {
             return iso7816::Status::ConditionsOfUseNotSatisfied.into();
         };
-        Response::Data(der)
+        Response::from_vec(der)
     }
 }
 
@@ -359,7 +359,7 @@ mod tests {
         let first = applet.process(&apdu);
         let mut cert_data = Vec::new();
         cert_data.extend_from_slice(first.data());
-        let cert_sw = if first.status() >> 8 == 0x61 {
+        let cert_sw = if first.status().to_u16() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
             cert_data.extend_from_slice(remainder.data());
             remainder.status()
@@ -368,8 +368,9 @@ mod tests {
         };
         assert_eq!(
             cert_sw,
-            Status::Success.to_u16(),
-            "ATTEST answers 9000 (sw 0x{cert_sw:04x})"
+            Status::Success,
+            "ATTEST answers 9000 (sw 0x{:04x})",
+            cert_sw.to_u16()
         );
 
         // The host's own parser reads it back: the slot's P-256 point —
@@ -432,7 +433,7 @@ mod tests {
             let response = applet.process(&apdu);
             assert_eq!(
                 response.status(),
-                Status::IncorrectP1OrP2Parameter.to_u16(),
+                Status::IncorrectP1OrP2Parameter,
                 "ref {ref_:02X}"
             );
         }
@@ -445,9 +446,9 @@ mod tests {
         let response = applet.process(&apdu);
         assert_eq!(
             response.status(),
-            Status::IncorrectP1OrP2Parameter.to_u16(),
+            Status::IncorrectP1OrP2Parameter,
             "status {:02X} != {:02X}",
-            response.status(),
+            response.status().to_u16(),
             Status::IncorrectP1OrP2Parameter.to_u16(),
         );
     }
@@ -457,7 +458,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let apdu = keyroost_piv::attest(0x9A);
         let response = applet.process(&apdu);
-        assert_eq!(response.status(), keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        assert_eq!(response.status(), Status::KeyReferenceNotFound);
     }
 
     #[test]
@@ -472,13 +473,13 @@ mod tests {
             keyroost_piv::TouchPolicy::Default,
         );
         let response = applet.process(&apdu);
-        assert_eq!(response.status(), Status::Success.to_u16());
+        assert_eq!(response.status(), Status::Success);
         let announced = announced_point(&response);
         let apdu = keyroost_piv::attest(0x84);
         let first = applet.process(&apdu);
         let mut cert_data = Vec::new();
         cert_data.extend_from_slice(first.data());
-        let _cert_sw = if first.status() >> 8 == 0x61 {
+        let _cert_sw = if first.status().to_u16() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
             cert_data.extend_from_slice(remainder.data());
             remainder.status()
@@ -503,14 +504,14 @@ mod tests {
         let apdu = keyroost_piv::get_data(&[0x5F, 0xFF, 0x01]);
         let first = applet.process(&apdu);
         let mut data = Vec::from(first.data());
-        let cert_sw = if first.status() >> 8 == 0x61 {
+        let cert_sw = if first.status().to_u16() >> 8 == 0x61 {
             let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
             data.extend_from_slice(remainder.data());
             remainder.status()
         } else {
             first.status()
         };
-        assert_eq!(cert_sw, Status::Success.to_u16());
+        assert_eq!(cert_sw, Status::Success);
         let value = keyroost_piv::unwrap_data_object(&data).expect("a 53 template");
         let cert =
             x509_cert::Certificate::from_der(value).expect("is DER-encoded X509 certificate");

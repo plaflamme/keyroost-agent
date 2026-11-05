@@ -20,7 +20,7 @@ impl PivApplet {
         &mut self,
         _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        Response::Data(VERSION.to_vec())
+        Response::from_vec(VERSION.to_vec())
     }
 
     /// GET SERIAL (0xF8, Yubico extension): the card serial as four
@@ -34,7 +34,7 @@ impl PivApplet {
         &mut self,
         _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        Response::Data(self.serial.to_be_bytes().to_vec())
+        Response::from_vec(self.serial.to_be_bytes().to_vec())
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
@@ -67,7 +67,7 @@ impl PivApplet {
         command: &crate::apdu::CommandView<'_>,
     ) -> Response {
         if command.p1 != 0x00 {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         let body = match command.p2 {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
@@ -77,10 +77,10 @@ impl PivApplet {
                     Some(body) => body,
                     None => return iso7816::Status::KeyReferenceNotFound.into(),
                 },
-                None => return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
+                None => return iso7816::Status::IncorrectP1OrP2Parameter.into(),
             },
         };
-        Response::Data(body)
+        Response::from_vec(body)
     }
 
     /// The flat metadata TLVs of the occupied key slot at `index`;
@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::constants::{DEFAULT_PIN_TRIES, DEFAULT_PUK_TRIES, DEFAULT_SERIAL};
     use crate::general_auth::tests::mgmt_handshake;
+    use iso7816::Status;
     use keyroost_piv::{
         KeyAlg, PIN_REF_APPLICATION, PinPolicy, Slot, TouchPolicy, change_reference, generate_key,
         get_metadata, parse_metadata, parse_public_key, verify_pin,
@@ -166,7 +167,7 @@ mod tests {
         let resp = app.process(&get_metadata(reference));
         assert_eq!(
             resp.status(),
-            keyroost_piv::SW_OK,
+            Status::Success,
             "GET METADATA {reference:#04x}"
         );
         parse_metadata(resp.data()).expect("a well-formed metadata response")
@@ -189,7 +190,7 @@ mod tests {
         // The host's case-2 form: `00 FD 00 00 00`.
         let resp = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x00]);
         assert_eq!(resp.data(), [0x05, 0x07, 0x04]);
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), Status::Success);
     }
 
     #[test]
@@ -198,7 +199,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xFD, 0x00, 0x00]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported);
     }
 
     #[test]
@@ -207,7 +208,7 @@ mod tests {
         // The host's case-2 form: `00 F8 00 00 00`.
         let resp = applet.process(&[0x00, 0xF8, 0x00, 0x00, 0x00]);
         assert_eq!(resp.data(), [0x02, 0x40, 0x8A, 0x1B]);
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), Status::Success);
     }
 
     #[test]
@@ -216,7 +217,7 @@ mod tests {
         // Case 1: no `Le` at all.
         let resp = applet.process(&[0x00, 0xF8, 0x00, 0x00]);
         assert_eq!(resp.data(), DEFAULT_SERIAL.to_be_bytes().to_vec());
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), Status::Success);
     }
 
     #[test]
@@ -225,7 +226,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xF8, 0x00, 0x00]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported);
     }
 
     #[test]
@@ -234,7 +235,7 @@ mod tests {
         for reference in [0x9A, 0x9C, 0x9D, 0x9E, 0x82, 0x95u8] {
             let resp = applet.process(&get_metadata(reference));
             assert_eq!(resp.data(), Vec::new());
-            assert_eq!(resp.status(), keyroost_piv::SW_REFERENCE_NOT_FOUND);
+            assert_eq!(resp.status(), Status::KeyReferenceNotFound);
         }
     }
 
@@ -258,7 +259,7 @@ mod tests {
         let mut applet = PivApplet::new();
         // A wrong PIN burns one try.
         let resp = applet.process(&verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), 0x63C4);
+        assert_eq!(resp.status(), Status::RemainingRetries(4));
         let pin = metadata(&mut applet, 0x80);
         assert_eq!(
             pin.retries,
@@ -271,7 +272,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp =
             applet.process(&change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap());
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), Status::Success);
         let pin = metadata(&mut applet, 0x80);
         assert_eq!(pin.is_default, Some(false));
         assert_eq!(pin.retries, Some((DEFAULT_PIN_TRIES, DEFAULT_PIN_TRIES)));
@@ -286,7 +287,7 @@ mod tests {
             PinPolicy::Default,
             TouchPolicy::Default,
         ));
-        assert_eq!(generated.status(), keyroost_piv::SW_OK);
+        assert_eq!(generated.status(), Status::Success);
         let announced = match parse_public_key(generated.data()).expect("the announced public key")
         {
             keyroost_piv::PublicKey::Ecc { point } => point,
@@ -322,7 +323,7 @@ mod tests {
             PinPolicy::Default,
             TouchPolicy::Default,
         ));
-        assert_eq!(generated.status(), keyroost_piv::SW_OK);
+        assert_eq!(generated.status(), Status::Success);
         let announced = match parse_public_key(generated.data()).expect("the announced public key")
         {
             keyroost_piv::PublicKey::Ecc { point } => point,
@@ -347,7 +348,7 @@ mod tests {
             PinPolicy::Default,
             TouchPolicy::Default,
         ));
-        assert_eq!(generated.status(), keyroost_piv::SW_OK);
+        assert_eq!(generated.status(), Status::Success);
         let announced = match parse_public_key(generated.data()).expect("the announced public key")
         {
             keyroost_piv::PublicKey::Ecc { point } => point,
@@ -380,7 +381,7 @@ mod tests {
             PinPolicy::Once,
             TouchPolicy::Default,
         ));
-        assert_eq!(generated.status(), keyroost_piv::SW_OK);
+        assert_eq!(generated.status(), Status::Success);
         let md = metadata(&mut applet, 0x9A);
         assert_eq!(
             md.policy,
@@ -394,7 +395,7 @@ mod tests {
             PinPolicy::Always,
             TouchPolicy::Default,
         ));
-        assert_eq!(generated.status(), keyroost_piv::SW_OK);
+        assert_eq!(generated.status(), Status::Success);
         let md = metadata(&mut applet, 0x9A);
         assert_eq!(
             md.policy,
@@ -407,7 +408,7 @@ mod tests {
     fn metadata_of_an_imported_key_reports_origin_imported() {
         let mut applet = unlocked();
         let resp = applet.process(&imported_scalar_apdu(0x9E));
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), Status::Success);
         let md = metadata(&mut applet, 0x9E);
         assert_eq!(md.algorithm, Some(KeyAlg::EccP256.id()));
         assert_eq!(md.origin, Some(2));
@@ -418,10 +419,7 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x00, 0xF7, 0x01, 0x80]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(
-            resp.status(),
-            iso7816::Status::IncorrectP1OrP2Parameter.into()
-        );
+        assert_eq!(resp.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
@@ -430,10 +428,7 @@ mod tests {
         for reference in [0x00u8, 0x58, 0x9B, 0xF9, 0xE0, 0xE1] {
             let resp = applet.process(&get_metadata(reference));
             assert_eq!(resp.data(), Vec::new());
-            assert_eq!(
-                resp.status(),
-                iso7816::Status::IncorrectP1OrP2Parameter.into()
-            );
+            assert_eq!(resp.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         }
     }
 
@@ -443,6 +438,6 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x40, 0xF7, 0x00, 0x80]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
+        assert_eq!(resp.status(), iso7816::Status::ClaNotSupported);
     }
 }

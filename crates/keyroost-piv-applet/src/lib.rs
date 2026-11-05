@@ -71,55 +71,40 @@ use management::MgmtKey;
 use slot::{Slot, factory_slots};
 use state::Pin;
 
-use crate::yubico::YubicoInstruction;
-
-/// A card response: the data the applet returns plus the 2-byte ISO 7816-4
-/// status word that always terminates the answer.
-///
-/// This wraps the `Response` type from the iso7816 crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Response {
-    Data(Vec<u8>),
-    Status(Status),
-}
+#[derive(Debug)]
+struct Response(apdu_dispatch::Response);
 
 impl Response {
-    /// A success (`0x9000`) response carrying `data`.
-    #[must_use]
-    pub fn ok(data: Vec<u8>) -> Self {
-        Self::Data(data)
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn from_vec(data: Vec<u8>) -> Self {
+        Self(apdu_dispatch::Response::Data(
+            apdu_dispatch::response::Data::from_slice(data.as_slice()).unwrap(), // TODO: don't panic
+        ))
     }
 
-    /// A status-only response (no data).
-    #[must_use]
-    pub fn sw(sw: u16) -> Self {
-        Self::Status(Status::from_u16(sw))
-    }
-
-    /// Access the response data as a slice.
-    #[must_use]
-    pub fn data(&self) -> &[u8] {
-        match &self {
-            Response::Data(d) => d.as_slice(),
-            Response::Status(_) => &[],
+    #[allow(unused)]
+    pub(crate) fn data(&self) -> &[u8] {
+        match &self.0 {
+            iso7816::Response::Data(d) => d,
+            iso7816::Response::Status(_) => &[],
         }
     }
 
-    /// Access the status word as u16.
-    #[must_use]
-    pub fn status(&self) -> u16 {
-        match &self {
-            Response::Data(_) => 0x9000,
-            Response::Status(s) => s.to_u16(),
+    pub(crate) fn status(&self) -> Status {
+        match self.0 {
+            iso7816::Response::Data(_) => Status::Success,
+            iso7816::Response::Status(status) => status,
         }
     }
 }
 
-impl From<iso7816::Status> for Response {
-    fn from(value: iso7816::Status) -> Self {
-        Self::Status(value)
+impl From<Status> for Response {
+    fn from(value: Status) -> Self {
+        Self(apdu_dispatch::Response::Status(value))
     }
 }
+
+use crate::yubico::YubicoInstruction;
 
 /// A PIV applet instance: the card side of NIST SP 800-73-4.
 ///
@@ -194,9 +179,9 @@ impl apdu_app::App for PivApplet {
         apdu: apdu_app::CommandView<'_>,
         reply: &mut apdu_app::VecView<u8>,
     ) -> apdu_app::Result {
-        match self.process_command(&apdu) {
-            Response::Data(d) => reply.extend(d),
-            Response::Status(s) => return Err(s),
+        match self.process_command(&apdu).0 {
+            apdu_dispatch::Response::Data(d) => reply.extend(d),
+            apdu_dispatch::Response::Status(s) => return Err(s),
         }
         Ok(())
     }
@@ -299,7 +284,7 @@ impl PivApplet {
         // armed it. A successful PIN presentation is the one APDU that arms
         // it — and it must not consume the arm it just set: the arm survives
         // until the next command.
-        let armed_this_apdu = pin_presentation && response.status() == Status::Success.to_u16();
+        let armed_this_apdu = pin_presentation && response.status() == Status::Success;
         if !armed_this_apdu {
             self.pin_always_armed = false;
         }
@@ -309,6 +294,6 @@ impl PivApplet {
 
 /// The `63Cx` status word carrying `tries` remaining in the low nibble of
 /// the second byte — the form the host's `sw_tries_remaining` decodes.
-pub(crate) fn tries_sw(tries: u8) -> u16 {
-    0x63C0 | u16::from(tries)
+pub(crate) fn tries_sw(tries: u8) -> Status {
+    Status::RemainingRetries(tries)
 }

@@ -2,6 +2,8 @@
 //! management-key witness / challenge exchange and the one-shot per-slot
 //! ECDSA signing and ECDH key agreement of the NIST-curve slots.
 
+use iso7816::Status;
+
 use crate::constants::{
     GA_MAX_CHALLENGE, GA_TAG_CHALLENGE, GA_TAG_DYN_AUTH, GA_TAG_EXP, GA_TAG_RESPONSE,
     GA_TAG_WITNESS,
@@ -59,7 +61,7 @@ impl PivApplet {
             Some(index) => self.ga_slot(index, command.p1, command.data()),
             None => match command.p2 {
                 0x9B => self.ga_management(command.p1, command.data()),
-                _ => Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
+                _ => iso7816::Status::IncorrectP1OrP2Parameter.into(),
             },
         }
     }
@@ -72,22 +74,22 @@ impl PivApplet {
     /// under `82`.
     fn ga_slot(&self, index: usize, p1: u8, body: &[u8]) -> Response {
         if let Err(sw) = self.slot_pin_gate(&self.slots[index]) {
-            return Response::sw(sw);
+            return sw.into();
         }
         let Some(key) = self.slots[index].key.as_ref() else {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         if p1 != key.alg as u8 {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         let t = match parse_ga_template(body) {
             Ok(t) => t,
-            Err(sw) => return Response::sw(sw),
+            Err(sw) => return sw.into(),
         };
         // The one-shot slot shape: an empty `82` plus a single data
         // member. Anything else is a wrong member.
         if t.wanted != Some(GA_TAG_RESPONSE) || t.response.is_some() || t.witness.is_some() {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         match (t.challenge, t.exponent) {
             (Some(digest), None) => {
@@ -96,24 +98,24 @@ impl PivApplet {
                 // hash), the modulus size for RSA (the host's pre-encoded
                 // DigestInfo block).
                 let Some(size) = ga_sign_block_bytes(key.alg) else {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 };
                 if digest.len() != size {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 }
                 slot_sign(key, digest)
             }
             (None, Some(peer)) => {
                 // The peer must be an uncompressed point of the slot curve.
                 let Some(size) = ec_point_bytes(key.alg) else {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 };
                 if peer.len() != size {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 }
                 slot_ecdh(key, peer)
             }
-            _ => Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
+            _ => iso7816::Status::IncorrectP1OrP2Parameter.into(),
         }
     }
 
@@ -123,13 +125,13 @@ impl PivApplet {
     fn ga_management(&mut self, p1: u8, body: &[u8]) -> Response {
         let tmpl = match parse_ga_template(body) {
             Ok(t) => t,
-            Err(sw) => return Response::sw(sw),
+            Err(sw) => return sw.into(),
         };
         match MgmtAlg::from_u8(p1) {
             Some(alg) => self.ga_sym(alg, &tmpl),
             // Asymmetric (or unknown) algorithm: no key slot, so no
             // exchange — the reference fails on the missing key.
-            None => Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
+            None => iso7816::Status::IncorrectP1OrP2Parameter.into(),
         }
     }
 
@@ -137,7 +139,7 @@ impl PivApplet {
     /// `processGenAuthSym`), once the template is parsed.
     fn ga_sym(&mut self, alg: MgmtAlg, t: &GaTemplate) -> Response {
         if self.mgmt.alg() != alg {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         let bs = alg.block_size();
         // The witness flow is the only supported symmetric exchange: a
@@ -148,31 +150,31 @@ impl PivApplet {
         // forge the witness, a wanted `81` hands the clear challenge to
         // whoever holds it — so they are refused.
         if t.response.is_some() {
-            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         match (t.wanted, t.witness, t.challenge) {
             (Some(GA_TAG_WITNESS), None, None) => {
                 let enc = self.mgmt.issue();
-                Response::ok(ga_response(GA_TAG_WITNESS, &enc))
+                ga_response(GA_TAG_WITNESS, &enc)
             }
             (None, Some(w), host_chal) => {
                 if w.len() != bs {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 }
                 if host_chal.is_some_and(|hc| {
                     hc.is_empty() || hc.len() > GA_MAX_CHALLENGE || hc.len() % bs != 0
                 }) {
-                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+                    return iso7816::Status::IncorrectDataParameter.into();
                 }
                 match self.mgmt.check(w, host_chal) {
-                    Ok(resp) => Response::ok(match resp {
+                    Ok(resp) => match resp {
                         Some(enc) => ga_response(GA_TAG_RESPONSE, &enc),
-                        None => Vec::new(),
-                    }),
-                    Err(_) => Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+                        None => Status::Success.into(),
+                    },
+                    Err(_) => iso7816::Status::IncorrectDataParameter.into(),
                 }
             }
-            _ => Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
+            _ => iso7816::Status::IncorrectP1OrP2Parameter.into(),
         }
     }
 }
@@ -226,7 +228,7 @@ fn slot_sign(key: &SlotKey, digest: &[u8]) -> Response {
         KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
             slot_rsa_raw(key, digest)
         }
-        _ => Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+        _ => iso7816::Status::IncorrectDataParameter.into(),
     }
 }
 
@@ -247,18 +249,18 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     use rsa::traits::PublicKeyParts;
 
     let Ok(key) = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let n = key.n().to_bytes_be();
     if block.len() != n.len() {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     }
     let c = BigUint::from_bytes_be(block);
     if &c >= key.n() {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     }
     let Ok(m) = rsa_decrypt::<rsa::rand_core::OsRng>(None, &key, &c) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
 
     // Zero-extend the residue to the full modulus size.
@@ -266,7 +268,7 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
     let mut out = vec![0u8; n.len()];
     let offset = n.len() - m_be.len();
     out[offset..].copy_from_slice(&m_be);
-    Response::ok(ga_response(GA_TAG_RESPONSE, &out))
+    ga_response(GA_TAG_RESPONSE, &out)
 }
 
 /// The ECDSA half for one curve: the `32`/`48`/`66`-byte scalar is the
@@ -274,28 +276,28 @@ fn slot_rsa_raw(key: &SlotKey, block: &[u8]) -> Response {
 fn sign_p256(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
     let Ok(signing) = ecdsa::SigningKey::<p256::NistP256>::from_slice(&key.secret[..32]) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     // The annotation pins the `Signature<C>` impl: with the `der` feature
     // the `PrehashSigner` impl for `der::Signature<C>` is also in scope.
     let sig: ecdsa::Signature<p256::NistP256> = match signing.sign_prehash(digest) {
         Ok(sig) => sig,
-        Err(_) => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+        Err(_) => return iso7816::Status::IncorrectDataParameter.into(),
     };
-    Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
+    ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes())
 }
 
 /// The ECDSA half for P-384 (the host hashes with SHA-384).
 fn sign_p384(key: &SlotKey, digest: &[u8]) -> Response {
     use ecdsa::signature::hazmat::PrehashSigner;
     let Ok(signing) = ecdsa::SigningKey::<p384::NistP384>::from_slice(&key.secret[..48]) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let sig: ecdsa::Signature<p384::NistP384> = match signing.sign_prehash(digest) {
         Ok(sig) => sig,
-        Err(_) => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+        Err(_) => return iso7816::Status::IncorrectDataParameter.into(),
     };
-    Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
+    ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes())
 }
 
 /// The ECDSA half for P-521 (the host hashes with SHA-512).
@@ -305,13 +307,13 @@ fn sign_p521(key: &SlotKey, digest: &[u8]) -> Response {
     // bounds (no `DigestPrimitive` impl), so the curve's own key type
     // signs instead — the same `PrehashSigner` trait.
     let Ok(signing) = p521::ecdsa::SigningKey::from_slice(&key.secret[..]) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let sig: ecdsa::Signature<p521::NistP521> = match signing.sign_prehash(digest) {
         Ok(sig) => sig,
-        Err(_) => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+        Err(_) => return iso7816::Status::IncorrectDataParameter.into(),
     };
-    Response::ok(ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes()))
+    ga_response(GA_TAG_RESPONSE, sig.to_der().as_bytes())
 }
 
 /// The ECDH half of the slot GA: the peer's uncompressed point is checked
@@ -323,7 +325,7 @@ fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
         KeyAlg::EccP256 => ecdh_p256(key, peer),
         KeyAlg::EccP384 => ecdh_p384(key, peer),
         KeyAlg::EccP521 => ecdh_p521(key, peer),
-        _ => Response::sw(iso7816::Status::IncorrectDataParameter.into()),
+        _ => iso7816::Status::IncorrectDataParameter.into(),
     }
 }
 
@@ -333,39 +335,39 @@ fn slot_ecdh(key: &SlotKey, peer: &[u8]) -> Response {
 fn ecdh_p256(key: &SlotKey, peer: &[u8]) -> Response {
     let Ok(secret) = elliptic_curve::SecretKey::<p256::NistP256>::from_slice(&key.secret[..32])
     else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let Ok(peer) = elliptic_curve::PublicKey::<p256::NistP256>::from_sec1_bytes(peer) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-    Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
+    ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes())
 }
 
 /// The ECDH half for P-384: the shared secret is the 48-byte x-coordinate.
 fn ecdh_p384(key: &SlotKey, peer: &[u8]) -> Response {
     let Ok(secret) = elliptic_curve::SecretKey::<p384::NistP384>::from_slice(&key.secret[..48])
     else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let Ok(peer) = elliptic_curve::PublicKey::<p384::NistP384>::from_sec1_bytes(peer) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-    Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
+    ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes())
 }
 
 /// The ECDH half for P-521: the shared secret is the 66-byte x-coordinate.
 fn ecdh_p521(key: &SlotKey, peer: &[u8]) -> Response {
     let Ok(secret) = elliptic_curve::SecretKey::<p521::NistP521>::from_slice(&key.secret[..])
     else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let Ok(peer) = elliptic_curve::PublicKey::<p521::NistP521>::from_sec1_bytes(peer) else {
-        return Response::sw(iso7816::Status::IncorrectDataParameter.into());
+        return iso7816::Status::IncorrectDataParameter.into();
     };
     let shared = elliptic_curve::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-    Response::ok(ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes()))
+    ga_response(GA_TAG_RESPONSE, shared.raw_secret_bytes())
 }
 
 /// One parsed SP 800-73-4 dynamic-auth template: the empty member the host
@@ -387,7 +389,7 @@ struct GaTemplate<'a> {
 
 /// Build the card's GA answer: the `7C` wrapper around one tagged value.
 #[allow(clippy::cast_possible_truncation)]
-fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
+fn ga_response(tag: u8, value: &[u8]) -> Response {
     fn length(data: &mut Vec<u8>, len: usize) {
         if len <= 127 {
             data.push(len as u8);
@@ -406,7 +408,7 @@ fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut data = vec![GA_TAG_DYN_AUTH];
     length(&mut data, inner.len());
     data.extend_from_slice(&inner);
-    data
+    Response::from_vec(data)
 }
 
 /// Parse the GA body as the card's dispatcher does: the `7C` wrapper (with
@@ -415,16 +417,16 @@ fn ga_response(tag: u8, value: &[u8]) -> Vec<u8> {
 /// length. `6B00` on a structurally broken template (truncated lengths,
 /// underrun), `6A86` on a protocol violation (two empty tags, an unknown or
 /// non-80/81/82 empty tag).
-fn parse_ga_template(body: &[u8]) -> Result<GaTemplate<'_>, u16> {
+fn parse_ga_template(body: &[u8]) -> Result<GaTemplate<'_>, Status> {
     let Some((&outer, rest)) = body.split_first() else {
-        return Err(iso7816::Status::IncorrectDataParameter.into());
+        return Err(iso7816::Status::IncorrectDataParameter);
     };
     if outer != GA_TAG_DYN_AUTH {
-        return Err(iso7816::Status::IncorrectDataParameter.into());
+        return Err(iso7816::Status::IncorrectDataParameter);
     }
     let (declared, after_header) = read_tlv_length(rest)?;
     if rest.len() < after_header + declared {
-        return Err(iso7816::Status::IncorrectDataParameter.into());
+        return Err(iso7816::Status::IncorrectDataParameter);
     }
     let mut t = GaTemplate::default();
     // The scan region: everything after the 7C header — the reference's
@@ -436,18 +438,18 @@ fn parse_ga_template(body: &[u8]) -> Result<GaTemplate<'_>, u16> {
         let (tlen, thdr) = read_tlv_length(r1)?;
         let value_end = thdr + tlen;
         if r1.len() < value_end {
-            return Err(iso7816::Status::IncorrectP1OrP2Parameter.into());
+            return Err(iso7816::Status::IncorrectP1OrP2Parameter);
         }
         let value = &r1[thdr..value_end];
         if tlen == 0 {
             if t.wanted.is_some() {
-                return Err(iso7816::Status::IncorrectDataParameter.into());
+                return Err(iso7816::Status::IncorrectDataParameter);
             }
             match tag {
                 GA_TAG_WITNESS | GA_TAG_CHALLENGE | GA_TAG_RESPONSE => {
                     t.wanted = Some(tag);
                 }
-                _ => return Err(iso7816::Status::IncorrectDataParameter.into()),
+                _ => return Err(iso7816::Status::IncorrectDataParameter),
             }
         } else {
             match tag {
@@ -471,7 +473,7 @@ fn parse_ga_template(body: &[u8]) -> Result<GaTemplate<'_>, u16> {
                         t.exponent = Some(value);
                     }
                 }
-                _ => return Err(iso7816::Status::IncorrectDataParameter.into()),
+                _ => return Err(iso7816::Status::IncorrectDataParameter),
             }
         }
         rest = &r1[value_end..];
@@ -547,11 +549,7 @@ pub(crate) mod tests {
     pub(crate) fn mgmt_handshake(applet: &mut PivApplet) -> (Vec<u8>, [u8; 8]) {
         // Step 1 (general_auth_request_witness): 7C 02 80 00.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "witness round: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "witness round: {r:?}");
         assert_eq!(r.data()[0], 0x7C);
         // The 7C wraps tag + length + 8-byte value: 2 + 8.
         assert_eq!(r.data()[1], 10);
@@ -568,11 +566,7 @@ pub(crate) mod tests {
         members.extend_from_slice(&[0x81, 0x08]);
         members.extend_from_slice(&challenge);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&members])));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "mutual round: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "mutual round: {r:?}");
         assert_eq!(r.data()[0], 0x7C);
         assert_eq!(r.data()[2], 0x82);
         assert_eq!(r.data()[3], 8);
@@ -600,10 +594,10 @@ pub(crate) mod tests {
     fn ga_witness_round_answers_an_encrypted_challenge() {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.status(), iso7816::Status::Success.into());
+        assert_eq!(r1.status(), iso7816::Status::Success);
         assert_eq!(r1.data().len(), 12);
         let r2 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r2.status(), iso7816::Status::Success.into());
+        assert_eq!(r2.status(), iso7816::Status::Success);
         // A fresh challenge every time — the witnesses differ.
         assert_ne!(&r1.data()[4..12], &r2.data()[4..12]);
     }
@@ -634,17 +628,17 @@ pub(crate) mod tests {
         let r = applet.process(&apdu);
         assert_eq!(
             r.status(),
-            iso7816::Status::Success.into(),
+            iso7816::Status::Success,
             "unlocked session: {r:?}"
         );
         // A witness request re-locks the slot (issue() clears the flag)...
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), iso7816::Status::Success.into());
+        assert_eq!(r.status(), iso7816::Status::Success);
         // ...so the same write now fails until a full mutual auth again.
         let r = applet.process(&apdu);
         assert_eq!(
             r.status(),
-            iso7816::Status::SecurityStatusNotSatisfied.into(),
+            iso7816::Status::SecurityStatusNotSatisfied,
             "re-locked: {r:?}"
         );
     }
@@ -659,7 +653,7 @@ pub(crate) mod tests {
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         // After a handshake the answer is the same — the shape, not the
         // state, is what is refused.
         mgmt_handshake(&mut applet);
@@ -667,25 +661,25 @@ pub(crate) mod tests {
             0x03,
             &ga_body(&[&[0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7]]),
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
     fn ga_wrong_witness_is_wrong_data_and_consumes_the_challenge() {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.status(), iso7816::Status::Success.into());
+        assert_eq!(r1.status(), iso7816::Status::Success);
         // A corrupted witness — the applet's challenge is consumed.
         let mut bad = vec![0x80, 0x08];
         bad.extend_from_slice(&r1.data()[4..12]);
         bad[2] ^= 1;
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&bad])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // The real witness no longer verifies — the challenge is gone.
         let mut good = vec![0x80, 0x08];
         good.extend_from_slice(&r1.data()[4..12]);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&good])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -693,13 +687,13 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         let r1 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
         let r2 = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r1.status(), iso7816::Status::Success.into());
-        assert_eq!(r2.status(), iso7816::Status::Success.into());
+        assert_eq!(r1.status(), iso7816::Status::Success);
+        assert_eq!(r2.status(), iso7816::Status::Success);
         // Presenting the first witness fails — the second issued it away.
         let mut body = vec![0x80, 0x08];
         body.extend_from_slice(&r1.data()[4..12]);
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&body])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -709,7 +703,7 @@ pub(crate) mod tests {
         // ciphertext proves nothing, so its length is never even looked at.
         let body = ga_body(&[&[0x82, 4, 0, 1, 2, 3]]);
         let r = applet.process(&ga_apdu(0x03, &body));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
@@ -717,12 +711,12 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // The applet is 3DES; P1 = AES-256 is not its algorithm.
         let r = applet.process(&ga_apdu(0x0C, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         // And an asymmetric P1 with a signing-shaped body too.
         let mut members = vec![0x81, 0x08, 0, 1, 2, 3, 4, 5, 6, 7];
         members.extend_from_slice(&[0x82, 0x00]);
         let r = applet.process(&ga_apdu(0x14, &ga_body(&[&members])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
@@ -731,36 +725,30 @@ pub(crate) mod tests {
         // Non-slot P2s: `6B00` outright.
         for p2 in [0x58u8, 0x00u8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+            assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         }
         // 9E is a slot (factory NEVER) — ungated, refused for the missing
         // key.
         let r = applet.process(&ga_apdu_for_p2(0x9E));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         // 9A/9C/9D and the retired slots: PIN-gated — locked first.
         for p2 in [0x9Au8, 0x9Cu8, 0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(
-                r.status(),
-                iso7816::Status::SecurityStatusNotSatisfied.into()
-            );
+            assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
         }
         // After the PIN is verified the applet has no key material for
         // them. The ONCE slots pass on the session flag; the ALWAYS latch
         // is consumed by the first slot APDU, so the 9C GA that does not
         // follow the VERIFY is gated again.
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.status(), iso7816::Status::Success.into());
+        assert_eq!(r.status(), iso7816::Status::Success);
         let r = applet.process(&ga_apdu_for_p2(0x9A));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         let r = applet.process(&ga_apdu_for_p2(0x9C));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::SecurityStatusNotSatisfied.into()
-        );
+        assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
         for p2 in [0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+            assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         }
     }
 
@@ -774,24 +762,24 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // Lc overrunning the APDU.
         let r = applet.process(&[0x00, 0x87, 0x03, KEY_REF_MANAGEMENT, 0x08, 0x7C, 0x00]);
-        assert_eq!(r.status(), iso7816::Status::WrongLength.to_u16());
+        assert_eq!(r.status(), iso7816::Status::WrongLength);
         // No 7C wrapper at all.
         let r = applet.process(&ga_apdu(0x03, &[0x80, 0x00]));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // Two empty tags.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00], &[0x81, 0x00]])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // An unknown empty tag.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x85, 0x00]])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // A member that overruns the body.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x81, 0x08, 0, 1, 2]])));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
         // The 7C wrapper's length underdeclared: the scan still runs to the
         // end of the body — here to a second empty tag, a protocol error.
         let body = vec![0x7C, 0x02, 0x80, 0x00, 0x81, 0x00];
         let r = applet.process(&ga_apdu(0x03, &body));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -800,7 +788,7 @@ pub(crate) mod tests {
         let mut apdu = ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]]));
         apdu[0] = 0x80;
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), iso7816::Status::ClaNotSupported.to_u16());
+        assert_eq!(r.status(), iso7816::Status::ClaNotSupported);
     }
 
     /// Management unlock plus a key of `alg` in `slot`; returns the
@@ -817,11 +805,7 @@ pub(crate) mod tests {
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "GENERATE: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "GENERATE: {r:?}");
         match keyroost_piv::parse_public_key(r.data()).expect("a well-formed public-key template") {
             keyroost_piv::PublicKey::Ecc { point } => point,
             keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
@@ -847,11 +831,7 @@ pub(crate) mod tests {
             key_ref,
             digest,
         ));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "signing GA: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "signing GA: {r:?}");
         let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point).expect("the announced point");
         let sig = p256::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
@@ -866,7 +846,7 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         card_signature(&mut applet, 0x9A, &point, &[0x2B; 32]);
     }
@@ -883,7 +863,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             r.status(),
-            iso7816::Status::Success.into(),
+            iso7816::Status::Success,
             "key agree(ment GA: {r:?}"
         );
         let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
@@ -906,7 +886,7 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         let digest = [0x2C; 48];
         let r = applet.process(&keyroost_piv::general_auth_sign(
@@ -914,11 +894,7 @@ pub(crate) mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "signing GA: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "signing GA: {r:?}");
         let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("the announced point");
@@ -939,7 +915,7 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         // The host hashes the TBS with SHA-512: a 64-byte digest, two bytes
         // short of the 66-byte field -- the applet accepts it as-is.
@@ -949,11 +925,7 @@ pub(crate) mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "signing GA: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "signing GA: {r:?}");
         let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         use p521::ecdsa::signature::hazmat::PrehashVerifier;
         let vk = p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("the announced point");
@@ -977,7 +949,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             r.status(),
-            iso7816::Status::Success.into(),
+            iso7816::Status::Success,
             "key agreement GA: {r:?}"
         );
         let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
@@ -1006,7 +978,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             r.status(),
-            iso7816::Status::Success.into(),
+            iso7816::Status::Success,
             "key agreement GA: {r:?}"
         );
         let z = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
@@ -1027,28 +999,26 @@ pub(crate) mod tests {
     //         0x9C,
     //         &digest,
     //     ));
-    //     assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied.into());
+    //     assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
     //     // A VERIFY followed by another APDU consumes the latch: gated again.
     //     assert_eq!(
     //         applet
     //             .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-    //             .status(),
-    //         iso7816::Status::Success.into()
+    //             .status(), iso7816::Status::Success
     //     );
-    //     assert_eq!(applet.process(&keyroost_piv::select_full()).status(), iso7816::Status::Success.into());
+    //     assert_eq!(applet.process(&keyroost_piv::select_full()).status(), iso7816::Status::Success);
     //     let r = applet.process(&keyroost_piv::general_auth_sign(
     //         keyroost_piv::KeyAlg::EccP256.id(),
     //         0x9C,
     //         &digest,
     //     ));
-    //     assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied.into());
+    //     assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
     //     // A VERIFY immediately followed by the GA: the signature verifies
     //     // under the announced point.
     //     assert_eq!(
     //         applet
     //             .process(&keyroost_piv::verify_pin(b"123456").unwrap())
-    //             .status(),
-    //         iso7816::Status::Success.into()
+    //             .status(), iso7816::Status::Success
     //     );
     //     card_signature(&mut applet, 0x9C, &point, &digest);
     // }
@@ -1060,14 +1030,14 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
             keyroost_piv::KeyAlg::EccP384.id(),
             0x9A,
             &[0x2B; 32],
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
@@ -1099,11 +1069,7 @@ pub(crate) mod tests {
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "GENERATE: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "GENERATE: {r:?}");
         let (n, e) = match keyroost_piv::parse_public_key(r.data()).expect("a template") {
             keyroost_piv::PublicKey::Rsa { modulus, exponent } => (modulus, exponent),
             keyroost_piv::PublicKey::Ecc { .. } => panic!("expected an RSA modulus"),
@@ -1112,11 +1078,7 @@ pub(crate) mod tests {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = 0x2B;
         let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &block));
-        assert_eq!(
-            r.status(),
-            iso7816::Status::Success.into(),
-            "signing GA: {r:?}"
-        );
+        assert_eq!(r.status(), iso7816::Status::Success, "signing GA: {r:?}");
         let s = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(
             s.len(),
@@ -1136,10 +1098,10 @@ pub(crate) mod tests {
             0x9E,
             &block[..block.len() - 1],
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // A block >= n is not a valid residue.
         let r = applet.process(&keyroost_piv::general_auth_sign(alg.id(), 0x9E, &n));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -1150,7 +1112,7 @@ pub(crate) mod tests {
             0xF9,
             &[0x2B; 32],
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
@@ -1161,14 +1123,14 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         let r = applet.process(&keyroost_piv::general_auth_sign(
             keyroost_piv::KeyAlg::EccP256.id(),
             0x9A,
             &[0x2B; 20],
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -1181,7 +1143,7 @@ pub(crate) mod tests {
             0x9E,
             &[0x04; 64],
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // 65 bytes but off the curve.
         let mut off_curve = [0x11; 65];
         off_curve[0] = 0x04;
@@ -1190,7 +1152,7 @@ pub(crate) mod tests {
             0x9E,
             &off_curve,
         ));
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
     }
 
     #[test]
@@ -1201,7 +1163,7 @@ pub(crate) mod tests {
             applet
                 .process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            iso7816::Status::Success.into()
+            iso7816::Status::Success
         );
         let digest = [0x2B; 32];
         // A non-empty 82 member: not the one-shot slot shape.
@@ -1222,7 +1184,7 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&body);
         apdu.push(0x00);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // Both an 81 and an 85 member: not the one-shot slot shape.
         let mut body = vec![0x7C, 3 + 34 + 2 + 65, 0x81, 0x20];
         body.extend_from_slice(&digest);
@@ -1232,11 +1194,11 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&body);
         apdu.push(0x00);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter);
         // A lone empty 82 (no data member at all): not the one-shot slot
         // shape.
         let r = applet.process(&[0x00, 0x87, 0x11, 0x9A, 0x04, 0x7C, 0x02, 0x82, 0x00, 0x00]);
-        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
 
     #[test]
