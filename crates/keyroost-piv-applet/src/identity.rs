@@ -1,7 +1,7 @@
 //! GET VERSION (0xFD), GET SERIAL (0xF8) and GET METADATA (0xF7): the
 //! read-only Yubico extension commands.
 
-use crate::constants::{DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, SW_INCORRECT_P1P2, VERSION};
+use crate::constants::{DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, VERSION};
 use crate::piv::TouchPolicy;
 use crate::slot::{factory_pin_policy, slot_index};
 use crate::state::Pin;
@@ -43,7 +43,7 @@ impl PivApplet {
     /// The host's case-1 form (`00 F7 00 <ref>`, no body, no `Le`) asks for
     /// the reference's metadata; a case-2 `Le` re-enters the usual `61xx` /
     /// GET RESPONSE continuation. P1 must be `0x00` (the host builder always
-    /// sends `0x00` — R4: anything else is [`SW_INCORRECT_P1P2`]).
+    /// sends `0x00` — R4: anything else is [`iso7816::Status::IncorrectP1OrP2Parameter.into()`]).
     ///
     /// A key reference (`9A`/`9C`/`9D`/`9E`, retired `1..=20`) whose slot is
     /// empty answers [`SW_REFERENCE_NOT_FOUND`]; an occupied slot answers the
@@ -67,7 +67,7 @@ impl PivApplet {
         command: &crate::apdu::CommandView<'_>,
     ) -> Response {
         if command.p1 != 0x00 {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
         let body = match command.p2 {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
@@ -77,7 +77,7 @@ impl PivApplet {
                     Some(body) => body,
                     None => return iso7816::Status::KeyReferenceNotFound.into(),
                 },
-                None => return Response::sw(SW_INCORRECT_P1P2),
+                None => return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
             },
         };
         Response::Data(body)
@@ -418,7 +418,10 @@ mod tests {
         let mut applet = PivApplet::new();
         let resp = applet.process(&[0x00, 0xF7, 0x01, 0x80]);
         assert_eq!(resp.data(), Vec::new());
-        assert_eq!(resp.status(), SW_INCORRECT_P1P2);
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
+        );
     }
 
     #[test]
@@ -427,7 +430,10 @@ mod tests {
         for reference in [0x00u8, 0x58, 0x9B, 0xF9, 0xE0, 0xE1] {
             let resp = applet.process(&get_metadata(reference));
             assert_eq!(resp.data(), Vec::new());
-            assert_eq!(resp.status(), SW_INCORRECT_P1P2);
+            assert_eq!(
+                resp.status(),
+                iso7816::Status::IncorrectP1OrP2Parameter.into()
+            );
         }
     }
 

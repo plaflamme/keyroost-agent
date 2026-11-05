@@ -64,10 +64,7 @@ mod yubico;
 pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, VERSION};
 
 use attest::Attestation;
-use constants::{
-    DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
-    SW_INS_NOT_SUPPORTED, SW_OK,
-};
+use constants::{DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE};
 use data::PivData;
 use iso7816::{Instruction, response::Status};
 use management::MgmtKey;
@@ -281,8 +278,8 @@ impl PivApplet {
             Instruction::PutData => self.process_put_data(command),
             Instruction::ChangeReferenceData => self.process_change_reference(command),
             Instruction::ResetRetryCounter => self.process_reset_retry_counter(command),
-            Instruction::ReadBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
-            Instruction::WriteBinary => Response::sw(SW_INS_NOT_SUPPORTED), // TODO
+            Instruction::ReadBinary => Status::InstructionNotSupportedOrInvalid.into(), // TODO
+            Instruction::WriteBinary => Status::InstructionNotSupportedOrInvalid.into(), // TODO
             Instruction::Unknown(code) if let Some(yi) = YubicoInstruction::from_code(code) => {
                 match yi {
                     YubicoInstruction::GetVersion => self.process_get_version(command),
@@ -296,13 +293,13 @@ impl PivApplet {
                     YubicoInstruction::Attest => self.process_attest(command),
                 }
             }
-            Instruction::Unknown(_code) => Response::sw(SW_INS_NOT_SUPPORTED),
+            Instruction::Unknown(_code) => Status::InstructionNotSupportedOrInvalid.into(),
         };
         // The PIN/ALWAYS latch is consumed by the APDU after the one that
         // armed it. A successful PIN presentation is the one APDU that arms
         // it — and it must not consume the arm it just set: the arm survives
         // until the next command.
-        let armed_this_apdu = pin_presentation && response.status() == SW_OK;
+        let armed_this_apdu = pin_presentation && response.status() == Status::Success.to_u16();
         if !armed_this_apdu {
             self.pin_always_armed = false;
         }

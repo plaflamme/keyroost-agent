@@ -4,8 +4,6 @@
 
 use crate::constants::{
     DEFAULT_MGMT_KEY, DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE,
-    SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED,
-    SW_WRONG_DATA,
 };
 use crate::piv::MgmtAlg;
 use crate::{Pin, PivApplet, Response};
@@ -27,7 +25,7 @@ pub(crate) enum GaState {
     Unlocked,
 }
 
-/// Why a GA check could not complete — both surface as `SW_WRONG_DATA`.
+/// Why a GA check could not complete — both surface as `iso7816::Status::IncorrectDataParameter.into()`.
 pub(crate) enum GaError {
     /// No challenge was pending — the check neither unlocked nor consumed.
     NoPendingChallenge,
@@ -192,29 +190,29 @@ impl PivApplet {
         command: &crate::apdu::CommandView<'_>,
     ) -> Response {
         if command.p1 != 0xFF || command.p2 != 0xFF {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
         if !self.mgmt.unlocked() {
-            return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
+            return Response::sw(iso7816::Status::SecurityStatusNotSatisfied.into());
         }
         let body = command.data();
         if body.len() < 4 {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         }
         let key_len = usize::from(body[2]);
         if body.len() < key_len + 3 {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         }
         if body[1] != KEY_REF_MANAGEMENT {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         }
         let alg = match MgmtAlg::from_u8(body[0]) {
             Some(alg) if alg.key_len() == key_len => alg,
-            _ => return Response::sw(SW_WRONG_DATA),
+            _ => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
         };
         let key = &body[3..3 + key_len];
         self.mgmt.set_key(alg, key);
-        Response::sw(SW_OK)
+        Response::sw(iso7816::Status::Success.into())
     }
 
     /// SET PIN RETRIES (0xFA, Yubico extension): set the PIN and PUK retry
@@ -232,14 +230,14 @@ impl PivApplet {
         command: &crate::apdu::CommandView<'_>,
     ) -> Response {
         if !self.mgmt.unlocked() {
-            return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
+            return Response::sw(iso7816::Status::SecurityStatusNotSatisfied.into());
         }
         if !self.pin.verified {
-            return Response::sw(SW_SECURITY_STATUS_NOT_SATISFIED);
+            return Response::sw(iso7816::Status::SecurityStatusNotSatisfied.into());
         }
         self.pin = Pin::factory(DEFAULT_PIN_VALUE, command.p1);
         self.puk = Pin::factory(DEFAULT_PUK_VALUE, command.p2);
-        Response::sw(SW_OK)
+        Response::sw(iso7816::Status::Success.into())
     }
 
     /// RESET (0xFB, Yubico extension): factory-reset the applet; allowed
@@ -259,12 +257,12 @@ impl PivApplet {
             // Yubico's documented answer for this precondition is 6985
             // (conditions of use not satisfied); the host only recognises
             // 6982/6983/6985 as "block the PIN and PUK first".
-            return Response::sw(SW_CONDITIONS_NOT_SATISFIED);
+            return Response::sw(iso7816::Status::ConditionsOfUseNotSatisfied.into());
         }
         self.mgmt.set_key(MgmtAlg::TripleDes, &DEFAULT_MGMT_KEY);
         self.pin = Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES);
         self.puk = Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES);
-        Response::sw(SW_OK)
+        Response::sw(iso7816::Status::Success.into())
     }
 }
 
@@ -283,7 +281,10 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, 3];
         apdu.extend_from_slice(&[0x0C, KEY_REF_MANAGEMENT, 0x20]);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::SecurityStatusNotSatisfied.into()
+        );
         // A handshake with the unchanged factory key still works.
         mgmt_handshake(&mut applet);
     }
@@ -294,7 +295,7 @@ pub(crate) mod tests {
         mgmt_handshake(&mut applet);
         let apdu = [0x00u8, 0xFF, 0x00, 0x00, 0];
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
     }
 
     #[test]
@@ -307,13 +308,13 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         // The old algorithm is gone.
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
         // The new algorithm answers a 16-byte witness.
         let r = applet.process(&ga_apdu(0x0C, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         assert_eq!(r.data()[1], 18);
         assert_eq!(r.data()[3], 16);
         assert_eq!(r.data().len(), 20);
@@ -328,32 +329,38 @@ pub(crate) mod tests {
         apdu.extend_from_slice(&[0x03, 0x58, 0x18]);
         apdu.extend_from_slice(&[0x00u8; 24]);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_WRONG_DATA);
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
         // A declared key length the algorithm does not take.
         let mut body = vec![0x03, KEY_REF_MANAGEMENT, 0x10];
         body.extend_from_slice(&[0x00u8; 16]);
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_WRONG_DATA);
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
         // A body shorter than the header: `lc < 4` in the reference.
         let r = applet.process(&[0x00, 0xFF, 0xFF, 0xFF, 0x03, 0x03, KEY_REF_MANAGEMENT, 0x18]);
-        assert_eq!(r.status(), SW_WRONG_DATA);
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.into());
     }
 
     #[test]
     fn set_pin_retries_needs_the_unlocked_session_and_verified_pin() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFA, 0x08, 0x08]);
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::SecurityStatusNotSatisfied.into()
+        );
         mgmt_handshake(&mut applet);
         // Unlocked but the PIN is not verified yet.
         let r = applet.process(&[0x00, 0xFA, 0x08, 0x08]);
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::SecurityStatusNotSatisfied.into()
+        );
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let r = applet.process(&[0x00, 0xFA, 0x01, 0x05]);
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         // The counters are set and the values reset to the factory defaults:
         // one PIN try left, and a wrong PIN burns it (blocking the counter).
         let r = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
@@ -369,18 +376,24 @@ pub(crate) mod tests {
     fn reset_needs_both_counters_blocked() {
         let mut applet = PivApplet::new();
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::ConditionsOfUseNotSatisfied.into()
+        );
         block_pin(&mut applet);
         // PIN blocked, PUK not.
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::ConditionsOfUseNotSatisfied.into()
+        );
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         // Factory state: PIN and PUK restored, management key back to the
         // Yubico 3DES default.
         let r = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         mgmt_handshake(&mut applet);
     }
 
@@ -394,16 +407,16 @@ pub(crate) mod tests {
         let mut apdu = vec![0x00, 0xFF, 0xFF, 0xFF, body.len() as u8];
         apdu.extend_from_slice(&body);
         let r = applet.process(&apdu);
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         block_pin(&mut applet);
         block_puk(&mut applet);
         let r = applet.process(&[0x00, 0xFB, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         // The AES-128 key is gone — the factory 3DES one answers again.
         let r = applet.process(&ga_apdu(0x08, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
         let r = applet.process(&ga_apdu(0x03, &ga_body(&[&[0x80, 0x00]])));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         assert_eq!(r.data()[3], 8);
     }
 }

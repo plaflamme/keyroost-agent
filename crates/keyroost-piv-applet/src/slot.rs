@@ -14,11 +14,11 @@
 //! key itself and its certificate data object. The two gates:
 //!
 //! - [`PivApplet::management_unlocked`] — the 9B session must be unlocked
-//!   ([`SW_SECURITY_NOT_SATISFIED`] otherwise); a read-only consultation
+//!   ([`iso7816::Status::SecurityStatusNotSatisfied`] otherwise); a read-only consultation
 //!   of the management state, not a second challenge.
 //! - [`PivApplet::slot_pin_gate`] — the slot's PIN policy, enforced with
 //!   the session's `pin.verified` flag and the [`PivApplet::pin_always_armed`]
-//!   latch; [`SW_SECURITY_STATUS_NOT_SATISFIED`] otherwise.
+//!   latch; [`iso7816::Status::SecurityStatusNotSatisfied`] otherwise.
 
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use elliptic_curve::sec1::ToSec1Point;
@@ -28,7 +28,6 @@ use rsa::traits::PublicKeyParts;
 use zeroize::Zeroizing;
 
 use crate::PivApplet;
-use crate::constants::{SW_SECURITY_NOT_SATISFIED, SW_SECURITY_STATUS_NOT_SATISFIED};
 
 /// One key slot: its key material (or the absence of one), its policies
 /// and its certificate data object.
@@ -232,7 +231,7 @@ impl PivApplet {
     ///
     /// A read-only consultation of [`MgmtKey::unlocked`](crate::management)
     /// — the 9B exchange itself stays in GENERAL AUTHENTICATE. Answers
-    /// [`SW_SECURITY_NOT_SATISFIED`].
+    /// [`iso7816::Status::SecurityStatusNotSatisfied.into()`].
     ///
     /// Consulted by the key-slot commands (GENERATE, IMPORT, MOVE KEY) and
     /// PUT DATA.
@@ -240,7 +239,7 @@ impl PivApplet {
         if self.mgmt.unlocked() {
             Ok(())
         } else {
-            Err(SW_SECURITY_NOT_SATISFIED)
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
         }
     }
 
@@ -250,7 +249,7 @@ impl PivApplet {
     /// `ALWAYS` needs the PIN verified and this APDU to be the one right
     /// after the successful VERIFY (the [`PivApplet::pin_always_armed`]
     /// latch, which the dispatch consumes with this APDU). A
-    /// not-satisfied policy answers [`SW_SECURITY_STATUS_NOT_SATISFIED`].
+    /// not-satisfied policy answers [`iso7816::Status::SecurityStatusNotSatisfied.into()`].
     /// Slots never hold the `DEFAULT` policy — GENERATE KEY always stores
     /// one of the three concrete values — so `DEFAULT` is unreachable here.
     pub(crate) fn slot_pin_gate(&self, slot: &Slot) -> Result<(), u16> {
@@ -265,7 +264,7 @@ impl PivApplet {
         if satisfied {
             Ok(())
         } else {
-            Err(SW_SECURITY_STATUS_NOT_SATISFIED)
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
         }
     }
 
@@ -286,9 +285,6 @@ impl PivApplet {
 mod tests {
     use super::*;
     use crate::PivApplet;
-    use crate::constants::{
-        SW_INCORRECT_P1P2, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA,
-    };
     use crate::general_auth::tests::mgmt_handshake;
 
     /// A case-1 GA APDU: `00 87 00 <p2>`, the shape the host's
@@ -364,13 +360,19 @@ mod tests {
     #[test]
     fn management_gate_answers_6982_until_unlocked() {
         let mut applet = PivApplet::new();
-        assert_eq!(applet.management_unlocked(), Err(SW_SECURITY_NOT_SATISFIED));
+        assert_eq!(
+            applet.management_unlocked(),
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
+        );
         mgmt_handshake(&mut applet);
         assert!(applet.management_unlocked().is_ok());
         // A witness request re-locks the session — the gate locks with it.
         let r = applet.process(&[0x00, 0x87, 0x03, 0x9B, 0x04, 0x7C, 0x02, 0x80, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_OK);
-        assert_eq!(applet.management_unlocked(), Err(SW_SECURITY_NOT_SATISFIED));
+        assert_eq!(r.status(), iso7816::Status::Success.into());
+        assert_eq!(
+            applet.management_unlocked(),
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
+        );
     }
 
     #[test]
@@ -379,11 +381,11 @@ mod tests {
         // 9A is ONCE: locked before the PIN is verified...
         assert_eq!(
             applet.slot_pin_gate(&applet.slots[0]),
-            Err(SW_SECURITY_STATUS_NOT_SATISFIED)
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
         );
         // ...and open after.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         assert!(applet.slot_pin_gate(&applet.slots[0]).is_ok());
     }
 
@@ -393,19 +395,26 @@ mod tests {
         // Locked before the PIN is verified...
         assert_eq!(
             applet.slot_pin_gate(&applet.slots[1]),
-            Err(SW_SECURITY_STATUS_NOT_SATISFIED)
+            Err(iso7816::Status::SecurityStatusNotSatisfied.into())
         );
         // ...and the APDU right after a successful VERIFY is the one that
         // gets through: the latch is set by the VERIFY and still set when
         // this slot GA runs.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_INCORRECT_P1P2, "arm survives the VERIFY");
+        assert_eq!(
+            r.status(),
+            iso7816::Status::IncorrectP1OrP2Parameter.into(),
+            "arm survives the VERIFY"
+        );
         // The arm is consumed by that APDU: the next one is gated again
         // even though the PIN is still verified.
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::SecurityStatusNotSatisfied.into()
+        );
     }
 
     #[test]
@@ -414,7 +423,7 @@ mod tests {
         // 9E is NEVER: no PIN, no arm, always open.
         assert!(applet.slot_pin_gate(&applet.slots[3]).is_ok());
         let r = applet.process(&ga_apdu(0x9E));
-        assert_eq!(r.status(), SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
     }
 
     #[test]
@@ -425,13 +434,19 @@ mod tests {
             assert_eq!(slot_index(ref_), Some(index));
             assert_eq!(
                 applet.process(&ga_apdu(ref_)).status(),
-                SW_SECURITY_STATUS_NOT_SATISFIED
+                iso7816::Status::SecurityStatusNotSatisfied.into()
             );
         }
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
-        assert_eq!(applet.process(&ga_apdu(0x82)).status(), SW_INCORRECT_P1P2);
-        assert_eq!(applet.process(&ga_apdu(0x95)).status(), SW_INCORRECT_P1P2);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
+        assert_eq!(
+            applet.process(&ga_apdu(0x82)).status(),
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
+        );
+        assert_eq!(
+            applet.process(&ga_apdu(0x95)).status(),
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
+        );
     }
 
     #[test]
@@ -449,7 +464,7 @@ mod tests {
         assert!(!applet.pin_always_armed);
         // A successful PIN presentation does.
         let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         assert!(applet.pin_always_armed);
     }
 
@@ -461,7 +476,10 @@ mod tests {
         assert_eq!(r.status(), 0x63C4);
         assert!(!applet.pin_always_armed);
         let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
+        assert_eq!(
+            r.status(),
+            iso7816::Status::SecurityStatusNotSatisfied.into()
+        );
     }
 
     #[test]
@@ -470,12 +488,12 @@ mod tests {
         // 9B: the management path — a bare APDU carries no witness member,
         // the shape is refused.
         let r = applet.process(&[0x00, 0x87, 0x03, 0x9B]);
-        assert_eq!(r.status(), SW_WRONG_DATA);
+        assert_eq!(r.status(), iso7816::Status::IncorrectDataParameter.to_u16());
         // The vendor-extension references are not slots: refused, and
         // ungated (no PIN needed).
         for p2 in [0xE0u8, 0xE1u8, 0xF9u8] {
             let r = applet.process(&ga_apdu(p2));
-            assert_eq!(r.status(), SW_INCORRECT_P1P2);
+            assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
     }
 }

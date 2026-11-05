@@ -2,36 +2,6 @@
 //! the SP 800-73-4 dynamic-authentication tags, and the factory default
 //! values.
 
-/// ISO 7816-4 status word: instruction not supported.
-pub(crate) const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
-/// ISO 7816-4 status word: incorrect P1/P2 — the `JavaCard`
-/// `ISO7816.SW_INCORRECT_P1P2` word the card answers for an unexpected P1.
-pub(crate) const SW_INCORRECT_P1P2: u16 = 0x6B00;
-/// ISO 7816-4 status word: wrong data — the `JavaCard`
-/// `ISO7816.SW_WRONG_DATA` word the card answers for a wrong-length or
-/// invalid reference-data body.
-pub(crate) const SW_WRONG_DATA: u16 = 0x6A86;
-/// ISO 7816-4 status word: security status not satisfied — the `JavaCard`
-/// `ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED` word the card answers when a
-/// management command's preconditions are not met.
-pub(crate) const SW_SECURITY_STATUS_NOT_SATISFIED: u16 = 0x6986;
-/// ISO 7816-4 status word: security object not satisfied — the
-/// `0x6982` word the slot key commands answer when the 9B management
-/// session is not unlocked.
-pub(crate) const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
-/// ISO 7816-4 status word: success — the card's `9000`.
-pub(crate) const SW_OK: u16 = 0x9000;
-/// ISO 7816-4 status word: file/app not found — `0x6A82`.
-/// ISO 7816-4 status word: reference not found — `0x6A88`.
-pub(crate) const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
-/// ISO 7816-4 status word: conditions not satisfied — `0x6985`.
-pub(crate) const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
-/// ISO 7816-4 status word: authentication method blocked — `0x6983`.
-pub(crate) const SW_AUTH_BLOCKED: u16 = 0x6983;
-/// ISO 7816-4 status word: invalid data — a structurally broken TLV
-/// template (truncated lengths, an underrun body).
-pub(crate) const SW_DATA_INVALID: u16 = 0x6B00;
-
 /// SP 800-73-4 §4.1.3 dynamic-authentication tags: the `7C` wrapper and its
 /// witness / challenge / response / exponent members.
 pub(crate) const GA_TAG_DYN_AUTH: u8 = 0x7C;

@@ -31,7 +31,6 @@ use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 
 use crate::PivApplet;
 use crate::Response;
-use crate::constants::{SW_INCORRECT_P1P2, SW_OK, SW_WRONG_DATA};
 use crate::data::push_tlv;
 use crate::slot::{SlotKey, rsa_modulus_len, slot_index};
 
@@ -158,15 +157,15 @@ impl PivApplet {
             return Response::sw(sw);
         }
         if command.p1 != 0x00 {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
         // Unwrap the `AC` control-reference template.
         let control = match command.data() {
             [0xAC, len, control @ ..] if usize::from(*len) == control.len() => control,
-            _ => return Response::sw(SW_WRONG_DATA),
+            _ => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
         };
         let Ok((alg, pin_policy, touch_policy)) = parse_control(control) else {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         };
         // The `F9` attestation key: P-256 only, and a regeneration
         // re-mints the self-signed certificate that describes it — the
@@ -177,7 +176,7 @@ impl PivApplet {
         if command.p2 == 0xF9 && alg != KeyAlg::EccP256 {
             // The `F9` attestation key is P-256 only, not a slot of the
             // 24-slot table.
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         }
         if command.p2 == 0xF9 {
             let secret =
@@ -200,7 +199,7 @@ impl PivApplet {
             return Response::ok(data);
         }
         let Some(index) = slot_index(command.p2) else {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         };
         let secret = match alg {
             KeyAlg::EccP256 => {
@@ -230,7 +229,7 @@ impl PivApplet {
                     _ => unreachable!("alg is an RSA key size"),
                 };
                 let Ok(key) = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits) else {
-                    return Response::sw(SW_WRONG_DATA);
+                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
                 };
                 // The card's storage form: the key's PKCS#1 encoding,
                 // zeroized on drop. `new` always precomputes the CRT
@@ -238,14 +237,14 @@ impl PivApplet {
                 // `crtCoefficient` field.
                 match key.to_pkcs1_der() {
                     Ok(doc) => Zeroizing::new(doc.as_bytes().to_vec()),
-                    Err(_) => return Response::sw(SW_WRONG_DATA),
+                    Err(_) => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
                 }
             }
-            _ => return Response::sw(SW_WRONG_DATA),
+            _ => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
         };
         let key = SlotKey { alg, secret };
         let Some(inner) = key.public_inner() else {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         };
         self.commit_slot_key(index, key, false, pin_policy, touch_policy);
 
@@ -270,21 +269,21 @@ impl PivApplet {
             return Response::sw(sw);
         }
         let Some(index) = slot_index(command.p2) else {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         };
         let alg = match KeyAlg::from_u8(command.p1) {
             Some(alg @ (KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521)) => alg,
             Some(alg @ (KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096)) => {
                 alg
             }
-            _ => return Response::sw(SW_WRONG_DATA),
+            _ => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
         };
         let rsa = matches!(
             alg,
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096
         );
         let Ok(import) = parse_import(command.data(), rsa) else {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         };
 
         let secret = match alg {
@@ -308,7 +307,7 @@ impl PivApplet {
                     || scalar.iter().all(|byte| *byte == 0)
                     || scalar.as_slice() >= order
                 {
-                    return Response::sw(SW_WRONG_DATA);
+                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
                 }
                 let secret = match alg {
                     KeyAlg::EccP256 => imported_secret::<p256::NistP256>(scalar),
@@ -318,7 +317,7 @@ impl PivApplet {
                 };
                 match secret {
                     Some(secret) => secret,
-                    None => return Response::sw(SW_WRONG_DATA),
+                    None => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
                 }
             }
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
@@ -327,19 +326,19 @@ impl PivApplet {
                 let (Some(p), Some(q), Some(dp), Some(dq), Some(n)) =
                     (&import.p, &import.q, &import.dp, &import.dq, &import.n)
                 else {
-                    return Response::sw(SW_WRONG_DATA);
+                    return Response::sw(iso7816::Status::IncorrectDataParameter.into());
                 };
                 let modulus_len = rsa_modulus_len(alg).expect("alg is an RSA key size");
                 match imported_rsa_secret(p, q, dp, dq, n, modulus_len) {
                     Some(secret) => Zeroizing::new(secret),
-                    None => return Response::sw(SW_WRONG_DATA),
+                    None => return Response::sw(iso7816::Status::IncorrectDataParameter.into()),
                 }
             }
             _ => unreachable!("alg is a NIST curve or an RSA key size"),
         };
         let key = SlotKey { alg, secret };
         self.commit_slot_key(index, key, true, import.pin_policy, import.touch_policy);
-        Response::sw(SW_OK)
+        iso7816::Status::Success.into()
     }
 
     /// MOVE KEY (`0xF6`, Yubico extension): the host's `move_key` /
@@ -362,13 +361,13 @@ impl PivApplet {
             return Response::sw(sw);
         }
         let Some(source) = slot_index(command.p2) else {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         };
         let dest = match command.p1 {
             0xFF => None,
             reference => match slot_index(reference) {
                 Some(index) => Some(index),
-                None => return Response::sw(SW_INCORRECT_P1P2),
+                None => return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into()),
             },
         };
         if self.slots[source].key.is_none() {
@@ -377,7 +376,7 @@ impl PivApplet {
         if let Some(dest) = dest
             && self.slots[dest].key.is_some()
         {
-            return Response::sw(SW_WRONG_DATA);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         }
 
         let key = self.slots[source].key.take().expect("checked above");
@@ -392,7 +391,7 @@ impl PivApplet {
             self.slots[dest].touch_policy = touch_policy;
             self.slots[dest].imported = imported;
         }
-        Response::sw(SW_OK)
+        iso7816::Status::Success.into()
     }
 }
 
@@ -578,7 +577,6 @@ impl PivApplet {
 #[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
-    use crate::constants::SW_SECURITY_NOT_SATISFIED;
     use crate::general_auth::tests::mgmt_handshake;
     use crate::yubico::YubicoInstruction;
     use elliptic_curve::sec1::ToSec1Point;
@@ -688,13 +686,13 @@ mod tests {
     fn generate_answers_the_uncompressed_point() {
         let mut app = unlocked();
         let r = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let point = point_of(&r);
         assert_eq!(point.len(), 65);
         assert_eq!(point[0], 0x04);
         // A second generate on the same slot regenerates: a different point.
         let r2 = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(r2.status(), SW_OK);
+        assert_eq!(r2.status(), iso7816::Status::Success.into());
         assert_ne!(point_of(&r2), point);
     }
 
@@ -704,14 +702,17 @@ mod tests {
         let mut app = PivApplet::new();
         assert_eq!(
             app.process(&gen_apdu(Slot::Authentication)).status(),
-            SW_SECURITY_NOT_SATISFIED
+            iso7816::Status::SecurityStatusNotSatisfied.into()
         );
 
         let mut app = unlocked();
         // A non-zero P1 is refused.
         let mut apdu = gen_apdu(Slot::Authentication);
         apdu[2] = 0x01;
-        assert_eq!(app.process(&apdu).status(), SW_INCORRECT_P1P2);
+        assert_eq!(
+            app.process(&apdu).status(),
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
+        );
         // Non-slot P2s: the vendor-extension and PIN references.
         // `9B` (management) and `F9` (attestation) are valid GENERATE
         // targets — `F9` in particular, see
@@ -719,7 +720,7 @@ mod tests {
         for p2 in [0xE0, 0xE1, 0x80, 0x00u8] {
             assert_eq!(
                 app.process(&gen_raw_p2(p2)).status(),
-                SW_INCORRECT_P1P2,
+                iso7816::Status::IncorrectP1OrP2Parameter.into(),
                 "P2 {p2:02X}",
             );
         }
@@ -732,7 +733,10 @@ mod tests {
             keyroost_piv::TouchPolicy::Default,
         );
         f9_p384[3] = 0xF9;
-        assert_eq!(app.process(&f9_p384).status(), SW_WRONG_DATA);
+        assert_eq!(
+            app.process(&f9_p384).status(),
+            iso7816::Status::IncorrectDataParameter.into()
+        );
 
         // A non-PIV CLA.
         let mut apdu = gen_apdu(Slot::Authentication);
@@ -757,7 +761,7 @@ mod tests {
             assert_eq!(
                 app.process(&gen_control_apdu(Slot::Authentication, control))
                     .status(),
-                SW_WRONG_DATA,
+                iso7816::Status::IncorrectDataParameter.into(),
                 "control template {control:02X?}",
             );
         }
@@ -778,7 +782,7 @@ mod tests {
             keyroost_piv::PinPolicy::Always,
             keyroost_piv::TouchPolicy::Always,
         ));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let slot = &app.slots[0];
         assert!(slot.key.is_some());
         assert_eq!(slot.pin_policy, PinPolicy::Always);
@@ -786,7 +790,10 @@ mod tests {
         assert!(!slot.imported);
 
         // Absent policy requests keep the slot's current policies.
-        assert_eq!(app.process(&gen_apdu(Slot::Authentication)).status(), SW_OK);
+        assert_eq!(
+            app.process(&gen_apdu(Slot::Authentication)).status(),
+            iso7816::Status::Success.into()
+        );
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Always);
         assert_eq!(app.slots[0].touch_policy, TouchPolicy::Always);
 
@@ -795,7 +802,7 @@ mod tests {
         assert_eq!(
             app.process(&gen_control_apdu(Slot::Authentication, &control))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(app.slots[0].pin_policy, PinPolicy::Once); // 9A's factory
         assert_eq!(app.slots[0].touch_policy, TouchPolicy::Default); // factory: no touch policy
@@ -807,12 +814,15 @@ mod tests {
         let der: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
         let cert = encode_certificate(&der, CertInfo::Uncompressed);
         let tag = Slot::Authentication.cert_object_tag();
-        assert_eq!(app.process(&put_data(&tag, &cert)).status(), SW_OK);
+        assert_eq!(
+            app.process(&put_data(&tag, &cert)).status(),
+            iso7816::Status::Success.into()
+        );
 
         let first = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(first.status(), SW_OK);
+        assert_eq!(first.status(), iso7816::Status::Success.into());
         let second = app.process(&gen_apdu(Slot::Authentication));
-        assert_eq!(second.status(), SW_OK);
+        assert_eq!(second.status(), iso7816::Status::Success.into());
         assert_ne!(point_of(&second), point_of(&first));
 
         // R5: the certificate object is cleared on regenerate.
@@ -825,14 +835,17 @@ mod tests {
         let scalar = fixed_scalar();
         let cert = encode_certificate(&[0x30, 0x82, 0x01, 0x00], CertInfo::Uncompressed);
         let tag = Slot::Authentication.cert_object_tag();
-        assert_eq!(app.process(&put_data(&tag, &cert)).status(), SW_OK);
+        assert_eq!(
+            app.process(&put_data(&tag, &cert)).status(),
+            iso7816::Status::Success.into()
+        );
 
         let r = app.process(&import_apdu(
             0x11,
             0x9A,
             &ec_body(&scalar, Some(0x02), Some(0x02)),
         ));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         assert_eq!(r.data(), [] as [u8; 0]);
 
         let slot = &app.slots[0];
@@ -855,7 +868,7 @@ mod tests {
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
                 .status(),
-            SW_SECURITY_NOT_SATISFIED
+            iso7816::Status::SecurityStatusNotSatisfied.into()
         );
 
         let mut app = unlocked();
@@ -868,7 +881,7 @@ mod tests {
             assert_eq!(
                 app.process(&import_apdu(alg, 0x9A, &ec_body(&scalar, None, None)))
                     .status(),
-                SW_WRONG_DATA
+                iso7816::Status::IncorrectDataParameter.into()
             );
         }
         // Non-slot P2s.
@@ -876,7 +889,7 @@ mod tests {
             assert_eq!(
                 app.process(&import_apdu(0x11, p2, &ec_body(&scalar, None, None)))
                     .status(),
-                SW_INCORRECT_P1P2
+                iso7816::Status::IncorrectP1OrP2Parameter.into()
             );
         }
         // A non-PIV CLA.
@@ -906,7 +919,7 @@ mod tests {
         for body in broken {
             assert_eq!(
                 app.process(&import_apdu(0x11, 0x9A, body)).status(),
-                SW_WRONG_DATA
+                iso7816::Status::IncorrectDataParameter.into()
             );
         }
         // An Lc overrun.
@@ -929,7 +942,11 @@ mod tests {
         above[31] += 1;
         for scalar in [zero, order, above] {
             let r = app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)));
-            assert_eq!(r.status(), SW_WRONG_DATA, "{scalar:02X?}");
+            assert_eq!(
+                r.status(),
+                iso7816::Status::IncorrectDataParameter.into(),
+                "{scalar:02X?}"
+            );
         }
         assert!(app.slots[0].key.is_none());
     }
@@ -941,7 +958,7 @@ mod tests {
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         // The stored scalar is the ECDSA secret for the point the slot
         // reports: a host-side prehash sign/verify round trip closes it.
@@ -963,7 +980,7 @@ mod tests {
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9E, &ec_body(&scalar, None, None)))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         // 9E is `NEVER` at the factory, so no VERIFY is needed: the GA
         // signing path signs the prehashed digest with the imported
@@ -997,7 +1014,11 @@ mod tests {
         let mut block = vec![0u8; n.len()];
         block[n.len() - 1] = m;
         let r = app.process(&keyroost_piv::general_auth_sign(alg.id(), slot, &block));
-        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        assert_eq!(
+            r.status(),
+            iso7816::Status::Success.into(),
+            "signing GA: {r:?}"
+        );
         let s = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         assert_eq!(
             s.len(),
@@ -1060,7 +1081,11 @@ mod tests {
             keyroost_piv::PinPolicy::Default,
             keyroost_piv::TouchPolicy::Default,
         ));
-        assert_eq!(r.status(), SW_OK, "GENERATE: {r:?}");
+        assert_eq!(
+            r.status(),
+            iso7816::Status::Success.into(),
+            "GENERATE: {r:?}"
+        );
         let (n, e) = rsa_public_of(&r);
         assert_eq!(n.len(), 128);
         assert_ne!(n[127] & 1, 0, "the modulus is odd");
@@ -1095,7 +1120,7 @@ mod tests {
                     &body
                 ))
                 .status(),
-                SW_OK,
+                iso7816::Status::Success.into(),
                 "IMPORT"
             );
             // The stored key is the host key: same modulus, and the
@@ -1179,7 +1204,7 @@ mod tests {
             assert_eq!(
                 app.process(&import_apdu(keyroost_piv::KeyAlg::Rsa1024.id(), 0x9E, body))
                     .status(),
-                SW_WRONG_DATA,
+                iso7816::Status::IncorrectDataParameter.into(),
                 "body {body:02X?}"
             );
         }
@@ -1190,7 +1215,11 @@ mod tests {
     /// values are all small, so no `61xx` continuation is expected.
     fn read_object(app: &mut PivApplet, tag: &[u8]) -> Vec<u8> {
         let r = app.process(&keyroost_piv::get_data(tag));
-        assert_eq!(r.status(), SW_OK, "GET DATA {tag:?}");
+        assert_eq!(
+            r.status(),
+            iso7816::Status::Success.into(),
+            "GET DATA {tag:?}"
+        );
         keyroost_piv::unwrap_data_object(r.data())
             .expect("a well-formed 53 template")
             .to_vec()
@@ -1208,19 +1237,19 @@ mod tests {
                 &ec_body(&scalar, Some(0x02), Some(0x02))
             ))
             .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         let cert_a = b"source-cert";
         let cert_b = b"dest-cert";
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0A], cert_a))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x0D], cert_b))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
 
         assert_eq!(
@@ -1229,7 +1258,7 @@ mod tests {
                 keyroost_piv::Slot::retired(1).expect("retired 1"),
             ))
             .status(),
-            SW_OK,
+            iso7816::Status::Success.into(),
             "move"
         );
         let source = &app.slots[slot_index(0x9C).expect("9C")];
@@ -1255,12 +1284,12 @@ mod tests {
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9A, &ec_body(&scalar, None, None)))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(
             app.process(&keyroost_piv::put_data(&[0x5F, 0xC1, 0x05], b"auth-cert"))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
 
         assert_eq!(
@@ -1268,7 +1297,7 @@ mod tests {
                 keyroost_piv::Slot::Authentication
             ))
             .status(),
-            SW_OK,
+            iso7816::Status::Success.into(),
             "delete"
         );
         let slot = &app.slots[slot_index(0x9A).expect("9A")];
@@ -1307,21 +1336,21 @@ mod tests {
         let mut app = PivApplet::new();
         assert_eq!(
             app.process(&[0x00, 0xF6, 0x9C, 0x9A]).status(),
-            SW_SECURITY_NOT_SATISFIED
+            iso7816::Status::SecurityStatusNotSatisfied.into()
         );
         mgmt_handshake(&mut app);
         // F9 is not in the slot table, in either position; neither is 9B.
         assert_eq!(
             app.process(&[0x00, 0xF6, 0xF9, 0x9A]).status(),
-            SW_INCORRECT_P1P2
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
         );
         assert_eq!(
             app.process(&[0x00, 0xF6, 0x9C, 0xF9]).status(),
-            SW_INCORRECT_P1P2
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
         );
         assert_eq!(
             app.process(&[0x00, 0xF6, 0x9B, 0x9A]).status(),
-            SW_INCORRECT_P1P2
+            iso7816::Status::IncorrectP1OrP2Parameter.into()
         );
         assert_eq!(app.process(&[0xFF, 0xF6, 0x9C, 0x9A]).status(), 0x6E00);
     }
@@ -1335,12 +1364,12 @@ mod tests {
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9C, &ec_body(&scalar, None, None)))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(
             app.process(&import_apdu(0x11, 0x9D, &ec_body(&other, None, None)))
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
 
         // R1: an occupied destination (the source itself included) is
@@ -1351,7 +1380,7 @@ mod tests {
                 keyroost_piv::Slot::KeyManagement,
             ))
             .status(),
-            SW_WRONG_DATA
+            iso7816::Status::IncorrectDataParameter.into()
         );
         assert_eq!(
             app.process(&keyroost_piv::move_key(
@@ -1359,7 +1388,7 @@ mod tests {
                 keyroost_piv::Slot::Signature,
             ))
             .status(),
-            SW_WRONG_DATA
+            iso7816::Status::IncorrectDataParameter.into()
         );
         let source = &app.slots[slot_index(0x9C).expect("9C")];
         let dest = &app.slots[slot_index(0x9D).expect("9D")];
@@ -1392,7 +1421,7 @@ mod tests {
             keyroost_piv::Slot::Signature,
             keyroost_piv::KeyAlg::EccP384,
         ));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let point = point_of(&r);
         assert_eq!(point.len(), 97);
         p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-384 point");
@@ -1406,7 +1435,7 @@ mod tests {
             keyroost_piv::Slot::KeyManagement,
             keyroost_piv::KeyAlg::EccP521,
         ));
-        assert_eq!(r.status(), SW_OK);
+        assert_eq!(r.status(), iso7816::Status::Success.into());
         let point = point_of(&r);
         assert_eq!(point.len(), 133);
         p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-521 point");
@@ -1434,7 +1463,7 @@ mod tests {
                 &body
             ))
             .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(
             app.slots[0].key.as_ref().expect("a key").alg,
@@ -1450,7 +1479,7 @@ mod tests {
         assert_eq!(
             app.process(&keyroost_piv::verify_pin(b"123456").unwrap())
                 .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         let digest = [0x2C; 48];
         let r = app.process(&keyroost_piv::general_auth_sign(
@@ -1458,7 +1487,11 @@ mod tests {
             0x9A,
             &digest,
         ));
-        assert_eq!(r.status(), SW_OK, "signing GA: {r:?}");
+        assert_eq!(
+            r.status(),
+            iso7816::Status::Success.into(),
+            "signing GA: {r:?}"
+        );
         let sig_der = keyroost_piv::parse_general_auth(r.data(), 0x82).expect("an 82 answer");
         let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(expected_point).expect("the point");
         let sig = p384::ecdsa::Signature::from_der(sig_der).expect("a DER signature");
@@ -1479,7 +1512,7 @@ mod tests {
                 &body
             ))
             .status(),
-            SW_OK
+            iso7816::Status::Success.into()
         );
         assert_eq!(
             app.slots[4].key.as_ref().expect("a key").alg,
@@ -1503,7 +1536,7 @@ mod tests {
                 &ec_body(&long, None, None)
             ))
             .status(),
-            SW_WRONG_DATA
+            iso7816::Status::IncorrectDataParameter.into()
         );
         assert_eq!(
             app.process(&import_apdu(
@@ -1512,7 +1545,7 @@ mod tests {
                 &ec_body(&short, None, None)
             ))
             .status(),
-            SW_WRONG_DATA
+            iso7816::Status::IncorrectDataParameter.into()
         );
         assert_eq!(
             app.process(&import_apdu(
@@ -1521,7 +1554,7 @@ mod tests {
                 &ec_body(&mid, None, None)
             ))
             .status(),
-            SW_WRONG_DATA
+            iso7816::Status::IncorrectDataParameter.into()
         );
         // Zero scalars and group orders, per curve: the range check refuses
         // them before the field conversion.
@@ -1534,7 +1567,7 @@ mod tests {
             assert_eq!(
                 app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&zero, None, None)))
                     .status(),
-                SW_WRONG_DATA
+                iso7816::Status::IncorrectDataParameter.into()
             );
             let order = match alg {
                 keyroost_piv::KeyAlg::EccP256 => P256_ORDER.to_vec(),
@@ -1545,7 +1578,7 @@ mod tests {
             assert_eq!(
                 app.process(&import_apdu(alg.id(), 0x9C, &ec_body(&order, None, None)))
                     .status(),
-                SW_WRONG_DATA
+                iso7816::Status::IncorrectDataParameter.into()
             );
         }
         // Nothing landed in 9C.

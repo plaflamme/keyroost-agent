@@ -10,7 +10,6 @@
 //! [`keyroost_piv::encode_certificate`] (DER or gzip, `CertInfo` `0x00`/`0x01`)
 //! reads back byte-identical.
 
-use crate::constants::{SW_DATA_INVALID, SW_INCORRECT_P1P2, SW_OK};
 use crate::{PivApplet, Response};
 use x509_cert::der::{Decode, Encode};
 
@@ -96,11 +95,11 @@ impl PivApplet {
     /// RESPONSE continuation; a tag no object exists under answers `6A82`.
     pub(crate) fn process_get_data(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
         if command.p1 != 0x3F || command.p2 != 0xFF {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
         let body = command.data();
         let Some(tag) = selector_tag(body) else {
-            return Response::sw(SW_DATA_INVALID);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         };
         match self.data_object_value(tag) {
             Some(value) => {
@@ -121,16 +120,16 @@ impl PivApplet {
     /// clears a slot certificate.
     pub(crate) fn process_put_data(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
         if command.p1 != 0x3F || command.p2 != 0xFF {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return Response::sw(iso7816::Status::IncorrectP1OrP2Parameter.into());
         }
         if let Err(sw) = self.management_unlocked() {
             return Response::sw(sw);
         }
         let Some((tag, value)) = parse_put_body(command.data()) else {
-            return Response::sw(SW_DATA_INVALID);
+            return Response::sw(iso7816::Status::IncorrectDataParameter.into());
         };
         if self.store_data_object(tag, value) {
-            Response::sw(SW_OK)
+            Response::sw(iso7816::Status::Success.into())
         } else {
             iso7816::Status::NotFound.into()
         }
@@ -271,9 +270,17 @@ mod tests {
         let value = [0xA5u8; 16];
         for tag in all_object_tags() {
             let resp = applet.process(&put_data(&tag, &value));
-            assert_eq!(resp.status(), keyroost_piv::SW_OK, "PUT {tag:02X?}");
+            assert_eq!(
+                resp.status(),
+                iso7816::Status::Success.into(),
+                "PUT {tag:02X?}"
+            );
             let resp = applet.process(&get_data(&tag));
-            assert_eq!(resp.status(), keyroost_piv::SW_OK, "GET {tag:02X?}");
+            assert_eq!(
+                resp.status(),
+                iso7816::Status::Success.into(),
+                "GET {tag:02X?}"
+            );
             let inner = unwrap_data_object(resp.data()).expect("a well-formed 53 template");
             assert_eq!(inner, value.as_slice(), "round trip {tag:02X?}");
         }
@@ -290,9 +297,9 @@ mod tests {
         let cert = encode_certificate(&der, CertInfo::Gzip);
         let tag = slot_cert_tag(0);
         let resp = applet.process(&put_data(&tag, &cert));
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), iso7816::Status::Success.into());
         let resp = applet.process(&get_data(&tag));
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), iso7816::Status::Success.into());
         let inner = unwrap_data_object(resp.data()).expect("a well-formed 53 template");
         assert_eq!(inner, cert.as_slice());
     }
@@ -318,7 +325,7 @@ mod tests {
         assert_eq!(locked.status(), keyroost_piv::SW_SECURITY_NOT_SATISFIED);
         let (_step2, _challenge) = mgmt_handshake(&mut applet);
         let unlocked = applet.process(&put_data(&tag, &[0x11; 4]));
-        assert_eq!(unlocked.status(), keyroost_piv::SW_OK);
+        assert_eq!(unlocked.status(), iso7816::Status::Success.into());
     }
 
     /// A GET DATA body that is not a `5C 03 <tag>` selector answers `6B00`.
@@ -328,11 +335,14 @@ mod tests {
         // No body at all.
         assert_eq!(
             applet.process(&[0x00, 0xCB, 0x3F, 0xFF, 0x00]).status(),
-            SW_DATA_INVALID
+            iso7816::Status::IncorrectDataParameter.into()
         );
         // A selector of the wrong length.
         let broken = [0x00u8, 0xCB, 0x3F, 0xFF, 0x04, 0x5C, 0x02, 0x5F, 0xC1, 0x00];
-        assert_eq!(applet.process(&broken).status(), SW_DATA_INVALID);
+        assert_eq!(
+            applet.process(&broken).status(),
+            iso7816::Status::IncorrectDataParameter.into()
+        );
     }
 
     /// A PUT DATA body missing its `53` template, underrunning its declared
@@ -343,18 +353,27 @@ mod tests {
         let (_step2, _challenge) = mgmt_handshake(&mut applet);
         // Selector only — the `53` template is missing.
         let no_template = [0x00u8, 0xDB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05];
-        assert_eq!(applet.process(&no_template).status(), SW_DATA_INVALID);
+        assert_eq!(
+            applet.process(&no_template).status(),
+            iso7816::Status::IncorrectDataParameter.into()
+        );
         // Declared length overruns the body.
         let underrun = [
             0x00u8, 0xDB, 0x3F, 0xFF, 0x09, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x53, 0x05, 0xAA, 0xBB,
         ];
-        assert_eq!(applet.process(&underrun).status(), SW_DATA_INVALID);
+        assert_eq!(
+            applet.process(&underrun).status(),
+            iso7816::Status::IncorrectDataParameter.into()
+        );
         // Garbage after the `53` template's value.
         let trailing = [
             0x00u8, 0xDB, 0x3F, 0xFF, 0x0A, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x53, 0x01, 0xAA, 0x00,
             0x00,
         ];
-        assert_eq!(applet.process(&trailing).status(), SW_DATA_INVALID);
+        assert_eq!(
+            applet.process(&trailing).status(),
+            iso7816::Status::IncorrectDataParameter.into()
+        );
     }
 
     /// PUT DATA for a tag no object exists under answers `6A82`.
@@ -373,6 +392,6 @@ mod tests {
         let (_step2, _challenge) = mgmt_handshake(&mut applet);
         let resp = applet.process(&put_data(&OBJECT_CHUID, &[0x01, 0x02]));
         assert_eq!(resp.data(), Vec::<u8>::new());
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
+        assert_eq!(resp.status(), iso7816::Status::Success.into());
     }
 }

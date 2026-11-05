@@ -26,7 +26,7 @@ use x509_cert::ext::Extension;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
 use x509_cert::spki::ObjectIdentifier;
 
-use crate::constants::{SW_INCORRECT_P1P2, VERSION};
+use crate::constants::VERSION;
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use crate::slot::{SlotKey, slot_index};
 use crate::{PivApplet, Response};
@@ -67,13 +67,13 @@ impl PivApplet {
     /// has no such check and would mint a keyless certificate.
     pub(crate) fn process_attest(&mut self, command: &crate::apdu::CommandView<'_>) -> Response {
         if command.p2 != 0x00 {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         }
         let Some(slot) = crate::piv::Slot::from_u8(command.p1) else {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         let Some(index) = slot_index(command.p1) else {
-            return Response::sw(SW_INCORRECT_P1P2);
+            return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         let Some(key) = &self.slots[index].key else {
             return iso7816::Status::KeyReferenceNotFound.into();
@@ -303,8 +303,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::constants::SW_OK;
     use crate::general_auth::tests::mgmt_handshake;
+    use iso7816::Status;
     use x509_cert::builder::Builder;
     use x509_cert::der::Encode;
     use zeroize::Zeroizing;
@@ -366,7 +366,11 @@ mod tests {
         } else {
             first.status()
         };
-        assert_eq!(cert_sw, SW_OK, "ATTEST answers 9000 (sw 0x{cert_sw:04x})");
+        assert_eq!(
+            cert_sw,
+            Status::Success.to_u16(),
+            "ATTEST answers 9000 (sw 0x{cert_sw:04x})"
+        );
 
         // The host's own parser reads it back: the slot's P-256 point —
         // byte-identical to what GENERATE announced — and the key-policy
@@ -426,7 +430,11 @@ mod tests {
         for ref_ in [0x9B, 0xF9, 0x96, 0x00, 0x80, 0xE0, 0x58] {
             let apdu = vec![0x00, 0xF9, ref_, 0x00, 0x00];
             let response = applet.process(&apdu);
-            assert_eq!(response.status(), SW_INCORRECT_P1P2, "ref {ref_:02X}");
+            assert_eq!(
+                response.status(),
+                Status::IncorrectP1OrP2Parameter.to_u16(),
+                "ref {ref_:02X}"
+            );
         }
     }
 
@@ -437,10 +445,10 @@ mod tests {
         let response = applet.process(&apdu);
         assert_eq!(
             response.status(),
-            SW_INCORRECT_P1P2,
+            Status::IncorrectP1OrP2Parameter.to_u16(),
             "status {:02X} != {:02X}",
             response.status(),
-            SW_INCORRECT_P1P2
+            Status::IncorrectP1OrP2Parameter.to_u16(),
         );
     }
 
@@ -464,7 +472,7 @@ mod tests {
             keyroost_piv::TouchPolicy::Default,
         );
         let response = applet.process(&apdu);
-        assert_eq!(response.status(), SW_OK);
+        assert_eq!(response.status(), Status::Success.to_u16());
         let announced = announced_point(&response);
         let apdu = keyroost_piv::attest(0x84);
         let first = applet.process(&apdu);
@@ -502,7 +510,7 @@ mod tests {
         } else {
             first.status()
         };
-        assert_eq!(cert_sw, SW_OK);
+        assert_eq!(cert_sw, Status::Success.to_u16());
         let value = keyroost_piv::unwrap_data_object(&data).expect("a 53 template");
         let cert =
             x509_cert::Certificate::from_der(value).expect("is DER-encoded X509 certificate");
