@@ -57,7 +57,6 @@ mod identity;
 mod keygen;
 mod management;
 mod piv;
-mod select;
 mod slot;
 mod state;
 mod yubico;
@@ -84,7 +83,6 @@ use crate::yubico::YubicoInstruction;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     Data(Vec<u8>),
-    More(Vec<u8>, u8),
     Status(Status),
 }
 
@@ -105,7 +103,7 @@ impl Response {
     #[must_use]
     pub fn data(&self) -> &[u8] {
         match &self {
-            Response::Data(d) | Response::More(d, _) => d.as_slice(),
+            Response::Data(d) => d.as_slice(),
             Response::Status(_) => &[],
         }
     }
@@ -115,7 +113,6 @@ impl Response {
     pub fn status(&self) -> u16 {
         match &self {
             Response::Data(_) => 0x9000,
-            Response::More(_, remain) => Status::MoreAvailable(*remain).to_u16(),
             Response::Status(s) => s.to_u16(),
         }
     }
@@ -143,10 +140,6 @@ pub struct PivApplet {
     /// The card serial GET SERIAL presents: a 32-bit value, big-endian on
     /// the wire.
     pub(crate) serial: u32,
-    /// The tail of a response the previous command signalled with `61xx`
-    /// because it did not fit in the requested `Le`, pending for a GET
-    /// RESPONSE (0xC0). `None` when nothing is pending.
-    pub(crate) get_response_tail: Option<Vec<u8>>,
     /// The application PIN (reference `80`).
     pub(crate) pin: Pin,
     /// The PUK (reference `81`).
@@ -179,6 +172,39 @@ impl Default for PivApplet {
     }
 }
 
+impl iso7816::App for PivApplet {
+    fn aid(&self) -> iso7816::Aid {
+        iso7816::Aid::new_truncatable(&constants::AID_FULL, constants::AID_RID.len())
+    }
+}
+
+impl apdu_app::App for PivApplet {
+    fn select(
+        &mut self,
+        _interface: iso7816::Interface,
+        _apdu: apdu_app::CommandView<'_>,
+        _reply: &mut apdu_app::VecView<u8>,
+    ) -> apdu_app::Result {
+        // NOOP
+        Ok(())
+    }
+
+    fn deselect(&mut self) {}
+
+    fn call(
+        &mut self,
+        _interface: iso7816::Interface,
+        apdu: apdu_app::CommandView<'_>,
+        reply: &mut apdu_app::VecView<u8>,
+    ) -> apdu_app::Result {
+        match self.process_command(&apdu) {
+            Response::Data(d) => reply.extend(d),
+            Response::Status(s) => return Err(s),
+        }
+        Ok(())
+    }
+}
+
 impl PivApplet {
     /// A factory-fresh applet: the default PIN/PUK with full retry counters,
     /// nothing verified, the [`DEFAULT_SERIAL`] serial.
@@ -194,7 +220,6 @@ impl PivApplet {
     pub fn with_serial(serial: u32) -> Self {
         Self {
             serial,
-            get_response_tail: None,
             pin: Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES),
             puk: Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES),
             mgmt: MgmtKey::default(),
@@ -207,7 +232,8 @@ impl PivApplet {
 
     /// The applet's entry point: dispatch a received host APDU to its
     /// instruction handler.
-    pub fn process(&mut self, apdu: &[u8]) -> Response {
+    #[cfg(test)]
+    fn process(&mut self, apdu: &[u8]) -> Response {
         let command = match apdu::CommandView::try_from(apdu) {
             Ok(command) => command,
             Err(
@@ -222,11 +248,7 @@ impl PivApplet {
                 return iso7816::Status::WrongLength.into();
             }
         };
-        if command.instruction() == Instruction::Select {
-            self.process_select(apdu)
-        } else {
-            self.process_command(&command)
-        }
+        self.process_command(&command)
     }
 
     fn process_command(&mut self, command: &apdu::CommandView<'_>) -> Response {
@@ -242,13 +264,6 @@ impl PivApplet {
         }
 
         let ins = command.instruction();
-        // A GET RESPONSE with a pending tail is a chained continuation of
-        // its parent APDU: it inherits the parent's gate results, so it
-        // does not consume the PIN/ALWAYS latch. Any other APDU — including
-        // a stray GET RESPONSE with nothing pending — is a new command and
-        // consumes the latch: an `ALWAYS`-policy slot operation must be the
-        // APDU right after a successful VERIFY.
-        let chained = ins == Instruction::GetResponse && self.get_response_tail.is_some();
         // A VERIFY carrying an 8-byte body is a real PIN presentation —
         // the status query (no body) is not, even though both can answer
         // 9000. Only a presentation that the card accepts re-arms the
@@ -260,7 +275,7 @@ impl PivApplet {
             Instruction::Select => unreachable!(),
             Instruction::Verify => self.process_verify(command),
             Instruction::GetData => self.process_get_data(command),
-            Instruction::GetResponse => self.process_get_response(command),
+            Instruction::GetResponse => unreachable!(),
             Instruction::GeneralAuthenticate => self.process_general_authenticate(command),
             Instruction::GenerateAsymmetricKeyPair => self.process_generate_key_pair(command),
             Instruction::PutData => self.process_put_data(command),
@@ -288,46 +303,10 @@ impl PivApplet {
         // it — and it must not consume the arm it just set: the arm survives
         // until the next command.
         let armed_this_apdu = pin_presentation && response.status() == SW_OK;
-        if !chained && !armed_this_apdu {
+        if !armed_this_apdu {
             self.pin_always_armed = false;
         }
         response
-    }
-
-    /// Apply a case-4 `Le` cap to a full response: send it whole under
-    /// `9000` when it fits (or no length was requested), otherwise stash
-    /// the overflow for GET RESPONSE and answer with the first bytes under
-    /// a `61xx` status word carrying the remaining count.
-    pub(crate) fn split_for_le(&mut self, full: Vec<u8>, le: Option<u8>) -> Response {
-        let cap = match le {
-            None => None,
-            Some(0) => Some(256),
-            Some(n) => Some(usize::from(n)),
-        };
-        match cap {
-            Some(cap) if full.len() > cap => {
-                self.get_response_tail = Some(full[cap..].to_vec());
-                #[allow(clippy::cast_possible_truncation)]
-                let remaining = (full.len() - cap).min(255) as u8;
-                let mut d = Vec::new();
-                d.extend_from_slice(&full[..cap]);
-                Response::More(d, remaining)
-            }
-            _ => Response::ok(full),
-        }
-    }
-}
-
-/// The case-4 `Le` in an APDU tail, the bytes after the command data:
-/// `Ok(None)` when the APDU carries no length (case 3 — the response is
-/// uncapped), `Ok(Some(le))` for the requested length byte, `Err(())` for a
-/// malformed tail (two or more bytes) the caller answers with
-/// [`keyroost_piv::SW_WRONG_LENGTH`].
-pub(crate) fn apdu_le(tail: &[u8]) -> Result<Option<u8>, ()> {
-    match tail {
-        [] => Ok(None),
-        [le] => Ok(Some(*le)),
-        _ => Err(()),
     }
 }
 

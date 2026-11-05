@@ -32,7 +32,7 @@ use clap::Parser;
 use tracing::{info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
-use keyroost_piv_applet::{PivApplet, Response};
+use keyroost_piv_applet::PivApplet;
 
 /// The ATR of a `YubiKey` 4, so card drivers that match on the ATR (`OpenSC`'s
 /// PIV support, `GnuPG`) bind to the virtual card.
@@ -43,10 +43,6 @@ const CTRL_POWER_OFF: u8 = 0x00;
 const CTRL_POWER_ON: u8 = 0x01;
 const CTRL_RESET: u8 = 0x02;
 const CTRL_GET_ATR: u8 = 0x04;
-
-// ISO 7816-4 status words for malformed input.
-const SW_WRONG_LENGTH: u16 = 0x6700;
-const SW_NOT_INITIALIZED: u16 = 0x6985;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -116,6 +112,16 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
     let mut applet = PivApplet::new();
     let mut power_on = false;
 
+    let contact = apdu_dispatch::interchanges::Channel::new();
+    let Some((_rq, contact_rp)) = contact.split() else {
+        return Err(io::Error::other("cannot create channel"));
+    };
+    let contactless = apdu_dispatch::interchanges::Channel::new();
+    let Some((mut requester, contactless_rp)) = contactless.split() else {
+        return Err(io::Error::other("cannot create channel"));
+    };
+    let mut dispatch = apdu_dispatch::dispatch::ApduDispatch::new(contact_rp, contactless_rp);
+
     loop {
         let Some(msg) = read_msg(&mut stream)? else {
             info!("vpcd disconnected");
@@ -131,7 +137,7 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
                 }
                 CTRL_POWER_ON | CTRL_RESET => {
                     power_on = true;
-                    trace!("power on (fresh applet)");
+                    trace!("power on");
                 }
                 CTRL_GET_ATR => write_msg(&mut stream, atr)?,
                 other => warn!("unknown control command 0x{other:02x}"),
@@ -139,39 +145,18 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
             continue;
         }
         // A command APDU.
-
-        let response = if !power_on {
-            warn!("command APDU while powered off");
-            Response::sw(SW_NOT_INITIALIZED)
-        } else if msg.len() < 4 {
-            warn!(
-                "command APDU shorter than the 4-byte header ({} byte(s))",
-                msg.len()
-            );
-            Response::sw(SW_WRONG_LENGTH)
+        if power_on {
+            requester
+                .request(apdu_dispatch::interchanges::Data::from_slice(&msg).unwrap())
+                .unwrap();
+            dispatch.poll(&mut [&mut applet]);
+            if let Some(response) = requester.take_response() {
+                trace!(apdu = hex(&msg), sw = hex(&response), "command APDU");
+                write_msg(&mut stream, &response)?;
+            }
         } else {
-            applet.process(&msg)
-        };
-
-        // Extract data and status from iso7816::Response
-        let (response_data, response_sw) = match &response {
-            Response::Data(data) => {
-                (data, 0x9000) // Status is implied to be 9000 for Data variant
-            }
-            Response::More(data, remain) => {
-                (data, iso7816::Status::MoreAvailable(*remain).to_u16())
-            }
-            Response::Status(status) => (&Vec::new(), status.to_u16()),
-        };
-
-        trace!(
-            apdu = hex(&msg),
-            sw = format!("{:04X}", response_sw),
-            "command APDU"
-        );
-        let mut out = response_data.clone();
-        out.extend_from_slice(&response_sw.to_be_bytes());
-        write_msg(&mut stream, &out)?;
+            warn!("command APDU while powered off");
+        }
     }
 }
 

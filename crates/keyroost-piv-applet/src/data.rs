@@ -99,7 +99,6 @@ impl PivApplet {
             return Response::sw(SW_INCORRECT_P1P2);
         }
         let body = command.data();
-        let le = command.expected();
         let Some(tag) = selector_tag(body) else {
             return Response::sw(SW_DATA_INVALID);
         };
@@ -107,7 +106,7 @@ impl PivApplet {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
                 push_tlv(&mut full, &[0x53], &value);
-                self.split_for_le(full, Some(u8::try_from(le).unwrap_or(0)))
+                Response::Data(full)
             }
             None => iso7816::Status::NotFound.into(),
         }
@@ -365,30 +364,6 @@ mod tests {
         let (_step2, _challenge) = mgmt_handshake(&mut applet);
         let resp = applet.process(&put_data(&[0x5F, 0xC1, 0x77], &[0x11]));
         assert_eq!(resp.status(), keyroost_piv::SW_NOT_FOUND);
-    }
-
-    /// A case-4 `Le` smaller than the wrapped value re-enters the `61xx` /
-    /// GET RESPONSE continuation, reassembling to the full `53` template.
-    #[test]
-    fn get_data_continues_past_a_small_le() {
-        let mut applet = PivApplet::new();
-        let (_step2, _challenge) = mgmt_handshake(&mut applet);
-        let value = [0x5Au8; 300];
-        let tag = slot_cert_tag(0);
-        let resp = applet.process(&put_data(&tag, &value));
-        assert_eq!(resp.status(), keyroost_piv::SW_OK);
-        // The host's builder asks for Le `0x00` (256) — the 304-byte
-        // template overflows by 48.
-        let first = applet.process(&get_data(&tag));
-        assert_eq!(first.data().len(), 256);
-        assert_eq!(first.status(), 0x6130);
-        let second = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(second.data().len(), 48);
-        assert_eq!(second.status(), keyroost_piv::SW_OK);
-        let mut full = Vec::from(first.data());
-        full.extend_from_slice(second.data());
-        let inner = unwrap_data_object(&full).expect("a well-formed 53 template");
-        assert_eq!(inner, value.as_slice());
     }
 
     /// PUT DATA answers `9000` with no data, like the card.

@@ -287,8 +287,7 @@ mod tests {
     use super::*;
     use crate::PivApplet;
     use crate::constants::{
-        AID_FULL, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK,
-        SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA,
+        SW_INCORRECT_P1P2, SW_OK, SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_DATA,
     };
     use crate::general_auth::tests::mgmt_handshake;
 
@@ -461,50 +460,6 @@ mod tests {
         let r = applet.process(&verify_pin(b"000000"));
         assert_eq!(r.status(), 0x63C4);
         assert!(!applet.pin_always_armed);
-        let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
-    }
-
-    #[test]
-    fn a_stray_get_response_consumes_the_arm() {
-        let mut applet = PivApplet::new();
-        // A stray GET RESPONSE with nothing pending is not a continuation
-        // of any command: it is a new APDU and consumes the arm.
-        let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
-        let r = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
-        assert!(!applet.pin_always_armed);
-        // And the ALWAYS slot is gated.
-        let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
-    }
-
-    #[test]
-    fn a_real_continuation_does_not_consume_the_arm() {
-        let mut applet = PivApplet::new();
-        // A SELECT with Le=5 truncates the 19-byte property template and
-        // stashes the tail for a GET RESPONSE.
-        let mut select = vec![0x00, 0xA4, 0x04, 0x0B, 0x0B];
-        select.extend_from_slice(&AID_FULL);
-        select.push(0x05);
-        let first = applet.process(&select);
-        assert_eq!(first.status(), 0x610E); // 19 - 5 = 14 remain
-        // A successful VERIFY arms the latch... The GET RESPONSE is a
-        // continuation of the SELECT, not a new command: it must not
-        // consume the arm.
-        let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), SW_OK);
-        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data().len(), 14);
-        assert_eq!(rest.status(), SW_OK);
-        // The arm survives: the ALWAYS slot is still open.
-        let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), SW_INCORRECT_P1P2);
-        // A stray GET RESPONSE with nothing pending is not a continuation:
-        // it is a new command, and the 9C GA after it is gated again.
-        let r = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(r.status(), SW_CONDITIONS_NOT_SATISFIED);
         let r = applet.process(&ga_apdu(0x9C));
         assert_eq!(r.status(), SW_SECURITY_STATUS_NOT_SATISFIED);
     }

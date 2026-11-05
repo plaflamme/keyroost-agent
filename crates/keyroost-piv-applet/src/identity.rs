@@ -15,14 +15,12 @@ impl PivApplet {
     /// the Yubico proprietary one (`0xFF`); anything else is
     /// [`SW_CLA_NOT_SUPPORTED`]. A case-2 `Le` smaller than three re-enters
     /// the usual `61xx` / GET RESPONSE continuation.
+    #[allow(clippy::unused_self)]
     pub(crate) fn process_get_version(
         &mut self,
-        command: &crate::apdu::CommandView<'_>,
+        _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        self.split_for_le(
-            VERSION.to_vec(),
-            Some(u8::try_from(command.expected()).unwrap_or(0)),
-        )
+        Response::Data(VERSION.to_vec())
     }
 
     /// GET SERIAL (0xF8, Yubico extension): the card serial as four
@@ -34,12 +32,9 @@ impl PivApplet {
     /// the usual `61xx` / GET RESPONSE continuation.
     pub(crate) fn process_get_serial(
         &mut self,
-        command: &crate::apdu::CommandView<'_>,
+        _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        self.split_for_le(
-            self.serial.to_be_bytes().to_vec(),
-            Some(u8::try_from(command.expected()).unwrap_or(0)),
-        )
+        Response::Data(self.serial.to_be_bytes().to_vec())
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
@@ -74,7 +69,6 @@ impl PivApplet {
         if command.p1 != 0x00 {
             return Response::sw(SW_INCORRECT_P1P2);
         }
-        let le = Some(u8::try_from(command.expected()).unwrap_or(0));
         let body = match command.p2 {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
             0x81 => PivApplet::pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
@@ -86,7 +80,7 @@ impl PivApplet {
                 None => return Response::sw(SW_INCORRECT_P1P2),
             },
         };
-        self.split_for_le(body, le)
+        Response::Data(body)
     }
 
     /// The flat metadata TLVs of the occupied key slot at `index`;
@@ -208,17 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn get_version_small_le_truncates_and_get_response_completes() {
-        let mut applet = PivApplet::new();
-        let first = applet.process(&[0x00, 0xFD, 0x00, 0x00, 0x02]);
-        assert_eq!(first.data(), [0x05, 0x07]);
-        assert_eq!(first.status(), 0x6101);
-        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data(), [0x04]);
-        assert_eq!(rest.status(), keyroost_piv::SW_OK);
-    }
-
-    #[test]
     fn get_serial_returns_the_serial_big_endian() {
         let mut applet = PivApplet::with_serial(0x0240_8A1B);
         // The host's case-2 form: `00 F8 00 00 00`.
@@ -243,17 +226,6 @@ mod tests {
         let resp = applet.process(&[0x40, 0xF8, 0x00, 0x00]);
         assert_eq!(resp.data(), Vec::new());
         assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
-    }
-
-    #[test]
-    fn get_serial_small_le_truncates_and_get_response_completes() {
-        let mut applet = PivApplet::with_serial(0xAABB_CCDD);
-        let first = applet.process(&[0x00, 0xF8, 0x00, 0x00, 0x02]);
-        assert_eq!(first.data(), [0xAA, 0xBB]);
-        assert_eq!(first.status(), 0x6102);
-        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data(), [0xCC, 0xDD]);
-        assert_eq!(rest.status(), keyroost_piv::SW_OK);
     }
 
     #[test]
@@ -466,19 +438,5 @@ mod tests {
         let resp = applet.process(&[0x40, 0xF7, 0x00, 0x80]);
         assert_eq!(resp.data(), Vec::new());
         assert_eq!(resp.status(), iso7816::Status::ClaNotSupported.to_u16());
-    }
-
-    #[test]
-    fn metadata_small_le_truncates_and_get_response_completes() {
-        let mut applet = PivApplet::new();
-        let full = applet.process(&get_metadata(0x80));
-        let full = full.data();
-        assert_eq!(full.len(), 7);
-        let first = applet.process(&[0x00, 0xF7, 0x00, 0x80, 0x04]);
-        assert_eq!(first.data(), full[..4].to_vec());
-        assert_eq!(first.status(), 0x6103);
-        let rest = applet.process(&[0x00, 0xC0, 0x00, 0x00, 0x00]);
-        assert_eq!(rest.data(), full[4..].to_vec());
-        assert_eq!(rest.status(), keyroost_piv::SW_OK);
     }
 }

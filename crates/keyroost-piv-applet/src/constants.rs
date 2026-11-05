@@ -4,8 +4,6 @@
 
 /// ISO 7816-4 status word: instruction not supported.
 pub(crate) const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
-/// ISO 7816-4 status word: CLA not supported.
-pub(crate) const SW_CLA_NOT_SUPPORTED: u16 = 0x6800;
 /// ISO 7816-4 status word: incorrect P1/P2 — the `JavaCard`
 /// `ISO7816.SW_INCORRECT_P1P2` word the card answers for an unexpected P1.
 pub(crate) const SW_INCORRECT_P1P2: u16 = 0x6B00;
@@ -52,10 +50,6 @@ pub(crate) const DEFAULT_MGMT_KEY: [u8; 24] = [
     1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
 ];
 
-/// SELECT P1: select by DF name (the AID). Anything else on a PIV card is
-/// a file select this applet has no answer for.
-pub(crate) const INS_SELECT_P1_BY_AID: u8 = 0x04;
-
 /// The default serial a factory-fresh applet presents: a placeholder until
 /// the virtual card has a real source of serial identity.
 pub const DEFAULT_SERIAL: u32 = 0x0102_0304;
@@ -74,14 +68,6 @@ pub const AID_FULL: [u8; 11] = [
 /// The 5-byte RID/PIX prefix of [`AID_FULL`] — the shortest SELECT AID this
 /// applet accepts, and the whole of `keyroost-piv`'s `AID`.
 pub const AID_RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x08];
-
-/// TLV tag of the response wrapper the SELECT template is nested in.
-pub(crate) const TAG_61: u8 = 0x61;
-/// TLV tag of the application identifier (AID/PIX) object.
-pub(crate) const TAG_4F: u8 = 0x4F;
-/// TLV tag of the application identifier template (SP 800-73-4) carrying
-/// the RID form of the AID.
-pub(crate) const TAG_79: u8 = 0x79;
 
 /// The factory application PIN: "123456" 0xFF-padded to 8 bytes.
 pub(crate) const DEFAULT_PIN_VALUE: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF];
