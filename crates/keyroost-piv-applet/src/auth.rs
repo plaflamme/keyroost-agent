@@ -39,23 +39,23 @@ impl PivApplet {
         };
         let body = command.data();
         let lc = body.len();
-        if pin.tries == 0 {
+        if pin.tries() == 0 {
             return iso7816::Status::OperationBlocked.into();
         }
         if command.p1 == 0xFF {
             // "Set security status to false": a verified PIN is reset
             // (counter and flag); an unverified one is left alone.
-            if pin.verified {
+            if pin.verified() {
                 pin.reset();
             }
             return iso7816::Status::Success.into();
         }
         if lc == 0 {
             // Status query: `9000` when verified, else `63Cx`.
-            return if pin.verified {
+            return if pin.verified() {
                 return iso7816::Status::Success.into();
             } else {
-                iso7816::Status::RemainingRetries(pin.tries).into()
+                iso7816::Status::RemainingRetries(pin.tries()).into()
             };
         }
         if lc != 8 {
@@ -71,7 +71,7 @@ impl PivApplet {
         } else {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; the applet has no key slots yet.
-            iso7816::Status::RemainingRetries(pin.tries).into()
+            iso7816::Status::RemainingRetries(pin.tries()).into()
         }
     }
 
@@ -102,14 +102,14 @@ impl PivApplet {
         if body.len() != 16 {
             return iso7816::Status::IncorrectDataParameter.into();
         }
-        if target.tries == 0 {
+        if target.tries() == 0 {
             return iso7816::Status::OperationBlocked.into();
         }
         let new_value: [u8; 8] = body[8..].try_into().unwrap();
         if !target.check(&body[..8]) {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; this applet has no key slots yet.
-            return iso7816::Status::RemainingRetries(target.tries).into();
+            return iso7816::Status::RemainingRetries(target.tries()).into();
         }
         if !is_valid_pin(new_value) {
             return iso7816::Status::IncorrectDataParameter.into();
@@ -144,14 +144,14 @@ impl PivApplet {
         if body.len() != 16 {
             return iso7816::Status::IncorrectDataParameter.into();
         }
-        if self.puk.tries == 0 {
+        if self.puk.tries() == 0 {
             return iso7816::Status::OperationBlocked.into();
         }
         let new_pin: [u8; 8] = body[8..].try_into().unwrap();
         if !self.puk.check(&body[..8]) {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; this applet has no key slots yet.
-            return iso7816::Status::RemainingRetries(self.puk.tries).into();
+            return iso7816::Status::RemainingRetries(self.puk.tries()).into();
         }
         if !is_valid_pin(new_pin) {
             return iso7816::Status::IncorrectDataParameter.into();

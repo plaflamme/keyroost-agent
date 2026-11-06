@@ -2,9 +2,9 @@
 //! read-only Yubico extension commands.
 
 use crate::constants::{DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, VERSION};
+use crate::pin::Pin;
 use crate::piv::TouchPolicy;
 use crate::slot::factory_pin_policy;
-use crate::state::Pin;
 use crate::{PivApplet, Response};
 
 impl PivApplet {
@@ -114,15 +114,15 @@ impl PivApplet {
     /// The flat metadata TLVs of a PIN/PUK reference: `05 <is default>` and
     /// `06 <remaining><total>`.
     fn pin_reference_metadata(reference: &Pin, factory: [u8; 8]) -> Vec<u8> {
-        let is_default = *reference.value == factory;
+        let is_default = reference.is_default(&factory);
         vec![
             0x05,
             0x01,
             u8::from(is_default),
             0x06,
             0x02,
-            reference.tries,
-            reference.max_tries,
+            reference.tries(),
+            reference.max_tries(),
         ]
     }
 }

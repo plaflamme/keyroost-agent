@@ -232,7 +232,7 @@ impl PivApplet {
         if !self.mgmt.unlocked() {
             return iso7816::Status::SecurityStatusNotSatisfied.into();
         }
-        if !self.pin.verified {
+        if !self.pin.verified() {
             return iso7816::Status::SecurityStatusNotSatisfied.into();
         }
         self.pin = Pin::factory(DEFAULT_PIN_VALUE, command.p1);
@@ -253,7 +253,7 @@ impl PivApplet {
     /// `6986` until both counters are blocked; `6400` on a non-standard
     /// CLA.
     pub(crate) fn process_reset(&mut self, _command: &crate::apdu::CommandView<'_>) -> Response {
-        if self.pin.tries != 0 || self.puk.tries != 0 {
+        if self.pin.tries() != 0 || self.puk.tries() != 0 {
             // Yubico's documented answer for this precondition is 6985
             // (conditions of use not satisfied); the host only recognises
             // 6982/6983/6985 as "block the PIN and PUK first".

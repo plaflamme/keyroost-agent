@@ -56,9 +56,9 @@ mod general_auth;
 mod identity;
 mod keygen;
 mod management;
+mod pin;
 mod piv;
 mod slot;
-mod state;
 mod yubico;
 
 use attest::Attestation;
@@ -68,7 +68,7 @@ use constants::{
 use data::PivData;
 use iso7816::{Instruction, response::Status};
 use management::MgmtKey;
-use state::Pin;
+use pin::Pin;
 
 use crate::{slot::Slots, yubico::YubicoInstruction};
 pub(crate) use apdu::Response;

@@ -280,8 +280,8 @@ impl PivApplet {
     pub(crate) fn slot_pin_gate(&self, slot: &Slot) -> Result<(), Status> {
         let satisfied = match slot.pin_policy {
             PinPolicy::Never => true,
-            PinPolicy::Once => self.pin.verified,
-            PinPolicy::Always => self.pin.verified && self.pin_always_armed,
+            PinPolicy::Once => self.pin.verified(),
+            PinPolicy::Always => self.pin.verified() && self.pin_always_armed,
             PinPolicy::Default => {
                 unreachable!("not possible, but TODO: make it statically impossible")
             }
