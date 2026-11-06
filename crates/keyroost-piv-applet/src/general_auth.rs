@@ -9,7 +9,7 @@ use crate::constants::{
     GA_TAG_WITNESS,
 };
 use crate::piv::{KeyAlg, MgmtAlg};
-use crate::slot::{SlotKey, slot_index};
+use crate::slot::SlotKey;
 use crate::{PivApplet, Response};
 
 impl PivApplet {
@@ -57,8 +57,8 @@ impl PivApplet {
     ) -> Response {
         // P2 is the key reference: a slot reference goes to the slot path,
         // `9B` is the management key, everything else is refused.
-        match slot_index(command.p2) {
-            Some(index) => self.ga_slot(index, command.p1, command.data()),
+        match crate::piv::Slot::from_u8(command.p2) {
+            Some(slot) => self.ga_slot(slot, command.p1, command.data()),
             None => match command.p2 {
                 0x9B => self.ga_management(command.p1, command.data()),
                 _ => iso7816::Status::IncorrectP1OrP2Parameter.into(),
@@ -72,11 +72,11 @@ impl PivApplet {
     /// one-shot dynamic-auth template — an empty `82` plus exactly one
     /// data member. The applet answers the signature or shared secret
     /// under `82`.
-    fn ga_slot(&self, index: usize, p1: u8, body: &[u8]) -> Response {
-        if let Err(sw) = self.slot_pin_gate(&self.slots[index]) {
+    fn ga_slot(&self, slot: crate::piv::Slot, p1: u8, body: &[u8]) -> Response {
+        if let Err(sw) = self.slot_pin_gate(&self.slots[slot]) {
             return sw.into();
         }
-        let Some(key) = self.slots[index].key.as_ref() else {
+        let Some(key) = self.slots[slot].key.as_ref() else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         if p1 != key.alg as u8 {
@@ -733,7 +733,11 @@ pub(crate) mod tests {
         // 9A/9C/9D and the retired slots: PIN-gated — locked first.
         for p2 in [0x9Au8, 0x9Cu8, 0x9Du8, 0x82u8, 0x8Cu8] {
             let r = applet.process(&ga_apdu_for_p2(p2));
-            assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
+            assert_eq!(
+                r.status(),
+                iso7816::Status::SecurityStatusNotSatisfied,
+                "0x{p2:02X}"
+            );
         }
         // After the PIN is verified the applet has no key material for
         // them. The ONCE slots pass on the session flag; the ALWAYS latch

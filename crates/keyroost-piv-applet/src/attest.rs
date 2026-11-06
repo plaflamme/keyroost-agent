@@ -28,7 +28,7 @@ use x509_cert::spki::ObjectIdentifier;
 
 use crate::constants::VERSION;
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
-use crate::slot::{SlotKey, slot_index};
+use crate::slot::SlotKey;
 use crate::{PivApplet, Response};
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
@@ -72,14 +72,11 @@ impl PivApplet {
         let Some(slot) = crate::piv::Slot::from_u8(command.p1) else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
-        let Some(index) = slot_index(command.p1) else {
-            return iso7816::Status::IncorrectP1OrP2Parameter.into();
-        };
-        let Some(key) = &self.slots[index].key else {
+        let Some(key) = &self.slots[slot].key else {
             return iso7816::Status::KeyReferenceNotFound.into();
         };
-        let pin_policy = self.slots[index].pin_policy;
-        let touch_policy = self.slots[index].touch_policy;
+        let pin_policy = self.slots[slot].pin_policy;
+        let touch_policy = self.slots[slot].touch_policy;
         let Some(spki) = target_public_key(key) else {
             return iso7816::Status::KeyReferenceNotFound.into();
         };
@@ -321,12 +318,7 @@ mod tests {
     #[test]
     fn attest_answers_a_certificate_for_a_generated_key() {
         let mut applet = PivApplet::new();
-        let slot = applet
-            .slots
-            .get_mut(
-                slot_index(keyroost_piv::Slot::Authentication.key_ref()).expect("hardcoded slot"),
-            )
-            .expect("hardcoded slot");
+        let slot = &mut applet.slots[crate::piv::Slot::Authentication];
         let key = elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
         let signing_key = ecdsa::SigningKey::<p256::NistP256>::from(&key);
         slot.key = Some(SlotKey {

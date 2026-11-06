@@ -31,9 +31,9 @@ impl Slot {
     /// All retired-slot construction must go through here so an invalid ref can
     /// never be built.
     #[must_use]
-    fn retired(n: u8) -> Option<Slot> {
-        if (0..20).contains(&n) {
-            Some(Self::Retired(n))
+    pub(crate) fn retired(n: u8) -> Option<Slot> {
+        if (1..=20).contains(&n) {
+            Some(Self::Retired(n - 1))
         } else {
             None
         }
@@ -45,9 +45,21 @@ impl Slot {
             0x9C => Some(Self::Signature),
             0x9D => Some(Self::KeyManagement),
             0x9E => Some(Self::CardAuthentication),
-            0x82..=0x95 => Self::retired(value - 0x82),
+            0x82..=0x95 => Some(Self::Retired(value - 0x82)),
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all() -> impl Iterator<Item = Slot> {
+        let named = [
+            Self::Authentication,
+            Self::Signature,
+            Self::KeyManagement,
+            Self::CardAuthentication,
+        ];
+        let retired = (1..=20).filter_map(Slot::retired);
+        std::iter::chain(named, retired)
     }
 }
 

@@ -68,10 +68,9 @@ use constants::{
 use data::PivData;
 use iso7816::{Instruction, response::Status};
 use management::MgmtKey;
-use slot::{Slot, factory_slots};
 use state::Pin;
 
-use crate::yubico::YubicoInstruction;
+use crate::{slot::Slots, yubico::YubicoInstruction};
 pub(crate) use apdu::Response;
 
 /// A PIV applet instance: the card side of NIST SP 800-73-4.
@@ -102,7 +101,7 @@ pub struct PivApplet {
     /// The 24 key slots in table order: `9A`, `9C`, `9D`, `9E`, then
     /// retired `1..=20` (key refs `82`..=`95`). `9B` (management) and `F9`
     /// (attestation) are not slots.
-    pub(crate) slots: [Slot; 24],
+    pub(crate) slots: Slots,
     /// The non-slot data objects — CHUID, PIN-protected, Yubico admin —
     /// none stored at the factory.
     pub(crate) data: PivData,
@@ -173,7 +172,7 @@ impl PivApplet {
             pin: Pin::factory(DEFAULT_PIN_VALUE, DEFAULT_PIN_TRIES),
             puk: Pin::factory(DEFAULT_PUK_VALUE, DEFAULT_PUK_TRIES),
             mgmt: MgmtKey::default(),
-            slots: factory_slots(),
+            slots: Slots::default(),
             data: PivData::default(),
             pin_always_armed: false,
             attestation: crate::attest::fresh_attestation().expect("fresh attestation"),

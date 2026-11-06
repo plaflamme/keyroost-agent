@@ -3,7 +3,7 @@
 
 use crate::constants::{DEFAULT_PIN_VALUE, DEFAULT_PUK_VALUE, VERSION};
 use crate::piv::TouchPolicy;
-use crate::slot::{factory_pin_policy, slot_index};
+use crate::slot::factory_pin_policy;
 use crate::state::Pin;
 use crate::{PivApplet, Response};
 
@@ -72,8 +72,8 @@ impl PivApplet {
         let body = match command.p2 {
             0x80 => PivApplet::pin_reference_metadata(&self.pin, DEFAULT_PIN_VALUE),
             0x81 => PivApplet::pin_reference_metadata(&self.puk, DEFAULT_PUK_VALUE),
-            reference => match slot_index(reference) {
-                Some(index) => match self.key_reference_metadata(index) {
+            reference => match crate::piv::Slot::from_u8(reference) {
+                Some(slot) => match self.key_reference_metadata(slot) {
                     Some(body) => body,
                     None => return iso7816::Status::KeyReferenceNotFound.into(),
                 },
@@ -86,19 +86,24 @@ impl PivApplet {
     /// The flat metadata TLVs of the occupied key slot at `index`;
     /// `None` for an empty slot (the caller answers
     /// [`SW_REFERENCE_NOT_FOUND`]).
-    fn key_reference_metadata(&self, index: usize) -> Option<Vec<u8>> {
-        let slot = &self.slots[index];
-        let key = slot.key.as_ref()?;
-        let is_default =
-            slot.pin_policy == factory_pin_policy(index) && slot.touch_policy == TouchPolicy::Never;
+    fn key_reference_metadata(&self, slot: crate::piv::Slot) -> Option<Vec<u8>> {
+        let slot_state = &self.slots[slot];
+        let key = slot_state.key.as_ref()?;
+        let is_default = slot_state.pin_policy == factory_pin_policy(slot)
+            && slot_state.touch_policy == TouchPolicy::Never;
         // The `7F49` inner TLVs, unwrapped from their template exactly as
         // the GENERATE response carries it: the `86` point for EC keys,
         // the `81` modulus and `82` exponent for RSA keys.
         let inner = key.public_inner()?;
         let mut body = Vec::new();
         body.extend_from_slice(&[0x01, 0x01, key.alg as u8]);
-        body.extend_from_slice(&[0x02, 0x02, slot.pin_policy as u8, slot.touch_policy as u8]);
-        body.extend_from_slice(&[0x03, 0x01, if slot.imported { 0x02 } else { 0x01 }]);
+        body.extend_from_slice(&[
+            0x02,
+            0x02,
+            slot_state.pin_policy as u8,
+            slot_state.touch_policy as u8,
+        ]);
+        body.extend_from_slice(&[0x03, 0x01, if slot_state.imported { 0x02 } else { 0x01 }]);
         body.push(0x04);
         push_ber_len(&mut body, inner.len());
         body.extend_from_slice(&inner);

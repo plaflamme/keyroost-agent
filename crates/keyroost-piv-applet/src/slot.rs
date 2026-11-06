@@ -20,6 +20,8 @@
 //!   the session's `pin.verified` flag and the [`PivApplet::pin_always_armed`]
 //!   latch; [`iso7816::Status::SecurityStatusNotSatisfied`] otherwise.
 
+use std::ops::{Index, IndexMut};
+
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 use elliptic_curve::sec1::ToSec1Point;
 use iso7816::Status;
@@ -169,7 +171,7 @@ impl Slot {
 
 /// The table order of the 24 key slots, one entry per slot: `9A`, `9C`,
 /// `9D`, `9E`, then retired `1..=20` (key refs `82`..=`95`).
-pub(crate) const fn factory_slots() -> [Slot; 24] {
+const fn factory_slots() -> [Slot; 24] {
     [
         Slot::factory(PinPolicy::Once),
         Slot::factory(PinPolicy::Always),
@@ -202,28 +204,50 @@ pub(crate) const fn factory_slots() -> [Slot; 24] {
 /// `NEVER` for 9E (index 3) and `ONCE` for every other slot — the per-slot
 /// column of [`factory_slots`], exposed so GET METADATA can report whether a
 /// slot still holds its factory policies.
-pub(crate) const fn factory_pin_policy(index: usize) -> PinPolicy {
-    match index {
-        1 => PinPolicy::Always,
-        3 => PinPolicy::Never,
+pub(crate) const fn factory_pin_policy(slot: crate::piv::Slot) -> PinPolicy {
+    match slot {
+        crate::piv::Slot::Signature => PinPolicy::Always,
+        crate::piv::Slot::CardAuthentication => PinPolicy::Never,
         _ => PinPolicy::Once,
     }
 }
 
 /// Map a key reference to its table index.
-///
-/// `9A`/`9C`/`9D`/`9E` are table indices `0`..=`3`; retired `n` (key ref
-/// `81 + n`) is table index `3 + n`, so key refs `82`..=`95` are indices
-/// `4`..=`23`. Everything else — `9B` (management), `F9` (attestation), the
-/// vendor-extension references, the PIN references — is not a slot.
-pub(crate) const fn slot_index(key_ref: u8) -> Option<usize> {
-    match key_ref {
-        0x9A => Some(0),
-        0x9C => Some(1),
-        0x9D => Some(2),
-        0x9E => Some(3),
-        0x82..=0x95 => Some((key_ref - 0x82 + 4) as usize),
-        _ => None,
+const fn slot_index(slot: crate::piv::Slot) -> usize {
+    match slot {
+        crate::piv::Slot::Authentication => 0,
+        crate::piv::Slot::Signature => 1,
+        crate::piv::Slot::KeyManagement => 2,
+        crate::piv::Slot::CardAuthentication => 3,
+        crate::piv::Slot::Retired(index) => index as usize + 4,
+    }
+}
+
+pub(crate) struct Slots([Slot; 24]);
+
+impl Slots {
+    fn new() -> Self {
+        Self(factory_slots())
+    }
+}
+
+impl Default for Slots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Index<crate::piv::Slot> for Slots {
+    type Output = Slot;
+
+    fn index(&self, index: crate::piv::Slot) -> &Self::Output {
+        &self.0[slot_index(index)]
+    }
+}
+
+impl IndexMut<crate::piv::Slot> for Slots {
+    fn index_mut(&mut self, index: crate::piv::Slot) -> &mut Self::Output {
+        self.0.index_mut(slot_index(index))
     }
 }
 
@@ -268,24 +292,12 @@ impl PivApplet {
             Err(iso7816::Status::SecurityStatusNotSatisfied)
         }
     }
-
-    /// The factory PIN policy of the slot at `index`: `NEVER` for 9E,
-    /// `ALWAYS` for 9C, `ONCE` for every other slot — the same table
-    /// `factory_slots` lays out.
-    pub(crate) const fn factory_pin_policy(index: usize) -> PinPolicy {
-        match index {
-            3 => PinPolicy::Never,
-            1 => PinPolicy::Always,
-            _ => PinPolicy::Once,
-        }
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::PivApplet;
     use crate::general_auth::tests::mgmt_handshake;
 
     /// A case-1 GA APDU: `00 87 00 <p2>`, the shape the host's
@@ -306,55 +318,49 @@ mod tests {
 
     #[test]
     fn factory_slot_table_has_the_plan_policies() {
-        let applet = PivApplet::new();
+        let slots = Slots::new();
         // 9A, 9C, 9D, 9E: once, always, once, never.
-        assert_eq!(applet.slots[0].pin_policy, PinPolicy::Once);
-        assert_eq!(applet.slots[1].pin_policy, PinPolicy::Always);
-        assert_eq!(applet.slots[2].pin_policy, PinPolicy::Once);
-        assert_eq!(applet.slots[3].pin_policy, PinPolicy::Never);
+        assert_eq!(
+            slots[crate::piv::Slot::Authentication].pin_policy,
+            PinPolicy::Once
+        );
+        assert_eq!(
+            slots[crate::piv::Slot::Signature].pin_policy,
+            PinPolicy::Always
+        );
+        assert_eq!(
+            slots[crate::piv::Slot::KeyManagement].pin_policy,
+            PinPolicy::Once
+        );
+        assert_eq!(
+            slots[crate::piv::Slot::CardAuthentication].pin_policy,
+            PinPolicy::Never
+        );
         // All 20 retired slots: once.
-        for slot in &applet.slots[4..] {
-            assert_eq!(slot.pin_policy, PinPolicy::Once);
+        for slot in 1..=20 {
+            assert_eq!(
+                slots[crate::piv::Slot::retired(slot).unwrap()].pin_policy,
+                PinPolicy::Once
+            );
         }
     }
 
     #[test]
     fn factory_pin_policy_matches_the_table() {
         let slots = factory_slots();
-        for (index, slot) in slots.iter().enumerate() {
-            assert_eq!(slot.pin_policy, factory_pin_policy(index));
+        for slot in crate::piv::Slot::all() {
+            assert_eq!(slots[slot_index(slot)].pin_policy, factory_pin_policy(slot));
         }
     }
 
     #[test]
     fn factory_slots_are_empty() {
-        let applet = PivApplet::new();
-        for slot in &applet.slots {
+        let slots = Slots::default();
+        for slot in &slots.0 {
             assert!(slot.key.is_none());
             assert!(slot.cert.is_none());
             assert!(!slot.imported);
             assert_eq!(slot.touch_policy, TouchPolicy::Never);
-        }
-    }
-
-    #[test]
-    fn slot_index_maps_the_slot_refs_only() {
-        assert_eq!(slot_index(0x9A), Some(0));
-        assert_eq!(slot_index(0x9C), Some(1));
-        assert_eq!(slot_index(0x9D), Some(2));
-        assert_eq!(slot_index(0x9E), Some(3));
-        assert_eq!(slot_index(0x82), Some(4));
-        assert_eq!(slot_index(0x95), Some(23));
-        for n in 1..=20usize {
-            assert_eq!(slot_index(0x81 + n as u8), Some(3 + n));
-        }
-        // Not slots: the PIN/PUK refs, the management key, the
-        // attestation reference, the vendor-extension references,
-        // `Retired(0)`, and everything above the retired range.
-        for ref_ in [
-            0x80u8, 0x81u8, 0x96u8, 0x9Bu8, 0xE0u8, 0xE1u8, 0xF9u8, 0x00u8,
-        ] {
-            assert_eq!(slot_index(ref_), None, "{ref_:02X}");
         }
     }
 
@@ -381,13 +387,17 @@ mod tests {
         let mut applet = PivApplet::new();
         // 9A is ONCE: locked before the PIN is verified...
         assert_eq!(
-            applet.slot_pin_gate(&applet.slots[0]),
+            applet.slot_pin_gate(&applet.slots[crate::piv::Slot::Authentication]),
             Err(iso7816::Status::SecurityStatusNotSatisfied)
         );
         // ...and open after.
         let r = applet.process(&verify_pin(b"123456"));
         assert_eq!(r.status(), iso7816::Status::Success);
-        assert!(applet.slot_pin_gate(&applet.slots[0]).is_ok());
+        assert!(
+            applet
+                .slot_pin_gate(&applet.slots[crate::piv::Slot::Authentication])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -395,7 +405,7 @@ mod tests {
         let mut applet = PivApplet::new();
         // Locked before the PIN is verified...
         assert_eq!(
-            applet.slot_pin_gate(&applet.slots[1]),
+            applet.slot_pin_gate(&applet.slots[crate::piv::Slot::Signature]),
             Err(iso7816::Status::SecurityStatusNotSatisfied)
         );
         // ...and the APDU right after a successful VERIFY is the one that
@@ -419,7 +429,11 @@ mod tests {
     fn never_policy_is_ungated() {
         let mut applet = PivApplet::new();
         // 9E is NEVER: no PIN, no arm, always open.
-        assert!(applet.slot_pin_gate(&applet.slots[3]).is_ok());
+        assert!(
+            applet
+                .slot_pin_gate(&applet.slots[crate::piv::Slot::CardAuthentication])
+                .is_ok()
+        );
         let r = applet.process(&ga_apdu(0x9E));
         assert_eq!(r.status(), iso7816::Status::IncorrectP1OrP2Parameter);
     }
@@ -428,10 +442,13 @@ mod tests {
     fn retired_slots_are_gated_by_their_own_policy() {
         let mut applet = PivApplet::new();
         // Retired 1 (82) and retired 20 (95) are ONCE.
-        for (ref_, index) in [(0x82u8, 4usize), (0x95u8, 23usize)] {
-            assert_eq!(slot_index(ref_), Some(index));
+        for (ref_, index) in [
+            (crate::piv::Slot::retired(1).unwrap(), 4usize),
+            (crate::piv::Slot::retired(20).unwrap(), 23usize),
+        ] {
+            assert_eq!(slot_index(ref_), index);
             assert_eq!(
-                applet.process(&ga_apdu(ref_)).status(),
+                applet.process(&ga_apdu(ref_.into_u8())).status(),
                 iso7816::Status::SecurityStatusNotSatisfied
             );
         }

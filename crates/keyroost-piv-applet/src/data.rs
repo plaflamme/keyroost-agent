@@ -72,15 +72,13 @@ impl PivData {
 /// tag — `5F C1 05` (`9A`), `5F C1 0A` (`9C`), `5F C1 0B` (`9D`),
 /// `5F C1 01` (`9E`) and `5F C1 0C+n` for retired slot `n` — or `None`
 /// for a non-slot object tag.
-pub(crate) fn cert_slot_index(tag: [u8; 3]) -> Option<usize> {
+pub(crate) fn cert_slot_index(tag: [u8; 3]) -> Option<crate::piv::Slot> {
     match tag {
-        [0x5F, 0xC1, 0x05] => Some(0),
-        [0x5F, 0xC1, 0x0A] => Some(1),
-        [0x5F, 0xC1, 0x0B] => Some(2),
-        [0x5F, 0xC1, 0x01] => Some(3),
-        [0x5F, 0xC1, third] if (0x0D..=0x20).contains(&third) => {
-            Some(3 + usize::from(third - 0x0C))
-        }
+        [0x5F, 0xC1, 0x05] => Some(crate::piv::Slot::Authentication),
+        [0x5F, 0xC1, 0x0A] => Some(crate::piv::Slot::Signature),
+        [0x5F, 0xC1, 0x0B] => Some(crate::piv::Slot::KeyManagement),
+        [0x5F, 0xC1, 0x01] => Some(crate::piv::Slot::CardAuthentication),
+        [0x5F, 0xC1, third @ 0x0D..=0x20] => Some(crate::piv::Slot::Retired(third - 0x0D)),
         _ => None,
     }
 }

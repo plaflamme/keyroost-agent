@@ -27,12 +27,13 @@ use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
 
+use crate::piv::Slot;
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 
 use crate::PivApplet;
 use crate::Response;
 use crate::data::push_tlv;
-use crate::slot::{SlotKey, rsa_modulus_len, slot_index};
+use crate::slot::{SlotKey, rsa_modulus_len};
 
 /// The public exponent every PIV RSA key carries: `0x01 0x00 0x01` (65537).
 /// GENERATE keys use it because `RsaPrivateKey::new` fixes it; IMPORT
@@ -198,7 +199,7 @@ impl PivApplet {
             push_tlv(&mut data, &[0x7F, 0x49], &inner);
             return data.into();
         }
-        let Some(index) = slot_index(command.p2) else {
+        let Some(slot) = Slot::from_u8(command.p2) else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         let secret = match alg {
@@ -246,7 +247,7 @@ impl PivApplet {
         let Some(inner) = key.public_inner() else {
             return iso7816::Status::IncorrectDataParameter.into();
         };
-        self.commit_slot_key(index, key, false, pin_policy, touch_policy);
+        self.commit_slot_key(slot, key, false, pin_policy, touch_policy);
 
         let mut data = Vec::with_capacity(3 + inner.len());
         push_tlv(&mut data, &[0x7F, 0x49], &inner);
@@ -268,7 +269,7 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return sw.into();
         }
-        let Some(index) = slot_index(command.p2) else {
+        let Some(index) = crate::piv::Slot::from_u8(command.p2) else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         let alg = match KeyAlg::from_u8(command.p1) {
@@ -360,12 +361,12 @@ impl PivApplet {
         if let Err(sw) = self.management_unlocked() {
             return sw.into();
         }
-        let Some(source) = slot_index(command.p2) else {
+        let Some(source) = crate::piv::Slot::from_u8(command.p2) else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
         };
         let dest = match command.p1 {
             0xFF => None,
-            reference => match slot_index(reference) {
+            reference => match crate::piv::Slot::from_u8(reference) {
                 Some(index) => Some(index),
                 None => return iso7816::Status::IncorrectP1OrP2Parameter.into(),
             },
@@ -550,25 +551,25 @@ impl PivApplet {
     /// invalidates the old certificate).
     fn commit_slot_key(
         &mut self,
-        index: usize,
+        slot: crate::piv::Slot,
         key: SlotKey,
         imported: bool,
         pin_policy: Option<PinPolicy>,
         touch_policy: Option<TouchPolicy>,
     ) {
-        let slot = &mut self.slots[index];
-        slot.key = Some(key);
-        slot.imported = imported;
-        slot.pin_policy = match pin_policy {
-            Some(PinPolicy::Default) => Self::factory_pin_policy(index),
+        let slot_state = &mut self.slots[slot];
+        slot_state.key = Some(key);
+        slot_state.imported = imported;
+        slot_state.pin_policy = match pin_policy {
+            Some(PinPolicy::Default) => crate::slot::factory_pin_policy(slot),
             Some(policy) => policy,
-            None => slot.pin_policy,
+            None => slot_state.pin_policy,
         };
-        slot.touch_policy = match touch_policy {
+        slot_state.touch_policy = match touch_policy {
             Some(policy) => policy,
-            None => slot.touch_policy,
+            None => slot_state.touch_policy,
         };
-        slot.cert = None;
+        slot_state.cert = None;
     }
 }
 
@@ -780,7 +781,7 @@ mod tests {
             keyroost_piv::TouchPolicy::Always,
         ));
         assert_eq!(r.status(), iso7816::Status::Success);
-        let slot = &app.slots[0];
+        let slot = &app.slots[crate::piv::Slot::Authentication];
         assert!(slot.key.is_some());
         assert_eq!(slot.pin_policy, PinPolicy::Always);
         assert_eq!(slot.touch_policy, TouchPolicy::Always);
@@ -791,8 +792,14 @@ mod tests {
             app.process(&gen_apdu(Slot::Authentication)).status(),
             iso7816::Status::Success
         );
-        assert_eq!(app.slots[0].pin_policy, PinPolicy::Always);
-        assert_eq!(app.slots[0].touch_policy, TouchPolicy::Always);
+        assert_eq!(
+            app.slots[crate::piv::Slot::Authentication].pin_policy,
+            PinPolicy::Always
+        );
+        assert_eq!(
+            app.slots[crate::piv::Slot::Authentication].touch_policy,
+            TouchPolicy::Always
+        );
 
         // Explicit `DEFAULT` policies restore the slot's factory policies.
         let control = [0x80, 0x01, 0x11, 0xAA, 0x01, 0x00, 0xAB, 0x01, 0x00];
@@ -801,8 +808,14 @@ mod tests {
                 .status(),
             iso7816::Status::Success
         );
-        assert_eq!(app.slots[0].pin_policy, PinPolicy::Once); // 9A's factory
-        assert_eq!(app.slots[0].touch_policy, TouchPolicy::Default); // factory: no touch policy
+        assert_eq!(
+            app.slots[crate::piv::Slot::Authentication].pin_policy,
+            PinPolicy::Once
+        ); // 9A's factory
+        assert_eq!(
+            app.slots[crate::piv::Slot::Authentication].touch_policy,
+            TouchPolicy::Default
+        ); // factory: no touch policy
     }
 
     #[test]
@@ -848,7 +861,7 @@ mod tests {
         assert_eq!(r.status(), iso7816::Status::Success);
         assert_eq!(r.data(), [] as [u8; 0]);
 
-        let slot = &app.slots[0];
+        let slot = &app.slots[crate::piv::Slot::Authentication];
         let key = slot.key.as_ref().expect("the imported key");
         assert_eq!(key.alg, KeyAlg::EccP256);
         assert_eq!(&key.secret[..], &scalar[..]);
@@ -930,7 +943,7 @@ mod tests {
         apdu[4] = 0x30;
         assert_eq!(app.process(&apdu).status(), iso7816::Status::WrongLength);
         // Refusals leave the slot empty.
-        assert!(app.slots[0].key.is_none());
+        assert!(app.slots[crate::piv::Slot::Authentication].key.is_none());
     }
 
     #[test]
@@ -948,7 +961,7 @@ mod tests {
                 "{scalar:02X?}"
             );
         }
-        assert!(app.slots[0].key.is_none());
+        assert!(app.slots[crate::piv::Slot::Authentication].key.is_none());
     }
 
     #[test]
@@ -962,7 +975,10 @@ mod tests {
         );
         // The stored scalar is the ECDSA secret for the point the slot
         // reports: a host-side prehash sign/verify round trip closes it.
-        let key = app.slots[0].key.as_ref().expect("the imported key");
+        let key = app.slots[crate::piv::Slot::Authentication]
+            .key
+            .as_ref()
+            .expect("the imported key");
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&key.secret[..]);
         let sk = SigningKey::from_bytes(&bytes.into()).expect("a valid scalar");
@@ -1084,7 +1100,10 @@ mod tests {
         assert_eq!(e, [0x01u8, 0x00, 0x01]);
         // The stored secret is the PKCS#1 key itself: it decodes and
         // carries the announced modulus and exponent.
-        let key = app.slots[3].key.as_ref().expect("the generated key");
+        let key = app.slots[crate::piv::Slot::CardAuthentication]
+            .key
+            .as_ref()
+            .expect("the generated key");
         let stored =
             RsaPrivateKey::from_pkcs1_der(key.secret.as_slice()).expect("a PKCS#1 RSAPrivateKey");
         assert_eq!(stored.n().to_bytes_be(), n);
@@ -1121,7 +1140,10 @@ mod tests {
             // host's own `d` reduced to that modulus (the host's `d` is
             // generated modulo phi(n), a multiple of lambda(n)). The GA
             // round trip below proves the two sign the same thing.
-            let key = app.slots[3].key.as_ref().expect("the imported key");
+            let key = app.slots[crate::piv::Slot::CardAuthentication]
+                .key
+                .as_ref()
+                .expect("the imported key");
             let stored = RsaPrivateKey::from_pkcs1_der(key.secret.as_slice())
                 .expect("a PKCS#1 RSAPrivateKey");
             assert_eq!(stored.n().to_bytes_be(), host.n);
@@ -1200,7 +1222,11 @@ mod tests {
                 "body {body:02X?}"
             );
         }
-        assert!(app.slots[3].key.is_none());
+        assert!(
+            app.slots[crate::piv::Slot::CardAuthentication]
+                .key
+                .is_none()
+        );
     }
 
     /// Read an object back through the host's GET DATA builder; the test
@@ -1249,8 +1275,8 @@ mod tests {
             iso7816::Status::Success,
             "move"
         );
-        let source = &app.slots[slot_index(0x9C).expect("9C")];
-        let dest = &app.slots[slot_index(0x82).expect("retired 1")];
+        let source = &app.slots[crate::piv::Slot::Signature];
+        let dest = &app.slots[crate::piv::Slot::retired(1).expect("retired slot 1")];
         assert!(source.key.is_none(), "the source keeps no key");
         assert_eq!(
             dest.key.as_ref().expect("the key moved").secret.as_slice(),
@@ -1288,7 +1314,7 @@ mod tests {
             iso7816::Status::Success,
             "delete"
         );
-        let slot = &app.slots[slot_index(0x9A).expect("9A")];
+        let slot = &app.slots[crate::piv::Slot::Authentication];
         assert!(slot.key.is_none());
         assert_eq!(slot.pin_policy, PinPolicy::Once, "the policy is untouched");
         assert!(slot.cert.is_some(), "the certificate is untouched");
@@ -1381,8 +1407,8 @@ mod tests {
             .status(),
             iso7816::Status::IncorrectDataParameter
         );
-        let source = &app.slots[slot_index(0x9C).expect("9C")];
-        let dest = &app.slots[slot_index(0x9D).expect("9D")];
+        let source = &app.slots[crate::piv::Slot::Signature];
+        let dest = &app.slots[crate::piv::Slot::KeyManagement];
         assert_eq!(
             source.key.as_ref().expect("still there").secret.as_slice(),
             &scalar
@@ -1417,7 +1443,11 @@ mod tests {
         assert_eq!(point.len(), 97);
         p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-384 point");
         assert_eq!(
-            app.slots[1].key.as_ref().expect("a key").alg,
+            app.slots[crate::piv::Slot::Signature]
+                .key
+                .as_ref()
+                .expect("a key")
+                .alg,
             KeyAlg::EccP384
         );
 
@@ -1431,7 +1461,11 @@ mod tests {
         assert_eq!(point.len(), 133);
         p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).expect("a P-521 point");
         assert_eq!(
-            app.slots[2].key.as_ref().expect("a key").alg,
+            app.slots[crate::piv::Slot::KeyManagement]
+                .key
+                .as_ref()
+                .expect("a key")
+                .alg,
             KeyAlg::EccP521
         );
     }
@@ -1457,10 +1491,14 @@ mod tests {
             iso7816::Status::Success
         );
         assert_eq!(
-            app.slots[0].key.as_ref().expect("a key").alg,
+            app.slots[crate::piv::Slot::Authentication]
+                .key
+                .as_ref()
+                .expect("a key")
+                .alg,
             KeyAlg::EccP384
         );
-        assert!(app.slots[0].imported);
+        assert!(app.slots[crate::piv::Slot::Authentication].imported);
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         let expected_point = p384::SecretKey::from_slice(&scalar)
             .expect("a valid scalar")
@@ -1502,10 +1540,14 @@ mod tests {
             iso7816::Status::Success
         );
         assert_eq!(
-            app.slots[4].key.as_ref().expect("a key").alg,
+            app.slots[crate::piv::Slot::retired(1).expect("retired slot 1")]
+                .key
+                .as_ref()
+                .expect("a key")
+                .alg,
             KeyAlg::EccP521
         );
-        assert!(app.slots[4].imported);
+        assert!(app.slots[crate::piv::Slot::retired(1).expect("retired slot 1")].imported);
     }
 
     #[test]
@@ -1569,6 +1611,6 @@ mod tests {
             );
         }
         // Nothing landed in 9C.
-        assert!(app.slots[1].key.is_none());
+        assert!(app.slots[crate::piv::Slot::Signature].key.is_none());
     }
 }
