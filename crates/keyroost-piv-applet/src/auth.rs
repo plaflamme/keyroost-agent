@@ -1,7 +1,7 @@
 //! VERIFY (0x20), CHANGE REFERENCE DATA (0x24) and RESET RETRY COUNTER
 //! (0x2C): the PIN/PUK reference-data commands.
 
-use crate::{PivApplet, Response, tries_sw};
+use crate::{PivApplet, Response};
 
 /// PIN reference (P2) for the PIV application PIN.
 const PIN_REF_APPLICATION: u8 = 0x80;
@@ -55,7 +55,7 @@ impl PivApplet {
             return if pin.verified {
                 return iso7816::Status::Success.into();
             } else {
-                tries_sw(pin.tries).into()
+                iso7816::Status::RemainingRetries(pin.tries).into()
             };
         }
         if lc != 8 {
@@ -71,7 +71,7 @@ impl PivApplet {
         } else {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; the applet has no key slots yet.
-            tries_sw(pin.tries).into()
+            iso7816::Status::RemainingRetries(pin.tries).into()
         }
     }
 
@@ -109,7 +109,7 @@ impl PivApplet {
         if !target.check(&body[..8]) {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; this applet has no key slots yet.
-            return tries_sw(target.tries).into();
+            return iso7816::Status::RemainingRetries(target.tries).into();
         }
         if !is_valid_pin(new_value) {
             return iso7816::Status::IncorrectDataParameter.into();
@@ -151,7 +151,7 @@ impl PivApplet {
         if !self.puk.check(&body[..8]) {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; this applet has no key slots yet.
-            return tries_sw(self.puk.tries).into();
+            return iso7816::Status::RemainingRetries(self.puk.tries).into();
         }
         if !is_valid_pin(new_pin) {
             return iso7816::Status::IncorrectDataParameter.into();
@@ -193,7 +193,7 @@ pub(crate) mod tests {
     pub(crate) fn block_pin(applet: &mut PivApplet) {
         for tries in (1..=DEFAULT_PIN_TRIES).rev() {
             let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-            assert_eq!(resp.status(), tries_sw(tries - 1));
+            assert_eq!(resp.status(), iso7816::Status::RemainingRetries(tries - 1));
         }
     }
 
@@ -209,9 +209,15 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         // Case-1 and case-3 `Le` = 0 both read as an empty body.
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES)
+        );
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80, 0x00]);
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES)
+        );
     }
 
     #[test]
@@ -227,7 +233,10 @@ pub(crate) mod tests {
     fn verify_wrong_pin_burns_a_try() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 1)
+        );
     }
 
     #[test]
@@ -236,7 +245,10 @@ pub(crate) mod tests {
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
         assert_eq!(resp.status(), Status::Success);
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 1)
+        );
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
         assert_eq!(resp.status(), Status::Success);
     }
@@ -265,20 +277,32 @@ pub(crate) mod tests {
         let resp = applet.process(&[0x00, 0x20, 0xFF, 0x80]);
         assert_eq!(resp.status(), Status::Success);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES)
+        );
     }
 
     #[test]
     fn verify_unverify_leaves_an_unverified_counter_alone() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 2));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 2)
+        );
         let resp = applet.process(&[0x00, 0x20, 0xFF, 0x80]);
         assert_eq!(resp.status(), Status::Success);
         let resp = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 2));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 2)
+        );
     }
 
     #[test]
@@ -339,7 +363,10 @@ pub(crate) mod tests {
         let resp = applet.process(
             &keyroost_piv::change_reference(PIN_REF_APPLICATION, b"000000", b"654321").unwrap(),
         );
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
         assert_eq!(resp.status(), Status::Success);
     }
@@ -462,7 +489,10 @@ pub(crate) mod tests {
     fn unblock_pin_wrong_puk_burns_a_puk_try() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PUK_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PUK_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
         assert_eq!(resp.status(), Status::Success);
     }
@@ -472,7 +502,7 @@ pub(crate) mod tests {
         let mut applet = PivApplet::new();
         for tries in (1..=DEFAULT_PUK_TRIES).rev() {
             let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
-            assert_eq!(resp.status(), tries_sw(tries - 1));
+            assert_eq!(resp.status(), iso7816::Status::RemainingRetries(tries - 1));
         }
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
         assert_eq!(resp.status(), Status::OperationBlocked);
@@ -493,13 +523,19 @@ pub(crate) mod tests {
     fn unblock_pin_resets_the_puk_counter() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PUK_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PUK_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::unblock_pin(b"12345678", b"999999").unwrap());
         assert_eq!(resp.status(), Status::Success);
         // The counter was reset to its limit: one wrong PUK answers `63C2`,
         // not `63C0`.
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PUK_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PUK_TRIES - 1)
+        );
     }
 
     #[test]
@@ -517,17 +553,29 @@ pub(crate) mod tests {
     fn pin_and_puk_counters_are_independent() {
         let mut applet = PivApplet::new();
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PIN_TRIES - 2));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PIN_TRIES - 2)
+        );
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"999999").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PUK_TRIES - 1));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PUK_TRIES - 1)
+        );
         let resp = applet.process(&keyroost_piv::verify_pin(b"123456").unwrap());
         assert_eq!(resp.status(), Status::Success);
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
-        assert_eq!(resp.status(), tries_sw(DEFAULT_PUK_TRIES - 2));
+        assert_eq!(
+            resp.status(),
+            iso7816::Status::RemainingRetries(DEFAULT_PUK_TRIES - 2)
+        );
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
-        assert_eq!(resp.status(), tries_sw(0));
+        assert_eq!(resp.status(), iso7816::Status::RemainingRetries(0));
         let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"111111").unwrap());
         assert_eq!(resp.status(), Status::OperationBlocked);
     }

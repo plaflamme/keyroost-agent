@@ -513,7 +513,6 @@ fn read_tlv_length(buf: &[u8]) -> Result<(usize, usize), u16> {
 pub(crate) mod tests {
     use super::*;
     use crate::constants::{DEFAULT_MGMT_KEY, DEFAULT_PUK_TRIES};
-    use crate::tries_sw;
     use aes::cipher::{BlockCipherDecrypt, KeyInit};
     use elliptic_curve::Generate;
     use elliptic_curve::sec1::ToSec1Point;
@@ -586,7 +585,7 @@ pub(crate) mod tests {
     pub(crate) fn block_puk(applet: &mut PivApplet) {
         for tries in (1..=DEFAULT_PUK_TRIES).rev() {
             let resp = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"123456").unwrap());
-            assert_eq!(resp.status(), tries_sw(tries - 1));
+            assert_eq!(resp.status(), iso7816::Status::RemainingRetries(tries - 1));
         }
     }
 

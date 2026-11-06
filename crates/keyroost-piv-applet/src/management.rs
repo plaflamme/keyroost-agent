@@ -272,7 +272,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::auth::tests::block_pin;
     use crate::general_auth::tests::{block_puk, ga_apdu, ga_body, mgmt_handshake};
-    use crate::tries_sw;
 
     #[test]
     fn set_management_key_locked_is_security_status() {
@@ -355,11 +354,11 @@ pub(crate) mod tests {
         // The counters are set and the values reset to the factory defaults:
         // one PIN try left, and a wrong PIN burns it (blocking the counter).
         let r = applet.process(&keyroost_piv::verify_pin(b"000000").unwrap());
-        assert_eq!(r.status(), tries_sw(0));
+        assert_eq!(r.status(), iso7816::Status::RemainingRetries(0));
         // The PUK counter too.
         for tries in (2..=5).rev() {
             let r = applet.process(&keyroost_piv::unblock_pin(b"00000000", b"12345678").unwrap());
-            assert_eq!(r.status(), tries_sw(tries - 1));
+            assert_eq!(r.status(), iso7816::Status::RemainingRetries(tries - 1));
         }
     }
 

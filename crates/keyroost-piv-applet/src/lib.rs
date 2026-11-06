@@ -259,9 +259,3 @@ impl PivApplet {
         response
     }
 }
-
-/// The `63Cx` status word carrying `tries` remaining in the low nibble of
-/// the second byte — the form the host's `sw_tries_remaining` decodes.
-pub(crate) fn tries_sw(tries: u8) -> Status {
-    Status::RemainingRetries(tries)
-}
