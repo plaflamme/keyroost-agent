@@ -78,7 +78,7 @@ pub(crate) fn cert_slot_index(tag: [u8; 3]) -> Option<crate::piv::Slot> {
         [0x5F, 0xC1, 0x0A] => Some(crate::piv::Slot::Signature),
         [0x5F, 0xC1, 0x0B] => Some(crate::piv::Slot::KeyManagement),
         [0x5F, 0xC1, 0x01] => Some(crate::piv::Slot::CardAuthentication),
-        [0x5F, 0xC1, third @ 0x0D..=0x20] => Some(crate::piv::Slot::Retired(third - 0x0D)),
+        [0x5F, 0xC1, third @ 0x0D..=0x20] => crate::piv::Slot::retired(third - 0x0C),
         _ => None,
     }
 }

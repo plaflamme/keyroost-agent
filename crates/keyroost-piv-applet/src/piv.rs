@@ -1,3 +1,21 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredIndex(u8);
+
+impl RetiredIndex {
+    /// Returns the retired slot's value in 0..20
+    pub(crate) const fn value(self) -> u8 {
+        self.0
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        Self(value - 0x82)
+    }
+
+    const fn into_u8(self) -> u8 {
+        self.0 + 0x82
+    }
+}
+
 /// The four PIV asymmetric key slots, identified by their key reference and the
 /// certificate data object that holds the slot's X.509 certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,7 +29,7 @@ pub enum Slot {
     /// `9E` — Card Authentication.
     CardAuthentication,
     /// Yubico retired key-management slots (fw 5.7+). 0x82..=0x95 (represented as Retired(0..20))
-    Retired(u8),
+    Retired(RetiredIndex),
 }
 
 impl Slot {
@@ -23,7 +41,7 @@ impl Slot {
             Slot::Signature => 0x9C,
             Slot::KeyManagement => 0x9D,
             Slot::CardAuthentication => 0x9E,
-            Slot::Retired(n) => 0x82 + n,
+            Slot::Retired(n) => n.into_u8(),
         }
     }
 
@@ -33,7 +51,7 @@ impl Slot {
     #[must_use]
     pub(crate) fn retired(n: u8) -> Option<Slot> {
         if (1..=20).contains(&n) {
-            Some(Self::Retired(n - 1))
+            Some(Self::Retired(RetiredIndex(n - 1)))
         } else {
             None
         }
@@ -45,7 +63,7 @@ impl Slot {
             0x9C => Some(Self::Signature),
             0x9D => Some(Self::KeyManagement),
             0x9E => Some(Self::CardAuthentication),
-            0x82..=0x95 => Some(Self::Retired(value - 0x82)),
+            0x82..=0x95 => Some(Self::Retired(RetiredIndex::from_u8(value))),
             _ => None,
         }
     }

@@ -219,7 +219,7 @@ const fn slot_index(slot: crate::piv::Slot) -> usize {
         crate::piv::Slot::Signature => 1,
         crate::piv::Slot::KeyManagement => 2,
         crate::piv::Slot::CardAuthentication => 3,
-        crate::piv::Slot::Retired(index) => index as usize + 4,
+        crate::piv::Slot::Retired(index) => index.value() as usize + 4,
     }
 }
 
