@@ -61,69 +61,18 @@ mod slot;
 mod state;
 mod yubico;
 
-pub use constants::{AID_FULL, AID_RID, DEFAULT_SERIAL, VERSION};
-
 use attest::Attestation;
-use constants::{DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE};
+use constants::{
+    DEFAULT_PIN_TRIES, DEFAULT_PIN_VALUE, DEFAULT_PUK_TRIES, DEFAULT_PUK_VALUE, DEFAULT_SERIAL,
+};
 use data::PivData;
 use iso7816::{Instruction, response::Status};
 use management::MgmtKey;
 use slot::{Slot, factory_slots};
 use state::Pin;
 
-#[derive(Debug)]
-struct Response(apdu_dispatch::Response);
-
-impl Response {
-    pub(crate) fn from_slice(data: &[u8]) -> Self {
-        let apdu_response = match apdu_dispatch::response::Data::from_slice(data) {
-            Ok(data) => apdu_dispatch::Response::Data(data),
-            Err(_) => apdu_dispatch::Response::Status(Status::NotEnoughMemory),
-        };
-        Self(apdu_response)
-    }
-
-    #[allow(unused)]
-    pub(crate) fn data(&self) -> &[u8] {
-        match &self.0 {
-            iso7816::Response::Data(d) => d,
-            iso7816::Response::Status(_) => &[],
-        }
-    }
-
-    pub(crate) fn status(&self) -> Status {
-        match self.0 {
-            iso7816::Response::Data(_) => Status::Success,
-            iso7816::Response::Status(status) => status,
-        }
-    }
-}
-
-impl From<Status> for Response {
-    fn from(value: Status) -> Self {
-        Self(apdu_dispatch::Response::Status(value))
-    }
-}
-
-impl From<Vec<u8>> for Response {
-    fn from(value: Vec<u8>) -> Self {
-        Self::from_slice(&value)
-    }
-}
-
-impl From<&[u8]> for Response {
-    fn from(value: &[u8]) -> Self {
-        Self::from_slice(value)
-    }
-}
-
-impl<const N: usize> From<[u8; N]> for Response {
-    fn from(value: [u8; N]) -> Self {
-        Self::from_slice(&value)
-    }
-}
-
 use crate::yubico::YubicoInstruction;
+pub(crate) use apdu::Response;
 
 /// A PIV applet instance: the card side of NIST SP 800-73-4.
 ///
@@ -198,7 +147,7 @@ impl apdu_app::App for PivApplet {
         apdu: apdu_app::CommandView<'_>,
         reply: &mut apdu_app::VecView<u8>,
     ) -> apdu_app::Result {
-        match self.process_command(&apdu).0 {
+        match self.process_command(&apdu).into_inner() {
             apdu_dispatch::Response::Data(d) => reply.extend(d),
             apdu_dispatch::Response::Status(s) => return Err(s),
         }
