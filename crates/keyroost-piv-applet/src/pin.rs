@@ -2,6 +2,31 @@
 
 use zeroize::Zeroizing;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum VerifiedState {
+    /// The pin was never verified
+    #[default]
+    Never,
+    /// The pin was verified once this session
+    Session,
+    /// The pin was verified by the previous APDU
+    Previous,
+    /// The pin was verified by this APDU
+    Now,
+}
+
+impl VerifiedState {
+    /// Returns true when the pin was verified at least once in the session.
+    fn is_verified(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+
+    /// A more strict check that only accepts the verified state when it was verified by the previous APDU
+    fn is_verified_previous(self) -> bool {
+        matches!(self, Self::Previous)
+    }
+}
+
 /// One PIV reference-data state.
 ///
 /// The value and the counter live for the applet's life; `verified` lives
@@ -16,18 +41,12 @@ pub(crate) struct Pin {
     max_tries: u8,
     /// Tries remaining; 0 means blocked.
     tries: u8,
-    /// Session-verified: set by a successful check, cleared by the card's
-    /// reset points.
-    verified: bool,
+    verified_state: VerifiedState,
 }
 
 impl Pin {
     pub(crate) fn tries(&self) -> u8 {
         self.tries
-    }
-
-    pub(crate) fn verified(&self) -> bool {
-        self.verified
     }
 
     pub(crate) fn max_tries(&self) -> u8 {
@@ -38,6 +57,14 @@ impl Pin {
         *self.value == default_value
     }
 
+    pub(crate) fn verified(&self) -> bool {
+        self.verified_state.is_verified()
+    }
+
+    pub(crate) fn verified_previous(&self) -> bool {
+        self.verified_state.is_verified_previous()
+    }
+
     /// Factory-fresh state: the stored value, the counter at its limit, not
     /// verified.
     pub(crate) fn factory(value: [u8; 8], max_tries: u8) -> Self {
@@ -45,7 +72,7 @@ impl Pin {
             value: Zeroizing::new(value),
             max_tries,
             tries: max_tries,
-            verified: false,
+            verified_state: VerifiedState::default(),
         }
     }
 
@@ -56,7 +83,7 @@ impl Pin {
     pub(crate) fn check(&mut self, presented: &[u8]) -> bool {
         let ok = ct_eq(presented, &self.value[..]);
         if ok {
-            self.verified = true;
+            self.verified_state = VerifiedState::Now;
             self.tries = self.max_tries;
         } else {
             self.tries -= 1;
@@ -64,10 +91,28 @@ impl Pin {
         ok
     }
 
+    pub(crate) fn session_end(&mut self) {
+        self.verified_state = VerifiedState::Never;
+    }
+
+    /// Downgrade the verified state.
+    ///
+    /// If the state was verified by the current APDU, then it is downgraded to [`VerifiedState::Previous`].
+    /// If the state is [`VerifiedState::Previous`], then it is downgraded to [`VerifiedState::Session`].
+    ///
+    /// Anything else leves the verified state untouched.
+    pub(crate) fn downgrade(&mut self) {
+        self.verified_state = match self.verified_state {
+            VerifiedState::Never | VerifiedState::Session => return,
+            VerifiedState::Previous => VerifiedState::Session,
+            VerifiedState::Now => VerifiedState::Previous,
+        };
+    }
+
     /// Reset the counter back to its limit, `verified` cleared.
     pub(crate) fn reset(&mut self) {
         self.tries = self.max_tries;
-        self.verified = false;
+        self.verified_state = VerifiedState::Never;
     }
 
     /// Replace the stored value; the counter and `verified` are untouched.

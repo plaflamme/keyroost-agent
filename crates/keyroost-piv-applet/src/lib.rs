@@ -105,10 +105,6 @@ pub struct PivApplet {
     /// The non-slot data objects — CHUID, PIN-protected, Yubico admin —
     /// none stored at the factory.
     pub(crate) data: PivData,
-    /// The PIN/ALWAYS latch: set by a successful VERIFY, consumed by the
-    /// next non-chained APDU — an `ALWAYS`-policy slot operation must be
-    /// the APDU right after the VERIFY that armed it.
-    pub(crate) pin_always_armed: bool,
     /// The `F9` attestation key and its self-signed certificate — the key
     /// that signs the ATTEST certificates and the slot keys' on-card
     /// origin proof.
@@ -134,7 +130,9 @@ impl apdu_app::App for PivApplet {
         _apdu: apdu_app::CommandView<'_>,
         _reply: &mut apdu_app::VecView<u8>,
     ) -> apdu_app::Result {
-        // NOOP
+        // Selecting the applet clears in-memory state
+        self.pin.session_end();
+        self.puk.session_end();
         Ok(())
     }
 
@@ -174,7 +172,6 @@ impl PivApplet {
             mgmt: MgmtKey::default(),
             slots: Slots::default(),
             data: PivData::default(),
-            pin_always_armed: false,
             attestation: crate::attest::fresh_attestation().expect("fresh attestation"),
         }
     }
@@ -212,15 +209,8 @@ impl PivApplet {
             return iso7816::Status::ClaNotSupported.into();
         }
 
-        let ins = command.instruction();
-        // A VERIFY carrying an 8-byte body is a real PIN presentation —
-        // the status query (no body) is not, even though both can answer
-        // 9000. Only a presentation that the card accepts re-arms the
-        // PIN/ALWAYS latch.
-        let pin_presentation =
-            ins == Instruction::Verify && command.p1 == 0x00 && command.data().len() == 8;
         #[allow(clippy::match_same_arms)]
-        let response = match ins {
+        let response = match command.instruction() {
             Instruction::Select => unreachable!(),
             Instruction::Verify => self.process_verify(command),
             Instruction::GetData => self.process_get_data(command),
@@ -247,14 +237,9 @@ impl PivApplet {
             }
             Instruction::Unknown(_code) => Status::InstructionNotSupportedOrInvalid.into(),
         };
-        // The PIN/ALWAYS latch is consumed by the APDU after the one that
-        // armed it. A successful PIN presentation is the one APDU that arms
-        // it — and it must not consume the arm it just set: the arm survives
-        // until the next command.
-        let armed_this_apdu = pin_presentation && response.status() == Status::Success;
-        if !armed_this_apdu {
-            self.pin_always_armed = false;
-        }
+
+        self.pin.downgrade();
+        self.puk.downgrade();
         response
     }
 }

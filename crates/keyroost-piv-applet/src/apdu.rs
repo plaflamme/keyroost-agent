@@ -27,6 +27,7 @@ impl Response {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn status(&self) -> Status {
         match self.0 {
             ApduResponse::Data(_) => Status::Success,

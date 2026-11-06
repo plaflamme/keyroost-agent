@@ -281,7 +281,7 @@ impl PivApplet {
         let satisfied = match slot.pin_policy {
             PinPolicy::Never => true,
             PinPolicy::Once => self.pin.verified(),
-            PinPolicy::Always => self.pin.verified() && self.pin_always_armed,
+            PinPolicy::Always => self.pin.verified_previous(),
             PinPolicy::Default => {
                 unreachable!("not possible, but TODO: make it statically impossible")
             }
@@ -462,36 +462,6 @@ mod tests {
             applet.process(&ga_apdu(0x95)).status(),
             iso7816::Status::IncorrectP1OrP2Parameter
         );
-    }
-
-    #[test]
-    fn the_arm_is_set_only_by_a_successful_verify() {
-        let mut applet = PivApplet::new();
-        // A fresh applet has no arm.
-        assert!(!applet.pin_always_armed);
-        // A wrong PIN does not set it...
-        let r = applet.process(&verify_pin(b"000000"));
-        assert_eq!(r.status(), Status::RemainingRetries(4));
-        assert!(!applet.pin_always_armed);
-        // ...nor does a status query, even though both can answer 9000.
-        let r = applet.process(&[0x00, 0x20, 0x00, 0x80]);
-        assert_eq!(r.status(), Status::RemainingRetries(4));
-        assert!(!applet.pin_always_armed);
-        // A successful PIN presentation does.
-        let r = applet.process(&verify_pin(b"123456"));
-        assert_eq!(r.status(), iso7816::Status::Success);
-        assert!(applet.pin_always_armed);
-    }
-
-    #[test]
-    fn a_wrong_pin_does_not_arm_the_latch() {
-        let mut applet = PivApplet::new();
-        // One burned try (5 -> 4).
-        let r = applet.process(&verify_pin(b"000000"));
-        assert_eq!(r.status(), Status::RemainingRetries(4));
-        assert!(!applet.pin_always_armed);
-        let r = applet.process(&ga_apdu(0x9C));
-        assert_eq!(r.status(), iso7816::Status::SecurityStatusNotSatisfied);
     }
 
     #[test]

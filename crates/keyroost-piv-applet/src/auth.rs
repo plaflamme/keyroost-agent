@@ -62,11 +62,6 @@ impl PivApplet {
             return iso7816::Status::IncorrectDataParameter.into();
         }
         if pin.check(body) {
-            // A successful VERIFY arms the PIN/ALWAYS latch: an
-            // `ALWAYS`-policy slot operation must follow it immediately.
-            // The latch is consumed by the next non-chained APDU — cleared
-            // in `process`, where the APDU that armed it survives intact.
-            self.pin_always_armed = true;
             iso7816::Status::Success.into()
         } else {
             // The card would also wipe the key slots here if this try
