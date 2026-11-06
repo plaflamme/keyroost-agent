@@ -113,11 +113,11 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
     let mut power_on = false;
 
     let contact = apdu_dispatch::interchanges::Channel::new();
-    let Some((_rq, contact_rp)) = contact.split() else {
+    let Some((mut contact_requester, contact_rp)) = contact.split() else {
         return Err(io::Error::other("cannot create channel"));
     };
     let contactless = apdu_dispatch::interchanges::Channel::new();
-    let Some((mut requester, contactless_rp)) = contactless.split() else {
+    let Some((_, contactless_rp)) = contactless.split() else {
         return Err(io::Error::other("cannot create channel"));
     };
     let mut dispatch = apdu_dispatch::dispatch::ApduDispatch::new(contact_rp, contactless_rp);
@@ -144,13 +144,30 @@ fn serve_connection(mut stream: TcpStream, atr: &[u8]) -> io::Result<()> {
             }
             continue;
         }
-        // A command APDU.
+
         if power_on {
-            requester
-                .request(apdu_dispatch::interchanges::Data::from_slice(&msg).unwrap())
-                .unwrap();
-            dispatch.poll(&mut [&mut applet]);
-            if let Some(response) = requester.take_response() {
+            let Ok(data) = apdu_dispatch::interchanges::Data::from_slice(&msg) else {
+                warn!(
+                    "command too large. Expected up to {}, got {} bytes",
+                    apdu_dispatch::interchanges::SIZE,
+                    msg.len(),
+                );
+                continue;
+            };
+
+            // NOTE: presumably, reading and writing should run in their own thread.
+            let Ok(()) = contact_requester.request(data) else {
+                warn!("failed to send request");
+                continue;
+            };
+
+            let response = match dispatch.poll(&mut [&mut applet]) {
+                Some(iso7816::Interface::Contact) => contact_requester.take_response(),
+                Some(iso7816::Interface::Contactless) => unreachable!("contactless is unused"),
+                None => continue,
+            };
+
+            if let Some(response) = response {
                 trace!(apdu = hex(&msg), sw = hex(&response), "command APDU");
                 write_msg(&mut stream, &response)?;
             }
