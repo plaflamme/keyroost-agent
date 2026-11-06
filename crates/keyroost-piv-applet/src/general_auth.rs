@@ -408,7 +408,7 @@ fn ga_response(tag: u8, value: &[u8]) -> Response {
     let mut data = vec![GA_TAG_DYN_AUTH];
     length(&mut data, inner.len());
     data.extend_from_slice(&inner);
-    Response::from_vec(data)
+    data.into()
 }
 
 /// Parse the GA body as the card's dispatcher does: the `7C` wrapper (with

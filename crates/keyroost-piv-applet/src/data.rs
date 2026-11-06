@@ -105,7 +105,7 @@ impl PivApplet {
             Some(value) => {
                 let mut full = Vec::with_capacity(2 + value.len());
                 push_tlv(&mut full, &[0x53], &value);
-                Response::from_vec(full)
+                full.into()
             }
             None => iso7816::Status::NotFound.into(),
         }

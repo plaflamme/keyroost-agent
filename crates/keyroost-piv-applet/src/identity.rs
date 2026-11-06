@@ -20,7 +20,7 @@ impl PivApplet {
         &mut self,
         _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        Response::from_vec(VERSION.to_vec())
+        VERSION.into()
     }
 
     /// GET SERIAL (0xF8, Yubico extension): the card serial as four
@@ -34,7 +34,7 @@ impl PivApplet {
         &mut self,
         _command: &crate::apdu::CommandView<'_>,
     ) -> Response {
-        Response::from_vec(self.serial.to_be_bytes().to_vec())
+        self.serial.to_be_bytes().into()
     }
 
     /// GET METADATA (0xF7, Yubico extension): per-key/PIN metadata
@@ -80,7 +80,7 @@ impl PivApplet {
                 None => return iso7816::Status::IncorrectP1OrP2Parameter.into(),
             },
         };
-        Response::from_vec(body)
+        body.into()
     }
 
     /// The flat metadata TLVs of the occupied key slot at `index`;

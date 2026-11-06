@@ -75,11 +75,12 @@ use state::Pin;
 struct Response(apdu_dispatch::Response);
 
 impl Response {
-    #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn from_vec(data: Vec<u8>) -> Self {
-        Self(apdu_dispatch::Response::Data(
-            apdu_dispatch::response::Data::from_slice(data.as_slice()).unwrap(), // TODO: don't panic
-        ))
+    pub(crate) fn from_slice(data: &[u8]) -> Self {
+        let apdu_response = match apdu_dispatch::response::Data::from_slice(data) {
+            Ok(data) => apdu_dispatch::Response::Data(data),
+            Err(_) => apdu_dispatch::Response::Status(Status::NotEnoughMemory),
+        };
+        Self(apdu_response)
     }
 
     #[allow(unused)]
@@ -101,6 +102,24 @@ impl Response {
 impl From<Status> for Response {
     fn from(value: Status) -> Self {
         Self(apdu_dispatch::Response::Status(value))
+    }
+}
+
+impl From<Vec<u8>> for Response {
+    fn from(value: Vec<u8>) -> Self {
+        Self::from_slice(&value)
+    }
+}
+
+impl From<&[u8]> for Response {
+    fn from(value: &[u8]) -> Self {
+        Self::from_slice(value)
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for Response {
+    fn from(value: [u8; N]) -> Self {
+        Self::from_slice(&value)
     }
 }
 

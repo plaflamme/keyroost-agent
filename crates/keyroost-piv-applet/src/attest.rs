@@ -96,7 +96,7 @@ impl PivApplet {
         let Ok(der) = cert.to_der() else {
             return iso7816::Status::ConditionsOfUseNotSatisfied.into();
         };
-        Response::from_vec(der)
+        der.into()
     }
 }
 

@@ -196,7 +196,7 @@ impl PivApplet {
             push_tlv(&mut inner, &[0x86], &point);
             let mut data = Vec::with_capacity(inner.len() + 2);
             push_tlv(&mut data, &[0x7F, 0x49], &inner);
-            return Response::from_vec(data);
+            return data.into();
         }
         let Some(index) = slot_index(command.p2) else {
             return iso7816::Status::IncorrectP1OrP2Parameter.into();
@@ -250,7 +250,7 @@ impl PivApplet {
 
         let mut data = Vec::with_capacity(3 + inner.len());
         push_tlv(&mut data, &[0x7F, 0x49], &inner);
-        Response::from_vec(data)
+        data.into()
     }
 
     /// IMPORT ASYMMETRIC KEY (`0xFE`): the host's
