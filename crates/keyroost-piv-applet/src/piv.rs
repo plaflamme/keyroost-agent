@@ -154,39 +154,47 @@ impl KeyAlg {
     }
 }
 
+/// Pin and Touch policies can be set to their "default" state.
+/// But the "default" member is only ever used when writing the policy to the slot.
+/// So instead of adding "Default" members to those enums, we use this type which can represent the default value
+/// only when writing the policies. This eliminates the need to handle the "default" member later on when using the policies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Defaultable<T> {
+    Default,
+    Specified(T),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinPolicy {
-    Default = 0x00,
     Never = 0x01,
     Once = 0x02,
     Always = 0x03,
 }
 
 impl PinPolicy {
-    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+    pub(crate) fn from_u8(value: u8) -> Option<Defaultable<Self>> {
         match value {
-            0x00 => Some(Self::Default),
-            0x01 => Some(Self::Never),
-            0x02 => Some(Self::Once),
-            0x03 => Some(Self::Always),
+            0x00 => Some(Defaultable::Default),
+            0x01 => Some(Defaultable::Specified(Self::Never)),
+            0x02 => Some(Defaultable::Specified(Self::Once)),
+            0x03 => Some(Defaultable::Specified(Self::Always)),
             _ => None,
         }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchPolicy {
-    Default = 0x00,
     Never = 0x01,
     Always = 0x02,
     Cached = 0x03,
 }
 impl TouchPolicy {
-    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+    pub(crate) fn from_u8(value: u8) -> Option<Defaultable<Self>> {
         match value {
-            0x00 => Some(Self::Default),
-            0x01 => Some(Self::Never),
-            0x02 => Some(Self::Always),
-            0x03 => Some(Self::Cached),
+            0x00 => Some(Defaultable::Default),
+            0x01 => Some(Defaultable::Specified(Self::Never)),
+            0x02 => Some(Defaultable::Specified(Self::Always)),
+            0x03 => Some(Defaultable::Specified(Self::Cached)),
             _ => None,
         }
     }

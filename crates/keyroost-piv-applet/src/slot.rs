@@ -282,9 +282,6 @@ impl PivApplet {
             PinPolicy::Never => true,
             PinPolicy::Once => self.pin.verified(),
             PinPolicy::Always => self.pin.verified_previous(),
-            PinPolicy::Default => {
-                unreachable!("not possible, but TODO: make it statically impossible")
-            }
         };
         if satisfied {
             Ok(())

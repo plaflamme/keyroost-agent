@@ -27,6 +27,7 @@ use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use zeroize::Zeroizing;
 
+use crate::piv::Defaultable;
 use crate::piv::Slot;
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
 
@@ -400,7 +401,17 @@ impl PivApplet {
 /// command: a required `80 01 <algorithm>` member and optional `AA 01
 /// <pin policy>` / `AB 01 <touch policy>` members, in any order, each at
 /// most once.
-fn parse_control(control: &[u8]) -> Result<(KeyAlg, Option<PinPolicy>, Option<TouchPolicy>), ()> {
+#[allow(clippy::type_complexity)]
+fn parse_control(
+    control: &[u8],
+) -> Result<
+    (
+        KeyAlg,
+        Option<Defaultable<PinPolicy>>,
+        Option<Defaultable<TouchPolicy>>,
+    ),
+    (),
+> {
     let mut alg = None;
     let mut pin_policy = None;
     let mut touch_policy = None;
@@ -481,8 +492,8 @@ struct ImportKey {
     dp: Option<Vec<u8>>,
     dq: Option<Vec<u8>>,
     n: Option<Vec<u8>>,
-    pin_policy: Option<PinPolicy>,
-    touch_policy: Option<TouchPolicy>,
+    pin_policy: Option<Defaultable<PinPolicy>>,
+    touch_policy: Option<Defaultable<TouchPolicy>>,
 }
 
 /// Walk the ordered TLV members of `rest` from the front, calling `f` for
@@ -518,7 +529,7 @@ fn parse_alg(value: &[u8]) -> Result<KeyAlg, ()> {
 }
 
 /// An `AA 01 <id>` pin-policy member.
-fn parse_pin_policy(value: &[u8]) -> Result<PinPolicy, ()> {
+fn parse_pin_policy(value: &[u8]) -> Result<Defaultable<PinPolicy>, ()> {
     let [id] = value else {
         return Err(());
     };
@@ -526,7 +537,7 @@ fn parse_pin_policy(value: &[u8]) -> Result<PinPolicy, ()> {
 }
 
 /// An `AB 01 <id>` touch-policy member.
-fn parse_touch_policy(value: &[u8]) -> Result<TouchPolicy, ()> {
+fn parse_touch_policy(value: &[u8]) -> Result<Defaultable<TouchPolicy>, ()> {
     let [id] = value else {
         return Err(());
     };
@@ -554,19 +565,20 @@ impl PivApplet {
         slot: crate::piv::Slot,
         key: SlotKey,
         imported: bool,
-        pin_policy: Option<PinPolicy>,
-        touch_policy: Option<TouchPolicy>,
+        pin_policy: Option<Defaultable<PinPolicy>>,
+        touch_policy: Option<Defaultable<TouchPolicy>>,
     ) {
         let slot_state = &mut self.slots[slot];
         slot_state.key = Some(key);
         slot_state.imported = imported;
         slot_state.pin_policy = match pin_policy {
-            Some(PinPolicy::Default) => crate::slot::factory_pin_policy(slot),
-            Some(policy) => policy,
+            Some(Defaultable::Default) => crate::slot::factory_pin_policy(slot),
+            Some(Defaultable::Specified(policy)) => policy,
             None => slot_state.pin_policy,
         };
         slot_state.touch_policy = match touch_policy {
-            Some(policy) => policy,
+            Some(Defaultable::Default) => TouchPolicy::Never,
+            Some(Defaultable::Specified(policy)) => policy,
             None => slot_state.touch_policy,
         };
         slot_state.cert = None;
@@ -814,7 +826,7 @@ mod tests {
         ); // 9A's factory
         assert_eq!(
             app.slots[crate::piv::Slot::Authentication].touch_policy,
-            TouchPolicy::Default
+            TouchPolicy::Never
         ); // factory: no touch policy
     }
 
