@@ -993,7 +993,7 @@ dependencies = [
  "clap-verbosity-flag",
  "ecdsa 0.16.9",
  "keyroost-openpgp",
- "keyroost-piv",
+ "keyroost-piv 0.14.0",
  "keyroost-transport",
  "p256 0.13.2",
  "p384 0.13.1",
@@ -1020,7 +1020,7 @@ dependencies = [
  "hidapi",
  "hmac 0.12.1",
  "keyroost-hid",
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "miniz_oxide",
  "p256 0.13.2",
  "rand_core 0.6.4",
@@ -1035,7 +1035,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4476818c2614750dc5a1ad6271d074542665a093bb156749b8a64e90c1b7b961"
 dependencies = [
  "hidapi",
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "keyroost-windevtree",
 ]
 
@@ -1045,7 +1045,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d31228d1d0f420be52ea69d0a216473fc0157676224808f841501332aba660a"
 dependencies = [
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "zeroize",
 ]
 
@@ -1055,7 +1055,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b590529d212dba75ddb6bf632c1bb1b99efb193bc023a1a17a86b527eaef8408"
 dependencies = [
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "zeroize",
 ]
 
@@ -1065,7 +1065,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d8d895c6c38ec170a93ee8cd15a56d0d290e1de8b0ffcd4cac60edfe939147a"
 dependencies = [
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "zeroize",
 ]
 
@@ -1075,7 +1075,17 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812ccf80ebf66579dcf57ca02f120d02b1eec8f7be001aa37378d135ea9c659c"
 dependencies = [
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
+ "zeroize",
+]
+
+[[package]]
+name = "keyroost-piv"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84c0a2c57ca2d228bf66f451c6cfd438d7a19260a97df2ec029ad7e9e8453379"
+dependencies = [
+ "keyroost-proto 0.15.0",
  "zeroize",
 ]
 
@@ -1093,8 +1103,7 @@ dependencies = [
  "elliptic-curve 0.14.3",
  "getrandom 0.4.3",
  "iso7816",
- "keyroost-piv",
- "keyroost-proto",
+ "keyroost-piv 0.15.0",
  "p256 0.14.0",
  "p384 0.14.0",
  "p521 0.14.0",
@@ -1114,6 +1123,12 @@ name = "keyroost-proto"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8bb6675e722e0bb6c28ab580608460b190cd4165ab774738842056724147caa"
+
+[[package]]
+name = "keyroost-proto"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8152ede67c73a7840712556fa1ccfc3f94cd74e6f619c70b55cccf7bb18e5747"
 
 [[package]]
 name = "keyroost-token2otp"
@@ -1136,7 +1151,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e11c00eab073dd7304b41282d98e64793e1c6befecff61483f9317e6f3ef85e9"
 dependencies = [
- "keyroost-proto",
+ "keyroost-proto 0.14.0",
  "zeroize",
 ]
 
@@ -1156,8 +1171,8 @@ dependencies = [
  "keyroost-import",
  "keyroost-oath",
  "keyroost-openpgp",
- "keyroost-piv",
- "keyroost-proto",
+ "keyroost-piv 0.14.0",
+ "keyroost-proto 0.14.0",
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-windevtree",
