@@ -172,7 +172,7 @@ impl PivApplet {
             mgmt: MgmtKey::default(),
             slots: Slots::default(),
             data: PivData::default(),
-            attestation: crate::attest::fresh_attestation().expect("fresh attestation"),
+            attestation: Attestation::generate().expect("can generate an attestation key"),
         }
     }
 

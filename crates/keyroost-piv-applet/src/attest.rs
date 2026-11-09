@@ -25,6 +25,7 @@ use x509_cert::der::{Decode, Encode};
 use x509_cert::ext::Extension;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
 use x509_cert::spki::ObjectIdentifier;
+use x509_cert::time::Validity;
 
 use crate::constants::VERSION;
 use crate::piv::{KeyAlg, PinPolicy, TouchPolicy};
@@ -37,21 +38,35 @@ const OID_YUBICO_FIRMWARE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 const OID_YUBICO_SERIAL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.7");
 const OID_YUBICO_POLICY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.3.8");
 
-/// The card's attestation state: the `F9` key's P-256 secret scalar and its
-/// own self-signed certificate in the `70`-wrapped storage form.
 pub(crate) struct Attestation {
     pub(crate) secret_key: elliptic_curve::SecretKey<p256::NistP256>,
     /// Option because after replacing the secret key (via keygen), the certificate that was in place is no longer valid until a new one is stored in its place.
     pub(crate) cert: Option<x509_cert::Certificate>,
 }
 
-/// The `F9` attestation key's own key-policy extension bytes: the reference
-/// applet's `F9` slot factory policy (PIN `ONCE`) and its hardcoded touch
-/// byte (`NEVER`).
-#[allow(unused)]
-pub(crate) const F9_PIN_POLICY: PinPolicy = PinPolicy::Once;
-#[allow(unused)]
-pub(crate) const F9_TOUCH_POLICY: TouchPolicy = TouchPolicy::Never;
+impl Attestation {
+    /// Generate a new secret attestation key with its attestation certificate.
+    pub(crate) fn generate() -> Result<Attestation, Box<dyn std::error::Error>> {
+        let secret_key =
+            elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
+        let signing = ecdsa::SigningKey::<p256::NistP256>::from(&secret_key);
+        let cert = x509_cert::builder::CertificateBuilder::new(
+            YubicoRootProfile,
+            x509_cert::serial_number::SerialNumber::generate(&mut rand::rng()),
+            x509_cert::time::Validity::from_now(std::time::Duration::from_hours(24 * 30))
+                .expect("valid validity"),
+            x509_cert::SubjectPublicKeyInfo::from_key(&secret_key.public_key())
+                .expect("valid public key"),
+        )?
+        .build::<ecdsa::SigningKey<p256::NistP256>, ecdsa::der::Signature<p256::NistP256>>(
+            &signing,
+        )?;
+        Ok(Attestation {
+            secret_key,
+            cert: Some(cert),
+        })
+    }
+}
 
 impl PivApplet {
     /// ATTEST (`0xF9`): `00 F9 <slot> 00 [Le]`, case 2. The card answers
@@ -80,8 +95,13 @@ impl PivApplet {
         let Some(spki) = target_public_key(key) else {
             return iso7816::Status::KeyReferenceNotFound.into();
         };
+        let Some(cert) = self.attestation.cert.as_ref() else {
+            return iso7816::Status::ConditionsOfUseNotSatisfied.into();
+        };
+
         let Some(cert) = attestation_cert(
             &self.attestation.secret_key,
+            *cert.tbs_certificate().validity(), // Validity of the attestation certificate is the one from the sining certificate
             slot,
             self.serial,
             spki,
@@ -176,14 +196,10 @@ impl x509_cert::builder::Profile for YubicoPivAttestationProfile {
         });
 
         // 3. Policy Extension: Two-byte configuration (Byte 0: PIN Policy, Byte 1: Touch Policy)
-        let policy_bytes = [self.pin_policy as u8, self.touch_policy as u8];
-        let policy_payload = OctetString::new(policy_bytes)?;
-        let policy_der = policy_payload.to_der()?;
-
         extensions.push(Extension {
             extn_id: OID_YUBICO_POLICY,
             critical: false,
-            extn_value: OctetString::new(policy_der)?,
+            extn_value: OctetString::new([self.pin_policy as u8, self.touch_policy as u8])?,
         });
 
         Ok(extensions)
@@ -246,6 +262,7 @@ impl x509_cert::builder::Profile for YubicoRootProfile {
 /// See <https://developers.yubico.com/PIV/Introduction/PIV_attestation.html#_implementation>
 fn attestation_cert(
     secret_key: &p256::SecretKey,
+    validity: Validity,
     slot: crate::piv::Slot,
     yubikey_serial: u32,
     spki: x509_cert::SubjectPublicKeyInfo,
@@ -262,7 +279,7 @@ fn attestation_cert(
             touch_policy,
         },
         x509_cert::serial_number::SerialNumber::generate(&mut rand::rng()),
-        x509_cert::time::Validity::from_now(std::time::Duration::from_hours(24 * 30)).unwrap(), // TODO: this is the signing certificate's validity
+        validity,
         spki,
     )
     .ok()?
@@ -272,28 +289,6 @@ fn attestation_cert(
     .ok()
 }
 
-/// A fresh attestation state: a new on-card P-256 key and its self-signed
-/// certificate, the reference applet's `initAttestation` — minted
-/// unconditionally at card construction, the key's origin being on-card by
-/// construction.
-pub(crate) fn fresh_attestation() -> Result<Attestation, Box<dyn std::error::Error>> {
-    let secret_key =
-        elliptic_curve::SecretKey::<p256::NistP256>::generate_from_rng(&mut rand::rng());
-    let signing = ecdsa::SigningKey::<p256::NistP256>::from(&secret_key);
-    let cert = x509_cert::builder::CertificateBuilder::new(
-        YubicoRootProfile,
-        x509_cert::serial_number::SerialNumber::generate(&mut rand::rng()),
-        x509_cert::time::Validity::from_now(std::time::Duration::from_hours(24 * 30)).unwrap(), // TODO: this is the signing certificate's validity
-        x509_cert::SubjectPublicKeyInfo::from_key(&secret_key.public_key())
-            .expect("valid public key"),
-    )?
-    .build::<ecdsa::SigningKey<p256::NistP256>, ecdsa::der::Signature<p256::NistP256>>(&signing)?;
-    Ok(Attestation {
-        secret_key,
-        cert: Some(cert),
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
@@ -301,7 +296,10 @@ mod tests {
 
     use super::*;
     use crate::general_auth::tests::mgmt_handshake;
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use elliptic_curve::sec1::ToSec1Point;
     use iso7816::Status;
+    use sha2::Digest;
     use x509_cert::builder::Builder;
     use x509_cert::der::Encode;
     use zeroize::Zeroizing;
@@ -348,73 +346,55 @@ mod tests {
         // The host's builder is case 2 with Le 0x00: a certificate over
         // 256 bytes splits over 61xx / GET RESPONSE.
         let apdu = keyroost_piv::attest(keyroost_piv::Slot::Authentication.key_ref());
-        let first = applet.process(&apdu);
-        let mut cert_data = Vec::new();
-        cert_data.extend_from_slice(first.data());
-        let cert_sw = if first.status().to_u16() >> 8 == 0x61 {
-            let remainder = applet.process(&[0x00, 0xC0, 0x00, 0x00]);
-            cert_data.extend_from_slice(remainder.data());
-            remainder.status()
-        } else {
-            first.status()
-        };
+        let response = applet.process(&apdu);
+        let cert_data = response.data();
         assert_eq!(
-            cert_sw,
+            response.status(),
             Status::Success,
             "ATTEST answers 9000 (sw 0x{:04x})",
-            cert_sw.to_u16()
+            response.status().to_u16()
         );
 
         // The host's own parser reads it back: the slot's P-256 point —
         // byte-identical to what GENERATE announced — and the key-policy
         // extension with the slot's policies (9A's factory: PIN ONCE, touch
         // the factory default).
-        // let (alg, point) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert_data)
-        //     .expect("the certificate parses");
-        // assert_eq!(alg, KeyAlg::EccP256);
-        // match point {
-        //     keyroost_piv::PublicKey::Ecc { point } => assert_eq!(point, announced),
-        //     keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
-        // }
+        let (alg, point) = keyroost_piv::x509_parse::parse_certificate_public_key(cert_data)
+            .expect("the certificate parses");
+        assert_eq!(alg, keyroost_piv::KeyAlg::EccP256);
+        match point {
+            keyroost_piv::PublicKey::Ecc { point } => {
+                assert_eq!(point, key.public_key().to_sec1_point(false).as_bytes());
+            }
+            keyroost_piv::PublicKey::Rsa { .. } => panic!("expected an EC point"),
+        }
 
-        // let (pin, touch) = keyroost_piv::x509_parse::parse_key_policy_extension(&cert_data)
-        //     .expect("the key-policy extension parses")
-        //     .expect("the extension is present");
-        // assert_eq!((pin, touch), (0x02, 0x00));
+        let (pin, touch) = keyroost_piv::x509_parse::parse_key_policy_extension(cert_data)
+            .expect("the key-policy extension parses")
+            .expect("the extension is present");
+        assert_eq!((pin, touch), (0x02, 0x01));
 
-        // let dn =
-        //     keyroost_piv::x509_parse::parse_subject_dn(&cert_data).expect("the subject parses");
-        // assert!(
-        //     dn.rdns
-        //         .iter()
-        //         .any(|attr| attr.1 == "PIVApplet Attestation 9A"),
-        //     "the subject carries the slot suffix: {dn:?}"
-        // );
+        let dn = keyroost_piv::x509_parse::parse_subject_dn(cert_data).expect("the subject parses");
+        assert!(
+            dn.rdns
+                .iter()
+                .any(|attr| attr.1 == "YubiKey PIV Attestation 0x9A"),
+            "the subject carries the slot suffix: {dn:?}"
+        );
 
-        // // The certificate is signed by the on-card F9 key: the signature
-        // // verifies over SHA-256 of the TBS certificate, and not with any
-        // // other key.
-        // let (tbs, sig_bytes) = tbs_and_signature(&cert_data).expect("certificate structure");
-        // let f9_signing =
-        //     ecdsa::SigningKey::<p256::NistP256>::from_slice(&applet.attestation.secret)
-        //         .expect("the F9 key is a valid P-256 key");
-        // let mut hasher = Sha256::new();
-        // hasher.update(tbs);
-        // let digest = hasher.finalize();
-        // let sig: ecdsa::Signature<p256::NistP256> =
-        //     ecdsa::der::Signature::<p256::NistP256>::from_bytes(sig_bytes)
-        //         .expect("a DER ECDSA signature")
-        //         .try_into()
-        //         .expect("the signature fits the fixed-size form");
-        // f9_signing
-        //     .verifying_key()
-        //     .verify_prehash(digest.as_slice(), &sig)
-        //     .expect("the F9 signature verifies over the TBS");
-        // let other = ecdsa::SigningKey::<p256::NistP256>::random(&mut rand::rng());
-        // other
-        //     .verifying_key()
-        //     .verify_prehash(digest.as_slice(), &sig)
-        //     .expect_err("another key does not verify");
+        let cert = x509_cert::Certificate::from_der(cert_data).expect("certificate is valid DER");
+        let tbs = cert.tbs_certificate();
+
+        let prehash = sha2::Sha256::new()
+            .chain_update(tbs.to_der().expect("valid tbs"))
+            .finalize();
+
+        let sig = ecdsa::Signature::from_der(cert.signature().raw_bytes())
+            .expect("signature is valid DER encoded");
+        ecdsa::SigningKey::<p256::NistP256>::from(applet.attestation.secret_key)
+            .verifying_key()
+            .verify_prehash(prehash.as_slice(), &sig)
+            .expect("signature is verified");
     }
 
     #[test]
