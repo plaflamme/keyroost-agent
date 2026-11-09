@@ -277,8 +277,8 @@ impl PivApplet {
     /// not-satisfied policy answers [`iso7816::Status::SecurityStatusNotSatisfied.into()`].
     /// Slots never hold the `DEFAULT` policy — GENERATE KEY always stores
     /// one of the three concrete values — so `DEFAULT` is unreachable here.
-    pub(crate) fn slot_pin_gate(&self, slot: &Slot) -> Result<(), Status> {
-        let satisfied = match slot.pin_policy {
+    pub(crate) fn slot_pin_gate(&self, slot: crate::piv::Slot) -> Result<(), Status> {
+        let satisfied = match self.slots[slot].pin_policy {
             PinPolicy::Never => true,
             PinPolicy::Once => self.pin.verified(),
             PinPolicy::Always => self.pin.verified_previous(),
@@ -384,7 +384,7 @@ mod tests {
         let mut applet = PivApplet::new();
         // 9A is ONCE: locked before the PIN is verified...
         assert_eq!(
-            applet.slot_pin_gate(&applet.slots[crate::piv::Slot::Authentication]),
+            applet.slot_pin_gate(crate::piv::Slot::Authentication),
             Err(iso7816::Status::SecurityStatusNotSatisfied)
         );
         // ...and open after.
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(r.status(), iso7816::Status::Success);
         assert!(
             applet
-                .slot_pin_gate(&applet.slots[crate::piv::Slot::Authentication])
+                .slot_pin_gate(crate::piv::Slot::Authentication)
                 .is_ok()
         );
     }
@@ -402,7 +402,7 @@ mod tests {
         let mut applet = PivApplet::new();
         // Locked before the PIN is verified...
         assert_eq!(
-            applet.slot_pin_gate(&applet.slots[crate::piv::Slot::Signature]),
+            applet.slot_pin_gate(crate::piv::Slot::Signature),
             Err(iso7816::Status::SecurityStatusNotSatisfied)
         );
         // ...and the APDU right after a successful VERIFY is the one that
@@ -428,7 +428,7 @@ mod tests {
         // 9E is NEVER: no PIN, no arm, always open.
         assert!(
             applet
-                .slot_pin_gate(&applet.slots[crate::piv::Slot::CardAuthentication])
+                .slot_pin_gate(crate::piv::Slot::CardAuthentication)
                 .is_ok()
         );
         let r = applet.process(&ga_apdu(0x9E));

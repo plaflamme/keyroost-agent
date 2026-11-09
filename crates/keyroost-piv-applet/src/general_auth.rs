@@ -73,7 +73,7 @@ impl PivApplet {
     /// data member. The applet answers the signature or shared secret
     /// under `82`.
     fn ga_slot(&self, slot: crate::piv::Slot, p1: u8, body: &[u8]) -> Response {
-        if let Err(sw) = self.slot_pin_gate(&self.slots[slot]) {
+        if let Err(sw) = self.slot_pin_gate(slot) {
             return sw.into();
         }
         let Some(key) = self.slots[slot].key.as_ref() else {
