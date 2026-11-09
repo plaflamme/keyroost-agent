@@ -93,24 +93,13 @@ impl PivApplet {
             PIN_REF_PUK => &mut self.puk,
             _ => return iso7816::Status::KeyReferenceNotFound.into(),
         };
-        let body = command.data();
-        if body.len() != 16 {
-            return iso7816::Status::IncorrectDataParameter.into();
+        match Self::gate_pin_change(command.data(), target) {
+            Err(status) => status.into(),
+            Ok(new_pin) => {
+                target.set_value(new_pin);
+                iso7816::Status::Success.into()
+            }
         }
-        if target.tries() == 0 {
-            return iso7816::Status::OperationBlocked.into();
-        }
-        let new_value: [u8; 8] = body[8..].try_into().unwrap();
-        if !target.check(&body[..8]) {
-            // The card would also wipe the key slots here if this try
-            // blocked both PIN and PUK; this applet has no key slots yet.
-            return iso7816::Status::RemainingRetries(target.tries()).into();
-        }
-        if !is_valid_pin(new_value) {
-            return iso7816::Status::IncorrectDataParameter.into();
-        }
-        target.set_value(new_value);
-        iso7816::Status::Success.into()
     }
 
     /// RESET RETRY COUNTER (0x2C): unblock the PIN (P2=`80`) using the PUK
@@ -135,25 +124,42 @@ impl PivApplet {
         if command.p2 != PIN_REF_APPLICATION {
             return iso7816::Status::KeyReferenceNotFound.into();
         }
-        let body = command.data();
+        match Self::gate_pin_change(command.data(), &mut self.puk) {
+            Err(status) => status.into(),
+            Ok(new_pin) => {
+                self.pin.set_value(new_pin);
+                self.pin.reset();
+                iso7816::Status::Success.into()
+            }
+        }
+    }
+
+    /// Gates a pin change to either the pin or puk slot by checking the provided pin againts the gate and returning the new pin to use when successful.
+    fn gate_pin_change(
+        body: &[u8],
+        target: &mut crate::pin::Pin,
+    ) -> Result<[u8; 8], iso7816::Status> {
         if body.len() != 16 {
-            return iso7816::Status::IncorrectDataParameter.into();
+            return Err(iso7816::Status::IncorrectDataParameter);
         }
-        if self.puk.tries() == 0 {
-            return iso7816::Status::OperationBlocked.into();
+        if target.tries() == 0 {
+            return Err(iso7816::Status::OperationBlocked);
         }
-        let new_pin: [u8; 8] = body[8..].try_into().unwrap();
-        if !self.puk.check(&body[..8]) {
+        let Some((pin, body)) = body.split_first_chunk::<8>() else {
+            return Err(iso7816::Status::IncorrectDataParameter);
+        };
+        let Some((new_value, _)) = body.split_first_chunk::<8>() else {
+            return Err(iso7816::Status::IncorrectDataParameter);
+        };
+        if !target.check(pin) {
             // The card would also wipe the key slots here if this try
             // blocked both PIN and PUK; this applet has no key slots yet.
-            return iso7816::Status::RemainingRetries(self.puk.tries()).into();
+            return Err(iso7816::Status::RemainingRetries(target.tries()));
         }
-        if !is_valid_pin(new_pin) {
-            return iso7816::Status::IncorrectDataParameter.into();
+        if !is_valid_pin(*new_value) {
+            return Err(iso7816::Status::IncorrectDataParameter);
         }
-        self.pin.set_value(new_pin);
-        self.pin.reset();
-        iso7816::Status::Success.into()
+        Ok(*new_value)
     }
 }
 
