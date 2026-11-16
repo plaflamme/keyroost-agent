@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/keyroost-piv-applet"]
+members = []
 
 [package]
 name = "keyroost-agent"
