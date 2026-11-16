@@ -18,10 +18,16 @@
       inputs.rust-overlay.follows = "rust-overlay";
     };
     keyroost.url = "github:framefilter/keyroost/v0.15.0";
+    sftcrd.url = "github:plaflamme/sftcrd";
   };
 
   outputs =
-    inputs@{ flake-parts, keyroost, ... }:
+    inputs@{
+      flake-parts,
+      keyroost,
+      sftcrd,
+      ...
+    }:
     flake-parts.lib.mkFlake { inherit inputs; } {
 
       systems = [
@@ -41,7 +47,10 @@
           system,
           pkgs,
           ...
-        }:
+        }@inputs:
+        let
+          keyroostctl = keyroost.packages.${system}.keyroostctl;
+        in
         {
           rust-project = {
             crates = {
@@ -71,7 +80,13 @@
             default = config.packages.keyroost-agent;
           };
 
-          checks = { };
+          checks =
+            let
+              ctx = inputs // {
+                inherit sftcrd keyroostctl;
+              };
+            in
+            { } // import ./nix/checks/piv.nix ctx;
 
           devShells.default = config.devShells.rust;
         };
