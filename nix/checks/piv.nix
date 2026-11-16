@@ -2,6 +2,7 @@
   pkgs,
   sftcrd,
   keyroostctl,
+  keyroost-agent,
   system,
   ...
 }:
@@ -36,8 +37,10 @@ pkgs.lib.optionalAttrs (system == "x86_64-linux") (
 
                 environment.systemPackages = [
                   pkgs.openssl
+                  pkgs.openssh
                   pkgs.yubico-piv-tool
                   keyroostctl
+                  keyroost-agent
                 ];
               };
           };

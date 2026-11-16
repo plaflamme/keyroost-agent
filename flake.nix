@@ -82,8 +82,9 @@
 
           checks =
             let
+              keyroost-agent = config.packages.keyroost-agent;
               ctx = inputs // {
-                inherit sftcrd keyroostctl;
+                inherit sftcrd keyroostctl keyroost-agent;
               };
             in
             { } // import ./nix/checks/piv.nix ctx;
