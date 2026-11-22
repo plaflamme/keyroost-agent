@@ -1,0 +1,42 @@
+version: 2
+
+multi-ecosystem-groups:
+  toolchain:
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+      # Run as late as possible to run after rust-overlay's updates
+      # https://github.com/oxalica/rust-overlay/blob/master/.github/workflows/sync-channels.yaml#L4-L5
+      time: "23:58"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    groups:
+      gha:
+        patterns: ["*"]
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-deps:
+        patterns: ["*"]
+  # bump rust-toolchain at the same time as nix because the toolchain must exist in rust-overlay
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    cooldown:
+      default-days: 0
+    multi-ecosystem-group: "toolchain"
+    patterns: ["*"]
+  - package-ecosystem: "nix"
+    directory: "/"
+    multi-ecosystem-group: "toolchain"
+    patterns: ["*"]
+    cooldown:
+      default-days: 0
