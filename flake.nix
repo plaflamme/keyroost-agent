@@ -50,39 +50,39 @@
         }@inputs:
         let
           keyroostctl = keyroost.packages.${system}.keyroostctl;
+          craneLib = config.rust-project.crane-lib;
+          src = config.rust-project.src;
         in
         {
           rust-project = {
             crates = {
-              # The workspace root package is not in `members`, so
-              # rust-flake does not find it on its own; point it at the
-              # workspace source explicitly.
-              keyroost-agent =
-                { rust-project, ... }:
-                {
-                  path = rust-project.src + "/";
-                  crane = {
-                    extraBuildArgs = {
-                      CARGO_PROFILE = "dev"; # TODO: how do we output both release and dev profiles?
-                    };
-                    args = {
-                      nativeBuildInputs = with pkgs; [
-                        pkg-config
-                      ];
-                      buildInputs = [ pkgs.pcsclite ];
-                    };
+              keyroost-agent = {
+                crane = {
+                  args = {
+                    nativeBuildInputs = [ pkgs.pkg-config ];
+                    buildInputs = [ pkgs.pcsclite ];
                   };
                 };
+              };
+
             };
           };
 
           packages = {
             default = config.packages.keyroost-agent;
+            keyroost-agent-debug = craneLib.buildPackage (
+              config.rust-project.crates.keyroost-agent.crane.args
+              // {
+                inherit src;
+                pname = "keyroost-agent-debug";
+                CARGO_PROFILE = "dev";
+              }
+            );
           };
 
           checks =
             let
-              keyroost-agent = config.packages.keyroost-agent;
+              keyroost-agent = config.packages.keyroost-agent-debug;
               ctx = inputs // {
                 inherit sftcrd keyroostctl keyroost-agent;
               };

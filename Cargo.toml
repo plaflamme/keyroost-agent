@@ -1,6 +1,3 @@
-[workspace]
-members = []
-
 [package]
 name = "keyroost-agent"
 version = "0.1.0"
