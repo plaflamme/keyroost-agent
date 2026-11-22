@@ -32,4 +32,4 @@ jobs:
           extraPullNames: sftcrd
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix build
-      - run: nix flake check
+      - run: nix flake check -L
