@@ -169,7 +169,6 @@ impl PivSshAgent {
         session: &'b mut PivSession,
     ) -> impl Iterator<Item = PivIdentity> + 'b {
         self.slots.iter().filter_map(|slot| {
-            // TODO: deal with Err here, probably logging is sufficient
             slot_to_ssh_identity(session, *slot)
                 .inspect_err(|e| {
                     tracing::warn!("failed to configure slot {slot:?} as PIV identity: {e}");

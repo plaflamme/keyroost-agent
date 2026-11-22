@@ -42,7 +42,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
             .sign(&request.credential, &request.data, rsa_sig_hash)?;
 
         let Some(signature) = signature else {
-            return Err(AgentError::Failure); // TODO: what error should we return for "not found"?
+            return Err(AgentError::Failure);
         };
 
         Ok(signature)
