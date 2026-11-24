@@ -8,14 +8,16 @@ use tokio::net::UnixListener;
 use tracing::debug;
 
 mod error;
+mod openpgp;
+mod pinentry;
 mod piv;
 
 pub(crate) use crate::error::Error;
 
 #[derive(Clone)]
 struct KeyroostAgent {
-    piv: piv::PivSshAgent,
-    // TODO: openpgp identity
+    piv: Option<piv::PivSshAgent>,
+    openpgp: Option<openpgp::OpenPgpSshAgent>,
 }
 
 #[ssh_agent_lib::async_trait]
@@ -23,7 +25,14 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         debug!("request_identities");
         // TODO: cache identities so we can directly look them up later by public key
-        Ok(self.piv.request_identities()?)
+        let mut identities = Vec::new();
+        if let Some(piv) = &self.piv {
+            identities.extend(piv.request_identities()?);
+        }
+        if let Some(openpgp) = &self.openpgp {
+            identities.extend(openpgp.request_identities()?);
+        }
+        Ok(identities)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
@@ -37,15 +46,20 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
             None
         };
 
-        let signature = self
-            .piv
-            .sign(&request.credential, &request.data, rsa_sig_hash)?;
+        if let Some(piv) = &self.piv
+            && let Some(signature) = piv.sign(&request.credential, &request.data, rsa_sig_hash)?
+        {
+            return Ok(signature);
+        }
 
-        let Some(signature) = signature else {
-            return Err(AgentError::Failure);
-        };
+        if let Some(openpgp) = &self.openpgp
+            && let Some(signature) =
+                openpgp.sign(&request.credential, &request.data, rsa_sig_hash)?
+        {
+            return Ok(signature);
+        }
 
-        Ok(signature)
+        Err(AgentError::Failure)
     }
 }
 
@@ -56,14 +70,17 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
 /// Will return `Err` if an error occurs while binding to the socket or if the ssh agent raises an error while listening for connections.
 pub async fn run(
     socket_path: &Path,
-    piv_reader: String,
+    piv_reader: Option<String>,
+    openpgp_reader: Option<String>,
     pinentry_binary: Option<String>,
 ) -> Result<(), std::io::Error> {
+    let pinentry = pinentry::SystemPinentry::new(pinentry_binary);
     let listener = UnixListener::bind(socket_path)?;
     let result = ssh_agent_lib::agent::listen(
         listener,
         KeyroostAgent {
-            piv: piv::PivSshAgent::new(piv_reader, pinentry_binary),
+            piv: piv_reader.map(|reader| piv::PivSshAgent::new(reader, pinentry.clone())),
+            openpgp: openpgp_reader.map(|reader| openpgp::OpenPgpSshAgent::new(reader, pinentry)),
         },
     )
     .await;

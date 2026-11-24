@@ -6,13 +6,15 @@ use keyroost_transport::{PivSession, TransportError};
 use sha2::Digest;
 use ssh_agent_lib::{
     proto::{Identity, PublicCredential},
-    secrecy::{self, ExposeSecret},
+    secrecy::ExposeSecret,
     ssh_key::{
         Algorithm, HashAlg, Mpint, Signature,
         public::{EcdsaPublicKey, Ed25519PublicKey, KeyData, RsaPublicKey},
         sec1::EncodedPoint,
     },
 };
+
+use crate::pinentry::{Pinentry, SystemPinentry};
 
 struct PivIdentity {
     slot: Slot,
@@ -30,12 +32,12 @@ impl From<PivIdentity> for Identity {
 pub(super) struct PivSshAgent {
     reader: String,
     slots: Vec<Slot>,
-    pinentry_binary: Option<String>,
+    pinentry: SystemPinentry,
 }
 
 impl PivSshAgent {
     // TODO: manually select slots
-    pub(super) fn new(reader: String, pinentry_binary: Option<String>) -> Self {
+    pub(super) fn new(reader: String, pinentry: SystemPinentry) -> Self {
         // default signature-related slots
         let sign_slots: &[Slot] = &[
             Slot::Authentication,
@@ -45,7 +47,7 @@ impl PivSshAgent {
 
         Self {
             reader,
-            pinentry_binary,
+            pinentry,
             slots: Vec::from_iter([sign_slots, &Slot::retired_all()].concat()),
         }
     }
@@ -102,7 +104,7 @@ impl PivSshAgent {
                 piv_identity.key_alg,
                 &prepared,
                 pin_policy,
-                || self.prompt_pin(),
+                &self.pinentry,
             )?
             else {
                 return Ok(None);
@@ -144,32 +146,6 @@ impl PivSshAgent {
 
             Ok(Some(signature))
         })
-    }
-
-    fn prompt_pin(&self) -> Result<Option<secrecy::SecretBox<str>>, crate::Error> {
-        let pinentry = match self.pinentry_binary.as_ref() {
-            Some(binary_name) => pinentry::PassphraseInput::with_binary(binary_name),
-            None => pinentry::PassphraseInput::with_default_binary(),
-        };
-
-        let Some(mut pinentry) = pinentry else {
-            return Err(crate::Error::Other("pinentry binary not found".into()));
-        };
-
-        let pin = pinentry
-            .with_prompt("PIN") // TODO: show card serial number
-            .with_description("Please unlock the card")
-            .required("PIN cannot be empty")
-            .interact();
-
-        match pin {
-            Ok(pin) => Ok(Some(pin)),
-            Err(pinentry::Error::Cancelled) => Ok(None),
-            Err(other) => {
-                tracing::warn!("pinentry failed {other}");
-                Ok(None)
-            }
-        }
     }
 
     fn list_identities<'a: 'b, 'b>(
@@ -269,21 +245,18 @@ impl PivSigner for PivSession<'_> {
     }
 }
 
-fn sign_with_policy<FPrompt>(
+fn sign_with_policy(
     signer: &mut impl PivSigner,
     slot: Slot,
     alg: KeyAlg,
     prepared: &[u8],
     pin_policy: Option<PinPolicy>,
-    mut prompt_pin: FPrompt,
-) -> Result<Option<Vec<u8>>, crate::Error>
-where
-    FPrompt: FnMut() -> Result<Option<secrecy::SecretBox<str>>, crate::Error>,
-{
+    pinentry: &impl Pinentry,
+) -> Result<Option<Vec<u8>>, crate::Error> {
     match pin_policy {
         Some(PinPolicy::Never) => Ok(Some(signer.sign(slot, alg, prepared)?)),
         Some(PinPolicy::Always) => {
-            let Some(pin) = prompt_pin()? else {
+            let Some(pin) = pinentry.prompt_pin("Please unlock the card")? else {
                 return Ok(None);
             };
             signer.verify_pin(pin.expose_secret().as_bytes())?;
@@ -293,7 +266,7 @@ where
         {
             Ok(signature) => Ok(Some(signature)),
             Err(TransportError::PivSecurityNotSatisfied) => {
-                let Some(pin) = prompt_pin()? else {
+                let Some(pin) = pinentry.prompt_pin("Please unlock the card")? else {
                     return Ok(None);
                 };
                 signer.verify_pin(pin.expose_secret().as_bytes())?;
@@ -307,12 +280,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::{PivSigner, sign_with_policy};
+    use crate::pinentry::Pinentry;
     use keyroost_piv::{KeyAlg, PinPolicy, Slot};
     use keyroost_transport::TransportError;
     use ssh_agent_lib::secrecy::SecretBox;
+    use std::cell::Cell;
 
-    fn test_pin(value: &str) -> SecretBox<str> {
-        SecretBox::new(value.to_owned().into_boxed_str())
+    struct MockPinentry {
+        pin: Option<&'static str>,
+        prompts: Cell<usize>,
+    }
+
+    impl MockPinentry {
+        fn new(pin: Option<&'static str>) -> Self {
+            Self {
+                pin,
+                prompts: Cell::new(0),
+            }
+        }
+
+        fn prompts(&self) -> usize {
+            self.prompts.get()
+        }
+    }
+
+    impl Pinentry for MockPinentry {
+        fn prompt_pin(&self, _description: &str) -> Result<Option<SecretBox<str>>, crate::Error> {
+            self.prompts.set(self.prompts.get() + 1);
+            Ok(self
+                .pin
+                .map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
+        }
     }
 
     struct MockSigner {
@@ -363,7 +361,7 @@ mod tests {
     #[test]
     fn never_policy_signs_without_prompting_or_verifying() {
         let mut signer = MockSigner::new(true, vec![1, 2, 3]);
-        let mut prompts = 0;
+        let pinentry = MockPinentry::new(Some("123456"));
 
         let res = sign_with_policy(
             &mut signer,
@@ -371,15 +369,12 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Never),
-            || {
-                prompts += 1;
-                Ok(Some(test_pin("123456")))
-            },
+            &pinentry,
         )
         .unwrap();
 
         assert_eq!(res, Some(vec![1, 2, 3]));
-        assert_eq!(prompts, 0);
+        assert_eq!(pinentry.prompts(), 0);
         assert_eq!(signer.verifies, 0);
         assert_eq!(signer.signs, 1);
     }
@@ -387,7 +382,7 @@ mod tests {
     #[test]
     fn always_policy_always_prompts_and_verifies_before_signing() {
         let mut signer = MockSigner::new(true, vec![4, 5, 6]);
-        let mut prompts = 0;
+        let pinentry = MockPinentry::new(Some("123456"));
 
         let res = sign_with_policy(
             &mut signer,
@@ -395,15 +390,12 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Always),
-            || {
-                prompts += 1;
-                Ok(Some(test_pin("123456")))
-            },
+            &pinentry,
         )
         .unwrap();
 
         assert_eq!(res, Some(vec![4, 5, 6]));
-        assert_eq!(prompts, 1);
+        assert_eq!(pinentry.prompts(), 1);
         assert_eq!(signer.verifies, 1);
         assert_eq!(signer.signs, 1);
     }
@@ -411,6 +403,7 @@ mod tests {
     #[test]
     fn always_policy_returns_none_when_prompt_cancelled() {
         let mut signer = MockSigner::new(false, vec![4, 5, 6]);
+        let pinentry = MockPinentry::new(None);
 
         let res = sign_with_policy(
             &mut signer,
@@ -418,7 +411,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Always),
-            || Ok(None),
+            &pinentry,
         )
         .unwrap();
 
@@ -430,7 +423,7 @@ mod tests {
     #[test]
     fn once_policy_skips_prompt_when_already_verified() {
         let mut signer = MockSigner::new(true, vec![7, 8, 9]);
-        let mut prompts = 0;
+        let pinentry = MockPinentry::new(Some("123456"));
 
         let res = sign_with_policy(
             &mut signer,
@@ -438,15 +431,12 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
-            || {
-                prompts += 1;
-                Ok(Some(test_pin("123456")))
-            },
+            &pinentry,
         )
         .unwrap();
 
         assert_eq!(res, Some(vec![7, 8, 9]));
-        assert_eq!(prompts, 0);
+        assert_eq!(pinentry.prompts(), 0);
         assert_eq!(signer.verifies, 0);
         assert_eq!(signer.signs, 1);
     }
@@ -454,7 +444,7 @@ mod tests {
     #[test]
     fn once_policy_prompts_and_verifies_when_security_not_satisfied() {
         let mut signer = MockSigner::new(false, vec![10, 11, 12]);
-        let mut prompts = 0;
+        let pinentry = MockPinentry::new(Some("123456"));
 
         let res = sign_with_policy(
             &mut signer,
@@ -462,15 +452,12 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
-            || {
-                prompts += 1;
-                Ok(Some(test_pin("123456")))
-            },
+            &pinentry,
         )
         .unwrap();
 
         assert_eq!(res, Some(vec![10, 11, 12]));
-        assert_eq!(prompts, 1);
+        assert_eq!(pinentry.prompts(), 1);
         assert_eq!(signer.verifies, 1);
         assert_eq!(signer.signs, 2);
     }
@@ -478,6 +465,7 @@ mod tests {
     #[test]
     fn once_policy_returns_none_when_prompt_cancelled() {
         let mut signer = MockSigner::new(false, vec![10, 11, 12]);
+        let pinentry = MockPinentry::new(None);
 
         let res = sign_with_policy(
             &mut signer,
@@ -485,7 +473,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
-            || Ok(None),
+            &pinentry,
         )
         .unwrap();
 
@@ -498,7 +486,7 @@ mod tests {
     fn missing_and_default_policy_fall_back_safely() {
         for policy in [None, Some(PinPolicy::Default)] {
             let mut signer = MockSigner::new(false, vec![42]);
-            let mut prompts = 0;
+            let pinentry = MockPinentry::new(Some("123456"));
 
             let res = sign_with_policy(
                 &mut signer,
@@ -506,33 +494,27 @@ mod tests {
                 KeyAlg::EccP256,
                 b"msg",
                 policy,
-                || {
-                    prompts += 1;
-                    Ok(Some(test_pin("123456")))
-                },
+                &pinentry,
             )
             .unwrap();
             assert_eq!(res, Some(vec![42]));
-            assert_eq!(prompts, 1);
+            assert_eq!(pinentry.prompts(), 1);
             assert_eq!(signer.verifies, 1);
             assert_eq!(signer.signs, 2);
 
             let mut signer_cached = MockSigner::new(true, vec![43]);
-            let mut prompts_cached = 0;
+            let pinentry_cached = MockPinentry::new(Some("123456"));
             let res_cached = sign_with_policy(
                 &mut signer_cached,
                 Slot::Authentication,
                 KeyAlg::EccP256,
                 b"msg",
                 policy,
-                || {
-                    prompts_cached += 1;
-                    Ok(Some(test_pin("123456")))
-                },
+                &pinentry_cached,
             )
             .unwrap();
             assert_eq!(res_cached, Some(vec![43]));
-            assert_eq!(prompts_cached, 0);
+            assert_eq!(pinentry_cached.prompts(), 0);
             assert_eq!(signer_cached.verifies, 0);
             assert_eq!(signer_cached.signs, 1);
         }
@@ -542,7 +524,7 @@ mod tests {
     fn once_policy_propagates_non_security_sign_errors_without_prompting() {
         let mut signer = MockSigner::new(false, vec![]);
         signer.sign_error = Some(|| TransportError::PivBadPinLength);
-        let mut prompts = 0;
+        let pinentry = MockPinentry::new(Some("123456"));
 
         let err = sign_with_policy(
             &mut signer,
@@ -550,15 +532,12 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
-            || {
-                prompts += 1;
-                Ok(Some(test_pin("123456")))
-            },
+            &pinentry,
         )
         .unwrap_err();
 
         assert!(matches!(err, crate::Error::Other(_)));
-        assert_eq!(prompts, 0);
+        assert_eq!(pinentry.prompts(), 0);
         assert_eq!(signer.verifies, 0);
     }
 }

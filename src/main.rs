@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut readers = keyroost_transport::probe_readers()?
         .into_iter()
-        .filter(|reader| reader.has_piv);
+        .filter(|reader| reader.has_piv || reader.has_openpgp);
     let reader = match opts.reader {
         Some(name) => readers.find(|probed| {
             probed
@@ -41,7 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No PC/SC reader found.".into());
     };
 
-    keyroost_agent::run(&opts.socket, reader.reader_name.clone(), None).await?;
+    keyroost_agent::run(
+        &opts.socket,
+        reader.has_piv.then(|| reader.reader_name.clone()),
+        reader.has_openpgp.then(|| reader.reader_name.clone()),
+        None,
+    )
+    .await?;
 
     Ok(())
 }
