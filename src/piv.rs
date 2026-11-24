@@ -14,7 +14,7 @@ use ssh_agent_lib::{
     },
 };
 
-use crate::pinentry::{Pinentry, SystemPinentry};
+use crate::pinentry::{Applet, Pinentry, SystemPinentry};
 
 struct PivIdentity {
     slot: Slot,
@@ -98,12 +98,15 @@ impl PivSshAgent {
                 .map(|(pin, _touch)| pin);
             tracing::debug!("slot {:?} PIN policy: {:?}", piv_identity.slot, pin_policy);
 
+            let serial = session.status().ok().and_then(|status| status.serial);
+
             let Some(signature) = sign_with_policy(
                 session,
                 piv_identity.slot,
                 piv_identity.key_alg,
                 &prepared,
                 pin_policy,
+                serial,
                 &self.pinentry,
             )?
             else {
@@ -251,12 +254,13 @@ fn sign_with_policy(
     alg: KeyAlg,
     prepared: &[u8],
     pin_policy: Option<PinPolicy>,
+    serial: Option<u128>,
     pinentry: &impl Pinentry,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     match pin_policy {
         Some(PinPolicy::Never) => Ok(Some(signer.sign(slot, alg, prepared)?)),
         Some(PinPolicy::Always) => {
-            let Some(pin) = pinentry.prompt_pin("Please unlock the card")? else {
+            let Some(pin) = pinentry.prompt_pin(Applet::Piv, serial)? else {
                 return Ok(None);
             };
             signer.verify_pin(pin.expose_secret().as_bytes())?;
@@ -266,7 +270,7 @@ fn sign_with_policy(
         {
             Ok(signature) => Ok(Some(signature)),
             Err(TransportError::PivSecurityNotSatisfied) => {
-                let Some(pin) = pinentry.prompt_pin("Please unlock the card")? else {
+                let Some(pin) = pinentry.prompt_pin(Applet::Piv, serial)? else {
                     return Ok(None);
                 };
                 signer.verify_pin(pin.expose_secret().as_bytes())?;
@@ -280,7 +284,7 @@ fn sign_with_policy(
 #[cfg(test)]
 mod tests {
     use super::{PivSigner, sign_with_policy};
-    use crate::pinentry::Pinentry;
+    use crate::pinentry::{Applet, Pinentry};
     use keyroost_piv::{KeyAlg, PinPolicy, Slot};
     use keyroost_transport::TransportError;
     use ssh_agent_lib::secrecy::SecretBox;
@@ -305,7 +309,11 @@ mod tests {
     }
 
     impl Pinentry for MockPinentry {
-        fn prompt_pin(&self, _description: &str) -> Result<Option<SecretBox<str>>, crate::Error> {
+        fn prompt_pin(
+            &self,
+            _applet: Applet,
+            _serial: Option<u128>,
+        ) -> Result<Option<SecretBox<str>>, crate::Error> {
             self.prompts.set(self.prompts.get() + 1);
             Ok(self
                 .pin
@@ -369,6 +377,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Never),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -390,6 +399,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Always),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -411,6 +421,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Always),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -431,6 +442,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -452,6 +464,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -473,6 +486,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
+            Some(1234),
             &pinentry,
         )
         .unwrap();
@@ -494,6 +508,7 @@ mod tests {
                 KeyAlg::EccP256,
                 b"msg",
                 policy,
+                Some(1234),
                 &pinentry,
             )
             .unwrap();
@@ -510,6 +525,7 @@ mod tests {
                 KeyAlg::EccP256,
                 b"msg",
                 policy,
+                Some(1234),
                 &pinentry_cached,
             )
             .unwrap();
@@ -532,6 +548,7 @@ mod tests {
             KeyAlg::EccP256,
             b"msg",
             Some(PinPolicy::Once),
+            Some(1234),
             &pinentry,
         )
         .unwrap_err();

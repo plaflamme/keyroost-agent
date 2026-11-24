@@ -13,7 +13,7 @@ use ssh_agent_lib::{
     },
 };
 
-use crate::pinentry::{Pinentry, SystemPinentry};
+use crate::pinentry::{Applet, Pinentry, SystemPinentry};
 
 const OPENPGP_SLOTS: [KeyCrt; 2] = [KeyCrt::Auth, KeyCrt::Sign];
 
@@ -80,16 +80,11 @@ impl OpenPgpSshAgent {
         };
 
         let prepared = prepare_sign_input(identity.attrs, data, rsa_sig_hash)?;
-        let description = match status.serial() {
-            Some(serial) => format!("Please unlock OpenPGP card {serial}"),
-            None => "Please unlock the OpenPGP card".to_owned(),
-        };
-
         let Some(signature) = sign_with_pin(
             &mut session,
             identity.slot,
             &prepared,
-            &description,
+            status.full_serial(),
             &self.pinentry,
         )?
         else {
@@ -341,7 +336,7 @@ fn sign_with_pin(
     signer: &mut impl OpenPgpSigner,
     slot: KeyCrt,
     prepared: &[u8],
-    description: &str,
+    serial: Option<u128>,
     pinentry: &impl Pinentry,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     let pw_ref = match slot {
@@ -354,7 +349,7 @@ fn sign_with_pin(
         }
     };
 
-    let Some(pin) = pinentry.prompt_pin(description)? else {
+    let Some(pin) = pinentry.prompt_pin(Applet::OpenPgp, serial)? else {
         return Ok(None);
     };
     signer.verify_pin(pw_ref, pin.expose_secret().as_bytes())?;
@@ -373,7 +368,7 @@ mod tests {
     use super::{
         OpenPgpSigner, encode_signature, prepare_sign_input, sign_with_pin, ssh_public_credentials,
     };
-    use crate::pinentry::Pinentry;
+    use crate::pinentry::{Applet, Pinentry};
     use keyroost_openpgp::{
         AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey, RsaAttributes,
         RsaImportFormat,
@@ -388,7 +383,11 @@ mod tests {
     struct MockPinentry(Option<&'static str>);
 
     impl Pinentry for MockPinentry {
-        fn prompt_pin(&self, _description: &str) -> Result<Option<SecretBox<str>>, crate::Error> {
+        fn prompt_pin(
+            &self,
+            _applet: Applet,
+            _serial: Option<u128>,
+        ) -> Result<Option<SecretBox<str>>, crate::Error> {
             Ok(self
                 .0
                 .map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
@@ -438,7 +437,7 @@ mod tests {
             &mut signer,
             KeyCrt::Sign,
             b"digest",
-            "Unlock",
+            Some(1234),
             &MockPinentry(Some("123456")),
         )
         .unwrap();
@@ -456,7 +455,7 @@ mod tests {
             &mut signer,
             KeyCrt::Auth,
             b"digest",
-            "Unlock",
+            Some(1234),
             &MockPinentry(Some("123456")),
         )
         .unwrap();
@@ -474,7 +473,7 @@ mod tests {
             &mut signer,
             KeyCrt::Auth,
             b"digest",
-            "Unlock",
+            Some(1234),
             &MockPinentry(None),
         )
         .unwrap();

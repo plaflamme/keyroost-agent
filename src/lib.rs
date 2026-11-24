@@ -1,6 +1,6 @@
 use ssh_agent_lib::{
     error::AgentError,
-    proto::{Identity, SignRequest},
+    proto::{Identity, PublicCredential, SignRequest},
     ssh_key::{HashAlg, Signature},
 };
 use std::path::Path;
@@ -36,7 +36,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        debug!("sign({:?})", request.credential); // TODO: saner display
+        debug!("sign({})", format_credential(&request.credential));
 
         let rsa_sig_hash = if request.flags & 0x02 != 0 {
             Some(HashAlg::Sha256)
@@ -89,5 +89,26 @@ pub async fn run(
         Ok(()) => Ok(()),
         Err(AgentError::IO(e)) => Err(e),
         Err(other) => Err(std::io::Error::other(other.to_string())),
+    }
+}
+
+fn format_credential(credential: &PublicCredential) -> String {
+    let key = credential.key_data();
+    format!("{} {}", key.algorithm(), key.fingerprint(HashAlg::Sha256))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_credential;
+    use ssh_agent_lib::{
+        proto::PublicCredential,
+        ssh_key::public::{Ed25519PublicKey, KeyData},
+    };
+
+    #[test]
+    fn format_credential_shows_algorithm_and_fingerprint() {
+        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x11; 32])));
+        let formatted = format_credential(&cred);
+        assert!(formatted.starts_with("ssh-ed25519 SHA256:"));
     }
 }
