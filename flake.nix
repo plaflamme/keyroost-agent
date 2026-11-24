@@ -87,7 +87,7 @@
                 inherit sftcrd keyroostctl keyroost-agent;
               };
             in
-            { } // (import ./nix/checks/piv.nix ctx) // (removeAttrs config.packages [ "default" ]);
+            { } // (import ./nix/checks/e2e.nix ctx) // (removeAttrs config.packages [ "default" ]);
 
           devShells.default = config.devShells.rust;
         };
