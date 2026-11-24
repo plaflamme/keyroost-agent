@@ -85,10 +85,10 @@ pkgs.lib.optionalAttrs (system == "x86_64-linux") (
   builtins.listToAttrs (
     map
       (test: {
-        name = "piv-${test}";
+        name = "e2e-piv-${test}";
         value = pkgs.testers.runNixOSTest {
 
-          name = "piv-${test}";
+          name = "e2e-piv-${test}";
 
           imports = [
             ./piv/${test}.nix
