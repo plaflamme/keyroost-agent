@@ -332,6 +332,18 @@ impl OpenPgpSigner for OpenPgpSession {
     }
 }
 
+fn attempt_sign(
+    signer: &mut impl OpenPgpSigner,
+    slot: KeyCrt,
+    prepared: &[u8],
+) -> Result<Vec<u8>, TransportError> {
+    match slot {
+        KeyCrt::Sign => signer.sign(prepared),
+        KeyCrt::Auth => signer.internal_authenticate(prepared),
+        KeyCrt::Decrypt => unreachable!(),
+    }
+}
+
 fn sign_with_pin(
     signer: &mut impl OpenPgpSigner,
     slot: KeyCrt,
@@ -349,18 +361,21 @@ fn sign_with_pin(
         }
     };
 
-    let Some(pin) = pinentry.prompt_pin(Applet::OpenPgp, serial)? else {
-        return Ok(None);
-    };
-    signer.verify_pin(pw_ref, pin.expose_secret().as_bytes())?;
-
-    let sig = match slot {
-        KeyCrt::Sign => signer.sign(prepared)?,
-        KeyCrt::Auth => signer.internal_authenticate(prepared)?,
-        KeyCrt::Decrypt => unreachable!(),
-    };
-
-    Ok(Some(sig))
+    match attempt_sign(signer, slot, prepared) {
+        Ok(sig) => Ok(Some(sig)),
+        Err(TransportError::Apdu {
+            sw1: 0x69,
+            sw2: 0x82,
+            ..
+        }) => {
+            let Some(pin) = pinentry.prompt_pin(Applet::OpenPgp, serial)? else {
+                return Ok(None);
+            };
+            signer.verify_pin(pw_ref, pin.expose_secret().as_bytes())?;
+            Ok(Some(attempt_sign(signer, slot, prepared)?))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(test)]
@@ -379,8 +394,25 @@ mod tests {
         secrecy::SecretBox,
         ssh_key::{Algorithm, HashAlg},
     };
+    use std::cell::Cell;
 
-    struct MockPinentry(Option<&'static str>);
+    struct MockPinentry {
+        pin: Option<&'static str>,
+        prompts: Cell<usize>,
+    }
+
+    impl MockPinentry {
+        fn new(pin: Option<&'static str>) -> Self {
+            Self {
+                pin,
+                prompts: Cell::new(0),
+            }
+        }
+
+        fn prompts(&self) -> usize {
+            self.prompts.get()
+        }
+    }
 
     impl Pinentry for MockPinentry {
         fn prompt_pin(
@@ -388,26 +420,31 @@ mod tests {
             _applet: Applet,
             _serial: Option<u128>,
         ) -> Result<Option<SecretBox<str>>, crate::Error> {
+            self.prompts.set(self.prompts.get() + 1);
             Ok(self
-                .0
+                .pin
                 .map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
         }
     }
 
     struct MockSigner {
+        verified: bool,
         verified_refs: Vec<u8>,
-        signed: bool,
-        authenticated: bool,
+        signs: usize,
+        authenticates: usize,
         result: Vec<u8>,
+        error: Option<fn() -> TransportError>,
     }
 
     impl MockSigner {
-        fn new(result: Vec<u8>) -> Self {
+        fn new(verified: bool, result: Vec<u8>) -> Self {
             Self {
+                verified,
                 verified_refs: Vec::new(),
-                signed: false,
-                authenticated: false,
+                signs: 0,
+                authenticates: 0,
                 result,
+                error: None,
             }
         }
     }
@@ -416,72 +453,132 @@ mod tests {
         fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
             assert_eq!(pin, b"123456");
             self.verified_refs.push(pw_ref);
+            self.verified = true;
             Ok(())
         }
 
         fn sign(&mut self, _digest_info: &[u8]) -> Result<Vec<u8>, TransportError> {
-            self.signed = true;
+            self.signs += 1;
+            if let Some(err) = self.error {
+                return Err(err());
+            }
+            if !self.verified {
+                return Err(TransportError::Apdu {
+                    label: "PSO:CDS",
+                    sw1: 0x69,
+                    sw2: 0x82,
+                });
+            }
             Ok(self.result.clone())
         }
 
         fn internal_authenticate(&mut self, _auth_input: &[u8]) -> Result<Vec<u8>, TransportError> {
-            self.authenticated = true;
+            self.authenticates += 1;
+            if let Some(err) = self.error {
+                return Err(err());
+            }
+            if !self.verified {
+                return Err(TransportError::Apdu {
+                    label: "INTERNAL AUTHENTICATE",
+                    sw1: 0x69,
+                    sw2: 0x82,
+                });
+            }
             Ok(self.result.clone())
         }
     }
 
     #[test]
-    fn sign_slot_verifies_pw1_sign_and_calls_pso_sign() {
-        let mut signer = MockSigner::new(vec![1, 2, 3]);
-        let res = sign_with_pin(
-            &mut signer,
-            KeyCrt::Sign,
-            b"digest",
-            Some(1234),
-            &MockPinentry(Some("123456")),
-        )
-        .unwrap();
+    fn already_verified_card_signs_without_prompting() {
+        let mut signer = MockSigner::new(true, vec![1, 2, 3]);
+        let pinentry = MockPinentry::new(Some("123456"));
+        let res = sign_with_pin(&mut signer, KeyCrt::Sign, b"digest", Some(1234), &pinentry)
+            .unwrap();
 
         assert_eq!(res, Some(vec![1, 2, 3]));
-        assert_eq!(signer.verified_refs, vec![PW1_SIGN]);
-        assert!(signer.signed);
-        assert!(!signer.authenticated);
-    }
+        assert_eq!(pinentry.prompts(), 0);
+        assert_eq!(signer.verified_refs, [] as [u8; 0]);
+        assert_eq!(signer.signs, 1);
+        assert_eq!(signer.authenticates, 0);
 
-    #[test]
-    fn auth_slot_verifies_pw1_other_and_calls_internal_authenticate() {
-        let mut signer = MockSigner::new(vec![4, 5, 6]);
-        let res = sign_with_pin(
-            &mut signer,
+        let mut auth_signer = MockSigner::new(true, vec![4, 5, 6]);
+        let auth_pinentry = MockPinentry::new(Some("123456"));
+        let auth_res = sign_with_pin(
+            &mut auth_signer,
             KeyCrt::Auth,
             b"digest",
             Some(1234),
-            &MockPinentry(Some("123456")),
+            &auth_pinentry,
         )
         .unwrap();
+
+        assert_eq!(auth_res, Some(vec![4, 5, 6]));
+        assert_eq!(auth_pinentry.prompts(), 0);
+        assert_eq!(auth_signer.verified_refs, [] as [u8; 0]);
+        assert_eq!(auth_signer.signs, 0);
+        assert_eq!(auth_signer.authenticates, 1);
+    }
+
+    #[test]
+    fn sign_slot_verifies_pw1_sign_and_retries_pso_sign() {
+        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+        let pinentry = MockPinentry::new(Some("123456"));
+        let res = sign_with_pin(&mut signer, KeyCrt::Sign, b"digest", Some(1234), &pinentry)
+            .unwrap();
+
+        assert_eq!(res, Some(vec![1, 2, 3]));
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(signer.verified_refs, vec![PW1_SIGN]);
+        assert_eq!(signer.signs, 2);
+        assert_eq!(signer.authenticates, 0);
+    }
+
+    #[test]
+    fn auth_slot_verifies_pw1_other_and_retries_internal_authenticate() {
+        let mut signer = MockSigner::new(false, vec![4, 5, 6]);
+        let pinentry = MockPinentry::new(Some("123456"));
+        let res = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
+            .unwrap();
 
         assert_eq!(res, Some(vec![4, 5, 6]));
+        assert_eq!(pinentry.prompts(), 1);
         assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
-        assert!(!signer.signed);
-        assert!(signer.authenticated);
+        assert_eq!(signer.signs, 0);
+        assert_eq!(signer.authenticates, 2);
     }
 
     #[test]
-    fn cancelled_pin_returns_none_without_verifying_or_signing() {
-        let mut signer = MockSigner::new(vec![7, 8, 9]);
-        let res = sign_with_pin(
-            &mut signer,
-            KeyCrt::Auth,
-            b"digest",
-            Some(1234),
-            &MockPinentry(None),
-        )
-        .unwrap();
+    fn cancelled_pin_returns_none_without_verifying() {
+        let mut signer = MockSigner::new(false, vec![7, 8, 9]);
+        let pinentry = MockPinentry::new(None);
+        let res = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
+            .unwrap();
 
         assert_eq!(res, None);
+        assert_eq!(pinentry.prompts(), 1);
         assert_eq!(signer.verified_refs, [] as [u8; 0]);
-        assert!(!signer.signed);
-        assert!(!signer.authenticated);
+        assert_eq!(signer.signs, 0);
+        assert_eq!(signer.authenticates, 1);
+    }
+
+    #[test]
+    fn non_security_error_propagates_without_prompting() {
+        let mut signer = MockSigner::new(false, vec![]);
+        signer.error = Some(|| TransportError::Apdu {
+            label: "INTERNAL AUTHENTICATE",
+            sw1: 0x6A,
+            sw2: 0x88,
+        });
+        let pinentry = MockPinentry::new(Some("123456"));
+
+        let err = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
+            .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Other(_)));
+        assert_eq!(pinentry.prompts(), 0);
+        assert_eq!(signer.verified_refs, [] as [u8; 0]);
+        assert_eq!(signer.signs, 0);
+        assert_eq!(signer.authenticates, 1);
     }
 
     #[test]
