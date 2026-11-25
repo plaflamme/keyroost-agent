@@ -830,8 +830,8 @@ fn ssh_public_credentials(
 ) -> Result<PublicCredential, crate::Error> {
     let key_data = match public_key {
         PublicKey::Rsa { modulus, exponent } => KeyData::Rsa(RsaPublicKey {
-            n: Mpint::from_bytes(&modulus)?,
-            e: Mpint::from_bytes(&exponent)?,
+            n: Mpint::from_positive_bytes(&modulus)?,
+            e: Mpint::from_positive_bytes(&exponent)?,
         }),
         PublicKey::Ecc { point } => match key_alg {
             KeyAlg::EccP256 => {
@@ -2115,5 +2115,26 @@ mod tests {
         assert_eq!(cancel_session.refreshes, 0);
         assert_eq!(cancel_session.cert_reads, 0);
         assert_eq!(cancel_pinentry.prompts(), 1);
+    }
+
+    #[test]
+    fn rsa_public_key_with_msb_set_encodes_as_positive_mpint() {
+        let mut modulus = vec![0x80; 256];
+        modulus[255] = 0x01;
+        let cred = super::ssh_public_credentials(
+            KeyAlg::Rsa2048,
+            keyroost_piv::PublicKey::Rsa {
+                modulus: modulus.clone(),
+                exponent: vec![0x00, 0x01, 0x00, 0x01],
+            },
+        )
+        .unwrap();
+
+        let super::PublicCredential::Key(super::KeyData::Rsa(rsa)) = cred else {
+            panic!("expected RSA key data");
+        };
+        assert_eq!(rsa.n.as_bytes()[0], 0x00);
+        assert_eq!(rsa.n.as_positive_bytes(), Some(modulus.as_slice()));
+        assert_eq!(rsa.e.as_positive_bytes(), Some([0x01, 0x00, 0x01].as_slice()));
     }
 }

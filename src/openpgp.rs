@@ -483,8 +483,8 @@ fn ssh_public_credentials(
     let key_data = match (attrs, public_key) {
         (AlgorithmAttributes::Rsa(_), PublicKey::Rsa { modulus, exponent }) => {
             KeyData::Rsa(RsaPublicKey {
-                n: Mpint::from_bytes(&modulus)?,
-                e: Mpint::from_bytes(&exponent)?,
+                n: Mpint::from_positive_bytes(&modulus)?,
+                e: Mpint::from_positive_bytes(&exponent)?,
             })
         }
         (
@@ -1338,6 +1338,33 @@ mod tests {
         )
         .unwrap();
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn rsa_public_key_with_msb_set_encodes_as_positive_mpint() {
+        let attrs = AlgorithmAttributes::Rsa(RsaAttributes {
+            n_bits: 2048,
+            e_bits: 32,
+            format: RsaImportFormat::Standard,
+        });
+        let mut modulus = vec![0xC3; 256];
+        modulus[255] = 0x01;
+        let cred = ssh_public_credentials(
+            attrs,
+            PublicKey::Rsa {
+                modulus: modulus.clone(),
+                exponent: vec![0x00, 0x01, 0x00, 0x01],
+            },
+        )
+        .unwrap()
+        .expect("expected RSA credential");
+
+        let PublicCredential::Key(super::KeyData::Rsa(rsa)) = cred else {
+            panic!("expected RSA key data");
+        };
+        assert_eq!(rsa.n.as_bytes()[0], 0x00);
+        assert_eq!(rsa.n.as_positive_bytes(), Some(modulus.as_slice()));
+        assert_eq!(rsa.e.as_positive_bytes(), Some([0x01, 0x00, 0x01].as_slice()));
     }
 
     #[derive(Debug, PartialEq, Eq)]
