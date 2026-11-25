@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use keyroost_agent::{ConnectionMode, PinCacheStrategy};
+use keyroost_agent::{ConnectionMode, OpenPgpOptions, PinCacheStrategy, PivOptions, PivSlot};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum AppletSelection {
@@ -176,6 +176,25 @@ fn resolve_config(
     })
 }
 
+fn resolve_piv_slots(
+    applet: AppletSelection,
+    slots: Vec<PivSlot>,
+) -> Result<Option<Vec<PivSlot>>, String> {
+    if slots.is_empty() {
+        return Ok(None);
+    }
+    if applet == AppletSelection::OpenPgp {
+        return Err("--piv-slot cannot be used with --applet=openpgp.".to_owned());
+    }
+    let mut deduped = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if !deduped.contains(&slot) {
+            deduped.push(slot);
+        }
+    }
+    Ok(Some(deduped))
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
@@ -196,6 +215,15 @@ struct Cli {
     /// Smart-card applet to expose
     #[arg(long, value_enum, default_value_t = AppletSelection::Auto)]
     applet: AppletSelection,
+
+    /// PIV slot(s) to expose (repeatable or comma-separated; e.g. 9a,9c,9d,9e,82-95,auth,sig,key-management,card-auth,retired1-retired20)
+    #[arg(
+        long = "piv-slot",
+        value_name = "SLOT",
+        value_delimiter = ',',
+        value_parser = keyroost_agent::parse_piv_slot
+    )]
+    piv_slots: Vec<PivSlot>,
 
     /// Smart-card connection mode
     #[arg(long, value_enum, default_value_t = ConnectionSelection::Auto)]
@@ -247,6 +275,24 @@ fn systemd_listener() -> Result<Option<tokio::net::UnixListener>, Box<dyn std::e
     Ok(Some(tokio::net::UnixListener::from_std(std_listener)?))
 }
 
+fn select_reader(
+    filter: Option<&str>,
+) -> Result<keyroost_transport::ReaderProbe, Box<dyn std::error::Error>> {
+    let mut readers = keyroost_transport::probe_readers()?
+        .into_iter()
+        .filter(|reader| reader.has_piv || reader.has_openpgp);
+    let reader = match filter {
+        Some(name) => readers.find(|probed| {
+            probed
+                .reader_name
+                .to_lowercase()
+                .contains(&name.to_lowercase())
+        }),
+        None => readers.next(),
+    };
+    reader.ok_or_else(|| "No PC/SC reader found.".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Cli::parse();
@@ -257,37 +303,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pin_cache_strategy =
         resolve_pin_cache(opts.pin_cache, opts.pin_cache_ttl, opts.pin_cache_max_ttl)?;
+    let piv_slots = resolve_piv_slots(opts.applet, opts.piv_slots)?;
     if matches!(pin_cache_strategy, PinCacheStrategy::Memory { .. }) {
         harden_process_memory();
     }
 
-    let mut readers = keyroost_transport::probe_readers()?
-        .into_iter()
-        .filter(|reader| reader.has_piv || reader.has_openpgp);
-    let reader = match opts.reader {
-        Some(name) => readers.find(|probed| {
-            probed
-                .reader_name
-                .to_lowercase()
-                .contains(&name.to_lowercase())
-        }),
-        None => readers.next(),
-    };
+    let reader = select_reader(opts.reader.as_deref())?;
 
-    let Some(reader) = reader else {
-        return Err("No PC/SC reader found.".into());
+    let piv_options = PivOptions {
+        reader: reader.reader_name.clone(),
+        slots: piv_slots.clone(),
     };
+    let openpgp_options = OpenPgpOptions::new(reader.reader_name.clone());
 
     let piv_has_identities = reader.has_piv
         && opts.applet != AppletSelection::OpenPgp
-        && keyroost_agent::probe_piv_identities(&reader.reader_name).unwrap_or_else(|err| {
+        && keyroost_agent::probe_piv_identities(&piv_options).unwrap_or_else(|err| {
             tracing::warn!("failed to probe PIV identities: {err}");
             false
         });
 
     let openpgp_has_identities = reader.has_openpgp
         && opts.applet != AppletSelection::Piv
-        && keyroost_agent::probe_openpgp_identities(&reader.reader_name).unwrap_or_else(|err| {
+        && keyroost_agent::probe_openpgp_identities(&openpgp_options).unwrap_or_else(|err| {
             tracing::warn!("failed to probe OpenPGP identities: {err}");
             false
         });
@@ -311,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         reader = %reader.reader_name,
         piv = resolved.use_piv,
+        piv_slots = ?piv_slots,
         openpgp = resolved.use_openpgp,
         connection = ?resolved.connection_mode,
         pin_cache = ?opts.pin_cache,
@@ -323,15 +362,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let piv_reader = resolved.use_piv.then(|| reader.reader_name.clone());
-    let openpgp_reader = resolved.use_openpgp.then(|| reader.reader_name.clone());
+    let piv_config = resolved.use_piv.then_some(piv_options);
+    let openpgp_config = resolved.use_openpgp.then_some(openpgp_options);
     let idle_timeout = (!opts.idle_timeout.is_zero()).then_some(opts.idle_timeout);
 
     if let Some(socket) = opts.socket {
         keyroost_agent::run(
             &socket,
-            piv_reader,
-            openpgp_reader,
+            piv_config,
+            openpgp_config,
             opts.pinentry,
             resolved.connection_mode,
             idle_timeout,
@@ -342,8 +381,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(listener) = systemd_listener()? {
         keyroost_agent::run_with_listener(
             listener,
-            piv_reader,
-            openpgp_reader,
+            piv_config,
+            openpgp_config,
             opts.pinentry,
             resolved.connection_mode,
             idle_timeout,
@@ -362,11 +401,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         AppletSelection, Cli, ConnectionSelection, PinCacheMode, ResolvedConfig, resolve_config,
-        resolve_pin_cache,
+        resolve_pin_cache, resolve_piv_slots,
     };
     use clap::Parser;
-    use keyroost_agent::{ConnectionMode, PinCacheStrategy};
+    use keyroost_agent::{ConnectionMode, PinCacheStrategy, PivSlot};
     use std::time::Duration;
+
+    #[test]
+    fn cli_parses_piv_slots_and_rejects_invalid() {
+        let default_cli = Cli::try_parse_from(["keyroost-agent"]).unwrap();
+        assert_eq!(default_cli.piv_slots, Vec::<PivSlot>::new());
+
+        let cli = Cli::try_parse_from([
+            "keyroost-agent",
+            "--piv-slot",
+            "9c,9d",
+            "--piv-slot",
+            "auth",
+            "--piv-slot",
+            "retired1,9c",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.piv_slots,
+            vec![
+                PivSlot::Signature,
+                PivSlot::KeyManagement,
+                PivSlot::Authentication,
+                PivSlot::Retired(1),
+                PivSlot::Signature,
+            ]
+        );
+
+        assert!(Cli::try_parse_from(["keyroost-agent", "--piv-slot", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn resolve_piv_slots_deduplicates_and_rejects_openpgp_applet() {
+        assert_eq!(resolve_piv_slots(AppletSelection::Auto, vec![]), Ok(None));
+        assert_eq!(
+            resolve_piv_slots(AppletSelection::OpenPgp, vec![]),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_piv_slots(
+                AppletSelection::Piv,
+                vec![
+                    PivSlot::Signature,
+                    PivSlot::KeyManagement,
+                    PivSlot::Signature,
+                ]
+            ),
+            Ok(Some(vec![PivSlot::Signature, PivSlot::KeyManagement]))
+        );
+        assert_eq!(
+            resolve_piv_slots(AppletSelection::Auto, vec![PivSlot::Authentication]),
+            Ok(Some(vec![PivSlot::Authentication]))
+        );
+        assert_eq!(
+            resolve_piv_slots(AppletSelection::Both, vec![PivSlot::Retired(2)]),
+            Ok(Some(vec![PivSlot::Retired(2)]))
+        );
+
+        let err =
+            resolve_piv_slots(AppletSelection::OpenPgp, vec![PivSlot::Authentication]).unwrap_err();
+        assert!(err.contains("--piv-slot"));
+        assert!(err.contains("--applet=openpgp"));
+    }
 
     #[test]
     fn cli_defaults_applet_connection_and_pin_cache() {

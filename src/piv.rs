@@ -214,20 +214,99 @@ pub(super) struct PivSshAgent {
     backend: PivBackend,
 }
 
+pub(crate) fn default_slots() -> Vec<Slot> {
+    let mut slots = vec![
+        Slot::Authentication,
+        Slot::CardAuthentication,
+        Slot::Signature,
+    ];
+    slots.extend(Slot::retired_all());
+    slots
+}
+
+pub(crate) fn dedup_slots(slots: Vec<Slot>) -> Vec<Slot> {
+    let mut deduped = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if !deduped.contains(&slot) {
+            deduped.push(slot);
+        }
+    }
+    deduped
+}
+
+pub(crate) fn parse_slot(s: &str) -> Result<Slot, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("PIV slot cannot be empty".to_owned());
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let hex = normalized.strip_prefix("0x").unwrap_or(&normalized);
+    if hex.len() == 2
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && let Ok(key_ref) = u8::from_str_radix(hex, 16)
+    {
+        return match key_ref {
+            0x9A => Ok(Slot::Authentication),
+            0x9C => Ok(Slot::Signature),
+            0x9D => Ok(Slot::KeyManagement),
+            0x9E => Ok(Slot::CardAuthentication),
+            0x82..=0x95 => Ok(Slot::retired(key_ref - 0x81).expect("0x82..=0x95 maps to 1..=20")),
+            _ => Err(format!(
+                "invalid PIV slot '{s}': unknown hex slot ID 0x{key_ref:02x} (expected 9a, 9c, 9d, 9e, or 82-95)"
+            )),
+        };
+    }
+
+    match normalized.as_str() {
+        "authentication" | "auth" => return Ok(Slot::Authentication),
+        "signature" | "sig" => return Ok(Slot::Signature),
+        "key-management" | "key_management" | "keymanagement" | "key-mgmt" | "keymgmt" | "km" => {
+            return Ok(Slot::KeyManagement);
+        }
+        "card-authentication"
+        | "card_authentication"
+        | "cardauthentication"
+        | "card-auth"
+        | "card_auth"
+        | "cardauth" => return Ok(Slot::CardAuthentication),
+        _ => {}
+    }
+
+    if let Some(rest) = normalized
+        .strip_prefix("retired-")
+        .or_else(|| normalized.strip_prefix("retired_"))
+        .or_else(|| normalized.strip_prefix("retired"))
+        .or_else(|| normalized.strip_prefix('r'))
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return rest
+            .parse::<u8>()
+            .ok()
+            .and_then(Slot::retired)
+            .ok_or_else(|| {
+                format!("invalid PIV retired slot '{s}': expected retired1-retired20 (82-95)")
+            });
+    }
+
+    Err(format!(
+        "invalid PIV slot '{s}': expected a slot hex ID (9a, 9c, 9d, 9e, 82-95) or name (authentication, signature, key-management, card-authentication, retired1-retired20)"
+    ))
+}
+
 impl PivSshAgent {
-    // TODO: manually select slots
     pub(super) fn new(
         reader: String,
+        slots: Option<Vec<Slot>>,
         pinentry: SystemPinentry,
         connection_mode: ConnectionMode,
         pin_cache: Option<PinCache>,
     ) -> Self {
-        // default signature-related slots
-        let sign_slots: &[Slot] = &[
-            Slot::Authentication,
-            Slot::CardAuthentication,
-            Slot::Signature,
-        ];
+        let slots = match slots {
+            Some(slots) => dedup_slots(slots),
+            None => default_slots(),
+        };
 
         let backend = match connection_mode {
             ConnectionMode::Ephemeral => PivBackend::Ephemeral,
@@ -237,7 +316,7 @@ impl PivSshAgent {
         Self {
             reader,
             config: PivConfig {
-                slots: Vec::from_iter([sign_slots, &Slot::retired_all()].concat()),
+                slots,
                 pinentry,
                 pin_cache,
             },
@@ -630,15 +709,108 @@ fn sign_with_policy(
 
 #[cfg(test)]
 mod tests {
-    use super::{PivSigner, sign_with_policy};
+    use super::{PivSigner, PivSshAgent, default_slots, parse_slot, sign_with_policy};
     use crate::{
+        ConnectionMode,
         pin_cache::PinCache,
-        pinentry::{Applet, PinPromptOptions, Pinentry},
+        pinentry::{Applet, PinPromptOptions, Pinentry, SystemPinentry},
     };
     use keyroost_piv::{KeyAlg, PinPolicy, Slot};
     use keyroost_transport::TransportError;
     use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
     use std::{cell::RefCell, collections::VecDeque, time::Duration};
+
+    #[test]
+    fn parse_slot_accepts_hex_and_named_identifiers() {
+        assert_eq!(parse_slot("9a"), Ok(Slot::Authentication));
+        assert_eq!(parse_slot("9A"), Ok(Slot::Authentication));
+        assert_eq!(parse_slot("0x9a"), Ok(Slot::Authentication));
+        assert_eq!(parse_slot(" 0X9C "), Ok(Slot::Signature));
+        assert_eq!(parse_slot("9d"), Ok(Slot::KeyManagement));
+        assert_eq!(parse_slot("9e"), Ok(Slot::CardAuthentication));
+        assert_eq!(parse_slot("82"), Ok(Slot::Retired(1)));
+        assert_eq!(parse_slot("0x82"), Ok(Slot::Retired(1)));
+        assert_eq!(parse_slot("95"), Ok(Slot::Retired(20)));
+        assert_eq!(parse_slot("0x95"), Ok(Slot::Retired(20)));
+
+        assert_eq!(parse_slot("authentication"), Ok(Slot::Authentication));
+        assert_eq!(parse_slot("auth"), Ok(Slot::Authentication));
+        assert_eq!(parse_slot("signature"), Ok(Slot::Signature));
+        assert_eq!(parse_slot("sig"), Ok(Slot::Signature));
+        assert_eq!(parse_slot("key-management"), Ok(Slot::KeyManagement));
+        assert_eq!(parse_slot("keymgmt"), Ok(Slot::KeyManagement));
+        assert_eq!(parse_slot("km"), Ok(Slot::KeyManagement));
+        assert_eq!(
+            parse_slot("card-authentication"),
+            Ok(Slot::CardAuthentication)
+        );
+        assert_eq!(parse_slot("card-auth"), Ok(Slot::CardAuthentication));
+
+        assert_eq!(parse_slot("retired1"), Ok(Slot::Retired(1)));
+        assert_eq!(parse_slot("retired-5"), Ok(Slot::Retired(5)));
+        assert_eq!(parse_slot("retired_10"), Ok(Slot::Retired(10)));
+        assert_eq!(parse_slot("retired20"), Ok(Slot::Retired(20)));
+        assert_eq!(parse_slot("r1"), Ok(Slot::Retired(1)));
+        assert_eq!(parse_slot("R20"), Ok(Slot::Retired(20)));
+    }
+
+    #[test]
+    fn parse_slot_rejects_invalid_identifiers() {
+        for invalid in [
+            "",
+            "   ",
+            "9b",
+            "81",
+            "96",
+            "0x9f",
+            "9a9c",
+            "retired",
+            "retired0",
+            "retired21",
+            "retired-0",
+            "retired-21",
+            "r0",
+            "r21",
+            "bogus",
+        ] {
+            assert!(
+                parse_slot(invalid).is_err(),
+                "expected '{invalid}' to fail parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn piv_agent_new_defaults_and_deduplicates_explicit_slots() {
+        let default_agent = PivSshAgent::new(
+            "reader".to_owned(),
+            None,
+            SystemPinentry::default(),
+            ConnectionMode::Ephemeral,
+            None,
+        );
+        assert_eq!(default_agent.config.slots, default_slots());
+        assert!(!default_agent.config.slots.contains(&Slot::KeyManagement));
+        assert_eq!(default_agent.config.slots.len(), 23);
+
+        let custom_agent = PivSshAgent::new(
+            "reader".to_owned(),
+            Some(vec![
+                Slot::Signature,
+                Slot::KeyManagement,
+                Slot::Signature,
+                Slot::Authentication,
+                Slot::KeyManagement,
+            ]),
+            SystemPinentry::default(),
+            ConnectionMode::Ephemeral,
+            None,
+        );
+        assert_eq!(
+            custom_agent.config.slots,
+            vec![Slot::Signature, Slot::KeyManagement, Slot::Authentication]
+        );
+    }
 
     fn secret(pin: &str) -> SecretBox<str> {
         SecretBox::from(Box::<str>::from(pin))

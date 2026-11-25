@@ -8,7 +8,7 @@
 ## Features
 
 - **PIV Applet**:
-  - Standard signature-capable slots (`9A`, `9C`, `9E`) and retired key-management slots (`82`–`95`)
+  - Standard signature-capable slots (`9A`, `9C`, `9E`) and retired key-management slots (`82`–`95`) by default, with optional manual slot selection via `--piv-slot` (including `9D` / Key Management)
 - **OpenPGP Card Applet**:
   - Authentication (`AUT`) and signature (`SIG`) slots
 - **Pinentry Integration**:
@@ -170,6 +170,7 @@ keyroost-agent --socket /tmp/keyroost-agent.sock \
 | `-r, --reader <READER>` | — | Filter PC/SC smart-card reader by case-insensitive substring |
 | `-p, --pinentry <PINENTRY>` | system default | Path or name of the `pinentry` binary to use for PIN prompts |
 | `--applet <auto\|piv\|openpgp\|both>` | `auto` | Smart-card applet(s) to expose (`auto` enables applets with usable SSH identities) |
+| `--piv-slot <SLOT>` | `9A`, `9C`, `9E`, `82`–`95` | PIV slot(s) to expose (repeatable or comma-separated; accepts hex IDs like `9a`, `9c`, `9d`, `9e`, `82`–`95` or names like `auth`, `sig`, `key-management`, `card-auth`, `retired1`–`retired20`; cannot be combined with `--applet=openpgp`) |
 | `--connection <auto\|persistent\|ephemeral>` | `auto` | Smart-card connection mode (`auto` uses `persistent` for a single active applet and `ephemeral` when both are active) |
 | `--idle-timeout <DURATION>` | `30m` | Idle timeout after which persistent sessions are released, e.g. `30s`, `30m`, `1h` (`0` disables) |
 | `--pin-cache <none\|memory\|pinentry>` | `none` | PIN caching strategy |

@@ -49,6 +49,21 @@ in
       '';
     };
 
+    pivSlots = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      default = null;
+      example = [
+        "9a"
+        "9c"
+      ];
+      description = ''
+        Optional list of PIV slots to expose, passed via {option}`--piv-slot`
+        (for example `["9a" "9c"]`, `["auth" "key-management"]`, or
+        `["retired1"]`). When `null`, the default slot set (`9A`, `9C`, `9E`,
+        and retired slots `82`–`95`) is used.
+      '';
+    };
+
     connection = lib.mkOption {
       type = lib.types.enum [
         "auto"
@@ -174,6 +189,9 @@ in
             [ "${cfg.package}/bin/keyroost-agent" ]
             ++ lib.optional (cfg.reader != null) "--reader=${lib.escapeShellArg cfg.reader}"
             ++ lib.optional (cfg.applets != "auto") "--applet=${cfg.applets}"
+            ++ lib.optionals (cfg.pivSlots != null) (
+              map (slot: "--piv-slot=${lib.escapeShellArg slot}") cfg.pivSlots
+            )
             ++ lib.optional (cfg.connection != "auto") "--connection=${cfg.connection}"
             ++ lib.optional (
               cfg.idleTimeout != null

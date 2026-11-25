@@ -18,6 +18,70 @@ mod pinentry;
 mod piv;
 
 pub(crate) use crate::error::Error;
+pub use keyroost_piv::Slot as PivSlot;
+
+/// Configuration options for the PIV smart-card applet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PivOptions {
+    /// PC/SC reader name to open.
+    pub reader: String,
+    /// Optional explicit list of PIV slots to expose.
+    ///
+    /// When `None`, the default slot set (`Authentication`, `CardAuthentication`,
+    /// `Signature`, and all retired slots `82`–`95`) is used. Duplicate entries
+    /// are deduplicated while preserving order.
+    pub slots: Option<Vec<PivSlot>>,
+}
+
+impl PivOptions {
+    /// Create PIV options for `reader` using the default slot set.
+    #[must_use]
+    pub fn new(reader: impl Into<String>) -> Self {
+        Self {
+            reader: reader.into(),
+            slots: None,
+        }
+    }
+
+    /// Restrict the exposed PIV slots to `slots`.
+    #[must_use]
+    pub fn with_slots(mut self, slots: Vec<PivSlot>) -> Self {
+        self.slots = Some(slots);
+        self
+    }
+}
+
+/// Configuration options for the `OpenPGP` smart-card applet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPgpOptions {
+    /// PC/SC reader name to open.
+    pub reader: String,
+}
+
+impl OpenPgpOptions {
+    /// Create `OpenPGP` options for `reader`.
+    #[must_use]
+    pub fn new(reader: impl Into<String>) -> Self {
+        Self {
+            reader: reader.into(),
+        }
+    }
+}
+
+/// Parse a PIV slot identifier or name into a [`PivSlot`].
+///
+/// Accepts case-insensitive hex key references (`9a`, `9c`, `9d`, `9e`, `82`–`95`,
+/// with optional `0x` prefix), standard names (`authentication`/`auth`,
+/// `signature`/`sig`, `key-management`/`keymgmt`/`km`,
+/// `card-authentication`/`card-auth`), and retired slot names
+/// (`retired1`–`retired20`, `retired-1`–`retired-20`, `r1`–`r20`).
+///
+/// # Errors
+///
+/// Returns an error message if `s` is not a recognized PIV slot identifier.
+pub fn parse_piv_slot(s: &str) -> Result<PivSlot, String> {
+    piv::parse_slot(s)
+}
 
 /// Strategy for managing PC/SC connections to a smart-card applet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,14 +167,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(total_secs))
 }
 
-/// Check whether the PIV applet on `reader` has at least one usable SSH identity.
+/// Check whether the PIV applet configured by `options` has at least one usable SSH identity.
 ///
 /// # Errors
 ///
 /// Returns an error if communicating with the PIV applet fails.
-pub fn probe_piv_identities(reader: &str) -> Result<bool, std::io::Error> {
+pub fn probe_piv_identities(options: &PivOptions) -> Result<bool, std::io::Error> {
     let agent = piv::PivSshAgent::new(
-        reader.to_owned(),
+        options.reader.clone(),
+        options.slots.clone(),
         pinentry::SystemPinentry::default(),
         ConnectionMode::Ephemeral,
         None,
@@ -121,14 +186,14 @@ pub fn probe_piv_identities(reader: &str) -> Result<bool, std::io::Error> {
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
-/// Check whether the `OpenPGP` applet on `reader` has at least one usable SSH identity.
+/// Check whether the `OpenPGP` applet configured by `options` has at least one usable SSH identity.
 ///
 /// # Errors
 ///
 /// Returns an error if communicating with the `OpenPGP` applet fails.
-pub fn probe_openpgp_identities(reader: &str) -> Result<bool, std::io::Error> {
+pub fn probe_openpgp_identities(options: &OpenPgpOptions) -> Result<bool, std::io::Error> {
     let agent = openpgp::OpenPgpSshAgent::new(
-        reader.to_owned(),
+        options.reader.clone(),
         pinentry::SystemPinentry::default(),
         ConnectionMode::Ephemeral,
         None,
@@ -325,8 +390,8 @@ fn map_listen_result(result: Result<(), AgentError>) -> Result<(), std::io::Erro
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     socket_path: &Path,
-    piv_reader: Option<String>,
-    openpgp_reader: Option<String>,
+    piv: Option<PivOptions>,
+    openpgp: Option<OpenPgpOptions>,
     pinentry_binary: Option<String>,
     connection_mode: ConnectionMode,
     idle_timeout: Option<Duration>,
@@ -336,8 +401,8 @@ pub async fn run(
     let listener = UnixListener::bind(socket_path)?;
     run_with_listener(
         listener,
-        piv_reader,
-        openpgp_reader,
+        piv,
+        openpgp,
         pinentry_binary,
         connection_mode,
         idle_timeout,
@@ -355,8 +420,8 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_listener(
     listener: UnixListener,
-    piv_reader: Option<String>,
-    openpgp_reader: Option<String>,
+    piv: Option<PivOptions>,
+    openpgp: Option<OpenPgpOptions>,
     pinentry_binary: Option<String>,
     connection_mode: ConnectionMode,
     idle_timeout: Option<Duration>,
@@ -373,11 +438,17 @@ pub async fn run_with_listener(
     let pinentry = pinentry::SystemPinentry::new(pinentry_binary, external_pin_cache);
     let idle_tracker = IdleTracker::new();
     let agent = KeyroostAgent {
-        piv: piv_reader.map(|reader| {
-            piv::PivSshAgent::new(reader, pinentry.clone(), connection_mode, pin_cache.clone())
+        piv: piv.map(|opts| {
+            piv::PivSshAgent::new(
+                opts.reader,
+                opts.slots,
+                pinentry.clone(),
+                connection_mode,
+                pin_cache.clone(),
+            )
         }),
-        openpgp: openpgp_reader.map(|reader| {
-            openpgp::OpenPgpSshAgent::new(reader, pinentry, connection_mode, pin_cache.clone())
+        openpgp: openpgp.map(|opts| {
+            openpgp::OpenPgpSshAgent::new(opts.reader, pinentry, connection_mode, pin_cache.clone())
         }),
         idle_tracker: idle_tracker.clone(),
         pin_cache,
@@ -505,6 +576,7 @@ mod tests {
         let mut agent = KeyroostAgent {
             piv: Some(piv::PivSshAgent::new(
                 "mock-reader".to_owned(),
+                None,
                 pinentry::SystemPinentry::default(),
                 ConnectionMode::Persistent,
                 None,
