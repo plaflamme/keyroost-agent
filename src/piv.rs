@@ -4,7 +4,7 @@ use keyroost_piv::{
     KeyAlg, PinPolicy, PublicKey, Slot,
     x509::{SigHash, X509Error},
 };
-use keyroost_transport::{PivSession, TransportError};
+use keyroost_transport::{PivSession, PivSessionState, TransportError};
 use sha2::Digest;
 use ssh_agent_lib::{
     proto::{Identity, PublicCredential},
@@ -143,21 +143,27 @@ impl<Req, Res, E> PersistentWorker<Req, Res, E> {
     }
 }
 
+enum TransactionExit {
+    Disconnect(mpsc::Sender<()>),
+    Closed,
+    TransportError,
+}
+
 fn serve_in_transaction<Req, Res, E>(
     first_req: Req,
     first_reply: mpsc::Sender<Result<Res, E>>,
     rx: &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
     mut handle: impl FnMut(Req) -> Result<Res, E>,
     is_fatal: impl Fn(&E) -> bool,
-) -> Option<mpsc::Sender<()>> {
+) -> TransactionExit {
     let mut pending = Some((first_req, first_reply));
     loop {
         let (req, reply) = match pending.take() {
             Some(pair) => pair,
             None => match rx.recv() {
                 Ok(WorkerMessage::Request { request, reply }) => (request, reply),
-                Ok(WorkerMessage::Disconnect { reply }) => return Some(reply),
-                Err(_) => return None,
+                Ok(WorkerMessage::Disconnect { reply }) => return TransactionExit::Disconnect(reply),
+                Err(_) => return TransactionExit::Closed,
             },
         };
         let result = handle(req);
@@ -165,7 +171,7 @@ fn serve_in_transaction<Req, Res, E>(
         let _ = reply.send(result);
         if broken {
             tracing::debug!("dropping persistent PIV session after transport error");
-            return None;
+            return TransactionExit::TransportError;
         }
     }
 }
@@ -175,7 +181,7 @@ fn run_worker<Req, Res, E>(
     mut open_and_serve: impl FnMut(
         &mut Option<(Req, mpsc::Sender<Result<Res, E>>)>,
         &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
-    ) -> Result<Option<mpsc::Sender<()>>, E>,
+    ) -> Result<TransactionExit, E>,
 ) {
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -185,11 +191,11 @@ fn run_worker<Req, Res, E>(
             WorkerMessage::Request { request, reply } => {
                 let mut pending = Some((request, reply));
                 match open_and_serve(&mut pending, rx) {
-                    Ok(Some(disconnect_reply)) => {
+                    Ok(TransactionExit::Disconnect(disconnect_reply)) => {
                         tracing::debug!("disconnected persistent PIV session");
                         let _ = disconnect_reply.send(());
                     }
-                    Ok(None) => {}
+                    Ok(TransactionExit::Closed | TransactionExit::TransportError) => {}
                     Err(err) => {
                         if let Some((_, reply)) = pending.take() {
                             let _ = reply.send(Err(err));
@@ -212,6 +218,40 @@ pub(super) struct PivSshAgent {
     reader: String,
     config: PivConfig,
     backend: PivBackend,
+    session_state: Arc<Mutex<PivSessionState>>,
+}
+
+fn with_piv_transaction<R>(
+    reader: &str,
+    cached_state: &Mutex<PivSessionState>,
+    f: impl FnOnce(&mut PivSession<'_>) -> Result<R, crate::Error>,
+) -> Result<R, crate::Error> {
+    let snapshot = cached_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let result = PivSession::with_cached_transaction(reader, snapshot, |session| {
+        let res = f(session);
+        let next_state = if res.as_ref().err().is_some_and(crate::Error::is_transport_error) {
+            PivSessionState::default()
+        } else {
+            session.state()
+        };
+        *cached_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_state;
+        res
+    });
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(crate::Error::is_transport_error)
+    {
+        *cached_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PivSessionState::default();
+    }
+    result
 }
 
 pub(crate) fn default_slots() -> Vec<Slot> {
@@ -321,6 +361,7 @@ impl PivSshAgent {
                 pin_cache,
             },
             backend,
+            session_state: Arc::new(Mutex::new(PivSessionState::default())),
         }
     }
 
@@ -337,7 +378,7 @@ impl PivSshAgent {
                     connection_mode = ?ConnectionMode::Ephemeral,
                     "requesting PIV identities"
                 );
-                PivSession::with_transaction(&self.reader, |session| {
+                with_piv_transaction(&self.reader, &self.session_state, |session| {
                     let serial = session.status().ok().and_then(|status| status.serial);
                     list_ssh_identities(&self.config.slots, session, serial)
                 })
@@ -365,17 +406,19 @@ impl PivSshAgent {
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<Option<Signature>, crate::Error> {
         match &self.backend {
-            PivBackend::Ephemeral => PivSession::with_transaction(&self.reader, |session| {
-                let serial = session.status().ok().and_then(|status| status.serial);
-                sign_in_session(
-                    &self.config,
-                    session,
-                    serial,
-                    public_credential,
-                    data,
-                    rsa_sig_hash,
-                )
-            }),
+            PivBackend::Ephemeral => {
+                with_piv_transaction(&self.reader, &self.session_state, |session| {
+                    let serial = session.status().ok().and_then(|status| status.serial);
+                    sign_in_session(
+                        &self.config,
+                        session,
+                        serial,
+                        public_credential,
+                        data,
+                        rsa_sig_hash,
+                    )
+                })
+            }
             PivBackend::Persistent(worker) => {
                 let response = self.send_persistent(
                     worker,
@@ -402,12 +445,13 @@ impl PivSshAgent {
     ) -> Result<PivResponse, crate::Error> {
         let reader = self.reader.clone();
         let config = self.config.clone();
+        let session_state = Arc::clone(&self.session_state);
         worker.send_request(
             request,
             move |rx| {
                 std::thread::spawn(move || {
                     run_worker(&rx, |pending, rx| {
-                        PivSession::with_transaction(&reader, |session| {
+                        let exit = with_piv_transaction(&reader, &session_state, |session| {
                             // Read serial ONCE when the persistent session opens: on Token2 cards,
                             // `status()` performs a cross-applet OTP read which resets PIV PIN state.
                             let serial = session.status().ok().and_then(|status| status.serial);
@@ -439,7 +483,14 @@ impl PivSshAgent {
                                 },
                                 crate::Error::is_transport_error,
                             ))
-                        })
+                        })?;
+                        if matches!(exit, TransactionExit::TransportError) {
+                            *session_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                PivSessionState::default();
+                        }
+                        Ok(exit)
                     });
                 });
             },
