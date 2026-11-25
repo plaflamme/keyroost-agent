@@ -12,8 +12,11 @@ in
 
     users.users.testuser = {
       isNormalUser = true;
+      linger = true;
       openssh.authorizedKeys.keys = [ sshPubKey ];
     };
+
+    home-manager.users.testuser.services.keyroost-agent.enable = true;
 
     services.sftcrd.config = {
       piv.slots."9a" = {
@@ -40,33 +43,43 @@ in
     };
   };
 
-  testScript = ''
-    host.wait_for_unit("sshd.service")
+  testScript =
+    { ... }:
+    let
+      bash = command: "XDG_RUNTIME_DIR=/run/user/1000 bash -il -c ${pkgs.lib.escapeShellArg command}";
+      su = command: "su - testuser -c ${pkgs.lib.escapeShellArg (bash command)}";
+      # toPythonString "foo "bar" baz" => ""foo \"bar\" baz""
+      toPythonString = string: builtins.toJSON string;
+    in
+    ''
+      host.wait_for_unit("sshd.service")
+      host.wait_for_unit("keyroost-agent.socket", "testuser")
 
-    # Start keyroost-agent in background binding to a unix socket
-    socket = "/tmp/agent.sock"
-    host.succeed(f"keyroost-agent --socket {socket} >/tmp/keyroost-agent.log 2>&1 &")
-    host.wait_for_file(socket)
+      socket = "/run/user/1000/keyroost-agent/ssh.socket"
+      host.wait_for_file(socket)
+      assert (
+          host.succeed(${toPythonString (su "printf %s $SSH_AUTH_SOCK")})
+          == socket
+      )
 
-    # Provide the valid PIV PIN via mockPinentry
-    host.succeed("printf '123456\n' > /tmp/pinentry-responses")
+      # Provide the valid PIV PIN via mockPinentry
+      host.succeed(${toPythonString (su "printf '123456\n' > /tmp/pinentry-responses")})
 
-    # Authenticate over SSH using only the keyroost-agent socket and static public key
-    ssh_output = host.succeed(
-        f"SSH_AUTH_SOCK={socket} ssh "
-        "-n "
-        "-o BatchMode=yes "
-        "-o StrictHostKeyChecking=no "
-        "-o UserKnownHostsFile=/dev/null "
-        "-o IdentitiesOnly=yes "
-        "-i ${pubKeyFile} "
-        "-T testuser@localhost echo ok"
-    ).strip()
-    assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
+      # Authenticate over SSH using the socket-activated keyroost-agent and SSH_AUTH_SOCK
+      ssh_output = host.succeed(${toPythonString (su ''
+        ssh -n \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes \
+        -i ${pubKeyFile} \
+        -T testuser@localhost echo ok
+      '')}).strip()
+      assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
 
-    # Verify mockPinentry was invoked with the expected card description and GETPIN
-    pinentry_log = host.succeed("cat /tmp/pinentry-commands.log")
-    assert "SETDESC Please unlock PIV card 87654321" in pinentry_log, f"Missing SETDESC in pinentry log:\n{pinentry_log}"
-    assert pinentry_log.count("GETPIN") == 1, f"Expected 1 GETPIN call, got:\n{pinentry_log}"
-  '';
+      # Verify mockPinentry was invoked with the expected card description and GETPIN
+      pinentry_log = host.succeed("cat /tmp/pinentry-commands.log")
+      assert "SETDESC Please unlock PIV card 87654321" in pinentry_log, f"Missing SETDESC in pinentry log:\n{pinentry_log}"
+      assert pinentry_log.count("GETPIN") == 1, f"Expected 1 GETPIN call, got:\n{pinentry_log}"
+    '';
 }

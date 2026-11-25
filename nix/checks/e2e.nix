@@ -1,8 +1,10 @@
 {
   pkgs,
   sftcrd,
+  home-manager,
   keyroostctl,
   keyroost-agent,
+  keyroostAgentModule,
   system,
   ...
 }:
@@ -85,70 +87,90 @@ let
     "openpgp"
   ];
 
-  mkCheck =
-    suite: test: {
+  mkCheck = suite: test: {
+    name = "e2e-${suite}-${test}";
+    value = pkgs.testers.runNixOSTest {
+
       name = "e2e-${suite}-${test}";
-      value = pkgs.testers.runNixOSTest {
 
-        name = "e2e-${suite}-${test}";
+      imports = [
+        (./. + "/${suite}/${test}.nix")
+      ];
 
-        imports = [
-          (./. + "/${suite}/${test}.nix")
-        ];
+      sshBackdoor.enable = true;
 
-        sshBackdoor.enable = true;
+      nodes = {
+        host =
+          {
+            config,
+            lib,
+            pkgs,
+            ...
+          }:
+          {
+            imports = [
+              nixosModule
+              home-manager.nixosModules.home-manager
+            ];
 
-        nodes = {
-          host =
-            { pkgs, ... }:
-            {
-              imports = [ nixosModule ];
-
-              services.sftcrd = {
-                enable = true;
-                log-level = "trace";
+            home-manager.useGlobalPkgs = true;
+            home-manager.users = lib.mkIf (config.users.users ? testuser) {
+              testuser = {
+                imports = [ keyroostAgentModule ];
+                home.stateVersion = "26.11";
+                programs.bash.enable = true;
+                services.keyroost-agent = {
+                  package = keyroost-agent;
+                  pinentry.package = lib.mkDefault mockPinentry;
+                };
               };
-
-              environment.systemPackages = [
-                pkgs.openssl
-                pkgs.openssh
-                pkgs.yubico-piv-tool
-                keyroostctl
-                keyroost-agent
-                mockPinentry
-              ];
             };
-        };
 
-        testScript = pkgs.lib.mkBefore ''
-          start_all()
-          host.wait_for_unit("pcscd.socket")
-          host.wait_for_unit("sftcrd.service")
+            services.sftcrd = {
+              enable = true;
+              log-level = "trace";
+            };
 
-          def keyroostctl(args, pin="123456", admin_pin="12345678", mgmt="010203040506070801020304050607080102030405060708", **kwargs):
-              env_parts = []
-              if pin:
-                  env_parts.append(f"PIN={pin}")
-              if admin_pin:
-                  env_parts.append(f"ADMIN_PIN={admin_pin}")
-              if mgmt:
-                  env_parts.append(f"MGMT={mgmt}")
-              for key, value in kwargs.items():
-                  env_parts.append(f"{key}={value}")
-              env_str = " ".join(env_parts) + " " if env_parts else ""
-              cmd = f"{env_str}keyroostctl {args}"
-              return host.succeed(cmd)
-        '';
+            environment.systemPackages = [
+              pkgs.openssl
+              pkgs.openssh
+              pkgs.yubico-piv-tool
+              keyroostctl
+              keyroost-agent
+              mockPinentry
+            ];
+          };
       };
+
+      testScript = pkgs.lib.mkBefore ''
+        start_all()
+        host.wait_for_unit("pcscd.socket")
+        host.wait_for_unit("sftcrd.service")
+
+        def keyroostctl(args, pin="123456", admin_pin="12345678", mgmt="010203040506070801020304050607080102030405060708", **kwargs):
+            env_parts = []
+            if pin:
+                env_parts.append(f"PIN={pin}")
+            if admin_pin:
+                env_parts.append(f"ADMIN_PIN={admin_pin}")
+            if mgmt:
+                env_parts.append(f"MGMT={mgmt}")
+            for key, value in kwargs.items():
+                env_parts.append(f"{key}={value}")
+            env_str = " ".join(env_parts) + " " if env_parts else ""
+            cmd = f"{env_str}keyroostctl {args}"
+            return host.succeed(cmd)
+      '';
     };
+  };
 in
 pkgs.lib.optionalAttrs (system == "x86_64-linux") (
   builtins.listToAttrs (
     pkgs.lib.concatMap (
       suite:
-      map
-        (name: mkCheck suite (pkgs.lib.strings.removeSuffix ".nix" name))
-        (builtins.attrNames (builtins.readDir (./. + "/${suite}")))
+      map (name: mkCheck suite (pkgs.lib.strings.removeSuffix ".nix" name)) (
+        builtins.attrNames (builtins.readDir (./. + "/${suite}"))
+      )
     ) suites
   )
 )

@@ -74,8 +74,22 @@ pub async fn run(
     openpgp_reader: Option<String>,
     pinentry_binary: Option<String>,
 ) -> Result<(), std::io::Error> {
-    let pinentry = pinentry::SystemPinentry::new(pinentry_binary);
     let listener = UnixListener::bind(socket_path)?;
+    run_with_listener(listener, piv_reader, openpgp_reader, pinentry_binary).await
+}
+
+/// Launch an SSH agent on an already-bound Unix-domain socket listener.
+///
+/// # Errors
+///
+/// Will return `Err` if the ssh agent raises an error while listening for connections.
+pub async fn run_with_listener(
+    listener: UnixListener,
+    piv_reader: Option<String>,
+    openpgp_reader: Option<String>,
+    pinentry_binary: Option<String>,
+) -> Result<(), std::io::Error> {
+    let pinentry = pinentry::SystemPinentry::new(pinentry_binary);
     let result = ssh_agent_lib::agent::listen(
         listener,
         KeyroostAgent {

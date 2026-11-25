@@ -19,6 +19,10 @@
     };
     keyroost.url = "github:framefilter/keyroost/v0.16.0";
     sftcrd.url = "github:plaflamme/sftcrd";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -26,8 +30,18 @@
       flake-parts,
       keyroost,
       sftcrd,
+      home-manager,
       ...
     }:
+    let
+      keyroostAgentModule =
+        { lib, pkgs, ... }:
+        {
+          imports = [ ./nix/modules/keyroost-agent.nix ];
+          services.keyroost-agent.package =
+            lib.mkDefault inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.keyroost-agent;
+        };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
 
       systems = [
@@ -40,6 +54,11 @@
         inputs.rust-flake.flakeModules.default
         inputs.rust-flake.flakeModules.nixpkgs
       ];
+
+      flake.homeModules = {
+        keyroost-agent = keyroostAgentModule;
+        default = keyroostAgentModule;
+      };
 
       perSystem =
         {
@@ -84,7 +103,13 @@
             let
               keyroost-agent = config.packages.keyroost-agent-debug;
               ctx = inputs // {
-                inherit sftcrd keyroostctl keyroost-agent;
+                inherit
+                  sftcrd
+                  home-manager
+                  keyroostctl
+                  keyroost-agent
+                  keyroostAgentModule
+                  ;
               };
             in
             { } // (import ./nix/checks/e2e.nix ctx) // (removeAttrs config.packages [ "default" ]);

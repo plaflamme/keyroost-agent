@@ -1,0 +1,106 @@
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+let
+  cfg = config.services.keyroost-agent;
+in
+{
+  options.services.keyroost-agent = {
+    enable = lib.mkEnableOption "the socket-activated keyroost-agent systemd user service";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "The keyroost-agent package to use.";
+    };
+
+    socket = lib.mkOption {
+      type = lib.types.str;
+      default = "keyroost-agent/ssh.socket";
+      example = "keyroost-agent/my.socket";
+      description = ''
+        The SSH agent's socket; interpreted as a suffix to {env}`$XDG_RUNTIME_DIR`
+        on Linux.
+      '';
+    };
+
+    reader = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Smart-card reader whose name contains this text (case-insensitive).
+      '';
+    };
+
+    pinentry = {
+      package = lib.mkPackageOption pkgs "pinentry-gnome3" {
+        nullable = true;
+        default = null;
+        extraDescription = ''
+          Which pinentry interface to use. If not `null`, it sets the
+          {option}`--pinentry` command line option.
+        '';
+      };
+
+      program = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        example = "pinentry-wayprompt";
+        description = ''
+          Which program to search for in the configured `pinentry.package`.
+        '';
+      };
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    # Grab the default binary name and fallback to expected value if `meta.mainProgram` not set
+    services.keyroost-agent.pinentry.program = lib.mkOptionDefault (
+      cfg.pinentry.package.meta.mainProgram or "pinentry"
+    );
+
+    home.packages = [ cfg.package ];
+
+    sshAuthSock = {
+      enable = true;
+      initialization =
+        let
+          socketPath = "\${XDG_RUNTIME_DIR}/${cfg.socket}";
+        in
+        {
+          bash = ''export SSH_AUTH_SOCK="${socketPath}"'';
+          fish = ''set -x SSH_AUTH_SOCK "${socketPath}"'';
+          nushell = "$env.SSH_AUTH_SOCK = $env.XDG_RUNTIME_DIR/${cfg.socket}";
+        };
+      systemd.socketProviderUnit = "keyroost-agent.service";
+    };
+
+    systemd.user = {
+      sockets."keyroost-agent" = {
+        Unit.Description = "keyroost-agent socket activation";
+        # systemd specifier syntax; %t is the user runtime directory ($XDG_RUNTIME_DIR)
+        Socket.ListenStream = [ "%t/${cfg.socket}" ];
+        Install.WantedBy = [ "sockets.target" ];
+      };
+
+      services."keyroost-agent" = {
+        Unit = {
+          Description = "keyroost-agent service";
+          Requires = "keyroost-agent.socket";
+          After = "keyroost-agent.socket";
+          RefuseManualStart = true;
+        };
+        Service = {
+          ExecStart = lib.concatStringsSep " " (
+            [ "${cfg.package}/bin/keyroost-agent" ]
+            ++ lib.optional (cfg.reader != null) "--reader=${lib.escapeShellArg cfg.reader}"
+            ++ lib.optional (
+              cfg.pinentry.package != null
+            ) "--pinentry=${lib.getExe' cfg.pinentry.package cfg.pinentry.program}"
+          );
+        };
+      };
+    };
+  };
+}
