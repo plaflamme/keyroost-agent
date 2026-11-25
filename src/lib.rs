@@ -93,7 +93,7 @@ pub enum ConnectionMode {
     Ephemeral,
 }
 
-/// Strategy for smart-card PIN caching.
+/// Strategy for caching smart-card PINs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PinCacheStrategy {
     /// Do not cache PINs; prompt on every card verification.
@@ -108,6 +108,25 @@ pub enum PinCacheStrategy {
     },
     /// Delegate PIN caching to `pinentry`'s external password cache (OS keyring).
     Pinentry,
+}
+
+/// Configuration options for running the `keyroost-agent` SSH agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyroostAgentOptions {
+    /// Optional PIV smart-card applet configuration.
+    pub piv: Option<PivOptions>,
+    /// Optional `OpenPGP` smart-card applet configuration.
+    pub openpgp: Option<OpenPgpOptions>,
+    /// Optional path or name of the `pinentry` binary to invoke for PIN prompts.
+    pub pinentry_binary: Option<String>,
+    /// Strategy for managing PC/SC connections to the smart-card applets.
+    pub connection_mode: ConnectionMode,
+    /// Optional idle timeout for disconnecting persistent sessions.
+    pub idle_timeout: Option<Duration>,
+    /// Whether the agent should exit once the idle timeout elapses (e.g. for socket activation).
+    pub exit_on_idle: bool,
+    /// Strategy for caching smart-card PINs.
+    pub pin_cache: PinCacheStrategy,
 }
 
 /// Parse a human-friendly duration string into a [`Duration`].
@@ -387,29 +406,9 @@ fn map_listen_result(result: Result<(), AgentError>) -> Result<(), std::io::Erro
 /// # Errors
 ///
 /// Will return `Err` if an error occurs while binding to the socket or if the ssh agent raises an error while listening for connections.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    socket_path: &Path,
-    piv: Option<PivOptions>,
-    openpgp: Option<OpenPgpOptions>,
-    pinentry_binary: Option<String>,
-    connection_mode: ConnectionMode,
-    idle_timeout: Option<Duration>,
-    exit_on_idle: bool,
-    pin_cache: PinCacheStrategy,
-) -> Result<(), std::io::Error> {
+pub async fn run(socket_path: &Path, options: KeyroostAgentOptions) -> Result<(), std::io::Error> {
     let listener = UnixListener::bind(socket_path)?;
-    run_with_listener(
-        listener,
-        piv,
-        openpgp,
-        pinentry_binary,
-        connection_mode,
-        idle_timeout,
-        exit_on_idle,
-        pin_cache,
-    )
-    .await
+    run_with_listener(listener, options).await
 }
 
 /// Launch an SSH agent on an already-bound Unix-domain socket listener.
@@ -417,17 +416,19 @@ pub async fn run(
 /// # Errors
 ///
 /// Will return `Err` if the ssh agent raises an error while listening for connections.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_with_listener(
     listener: UnixListener,
-    piv: Option<PivOptions>,
-    openpgp: Option<OpenPgpOptions>,
-    pinentry_binary: Option<String>,
-    connection_mode: ConnectionMode,
-    idle_timeout: Option<Duration>,
-    exit_on_idle: bool,
-    pin_cache: PinCacheStrategy,
+    options: KeyroostAgentOptions,
 ) -> Result<(), std::io::Error> {
+    let KeyroostAgentOptions {
+        piv,
+        openpgp,
+        pinentry_binary,
+        connection_mode,
+        idle_timeout,
+        exit_on_idle,
+        pin_cache,
+    } = options;
     let (pin_cache, external_pin_cache) = match pin_cache {
         PinCacheStrategy::None => (None, false),
         PinCacheStrategy::Memory { ttl, max_ttl } => {
@@ -473,7 +474,10 @@ pub async fn run_with_listener(
             idle_tracker,
             timeout,
             move || {
-                debug!(?timeout, "idle timeout elapsed; disconnecting persistent session");
+                debug!(
+                    ?timeout,
+                    "idle timeout elapsed; disconnecting persistent session"
+                );
                 disconnect_agent.disconnect();
             },
         )));
@@ -494,7 +498,7 @@ fn format_credential(credential: &PublicCredential) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortOnDrop, ConnectionMode, IdleTracker, KeyroostAgent, PinCacheStrategy,
+        AbortOnDrop, ConnectionMode, IdleTracker, KeyroostAgent, KeyroostAgentOptions,
         format_credential, openpgp, parse_duration, pinentry, piv, run_idle_disconnect_loop,
         run_with_idle_exit, run_with_listener,
     };
@@ -695,13 +699,12 @@ mod tests {
         let start = Instant::now();
         let result = run_with_listener(
             listener,
-            None,
-            None,
-            None,
-            ConnectionMode::Persistent,
-            Some(Duration::from_millis(80)),
-            true,
-            PinCacheStrategy::None,
+            KeyroostAgentOptions {
+                connection_mode: ConnectionMode::Persistent,
+                idle_timeout: Some(Duration::from_millis(80)),
+                exit_on_idle: true,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -717,7 +720,11 @@ mod tests {
     #[tokio::test]
     async fn remove_all_identities_clears_pin_cache() {
         let cache = PinCache::new(Duration::from_secs(60), None);
-        cache.insert(Applet::Piv, Some(1), SecretBox::from(Box::<str>::from("123456")));
+        cache.insert(
+            Applet::Piv,
+            Some(1),
+            SecretBox::from(Box::<str>::from("123456")),
+        );
         cache.insert(
             Applet::OpenPgp,
             Some(2),
@@ -740,7 +747,11 @@ mod tests {
     #[tokio::test]
     async fn lock_clears_pin_cache() {
         let cache = PinCache::new(Duration::from_secs(60), None);
-        cache.insert(Applet::Piv, Some(1), SecretBox::from(Box::<str>::from("123456")));
+        cache.insert(
+            Applet::Piv,
+            Some(1),
+            SecretBox::from(Box::<str>::from("123456")),
+        );
 
         let mut agent = KeyroostAgent {
             piv: None,

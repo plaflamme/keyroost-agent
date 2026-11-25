@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use keyroost_agent::{ConnectionMode, OpenPgpOptions, PinCacheStrategy, PivOptions, PivSlot};
+use keyroost_agent::{
+    ConnectionMode, KeyroostAgentOptions, OpenPgpOptions, PinCacheStrategy, PivOptions, PivSlot,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum AppletSelection {
@@ -351,32 +353,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let piv_config = resolved.use_piv.then_some(piv_options);
-    let openpgp_config = resolved.use_openpgp.then_some(openpgp_options);
-    let idle_timeout = (!opts.idle_timeout.is_zero()).then_some(opts.idle_timeout);
+    let agent_options = KeyroostAgentOptions {
+        piv: resolved.use_piv.then_some(piv_options),
+        openpgp: resolved.use_openpgp.then_some(openpgp_options),
+        pinentry_binary: opts.pinentry,
+        connection_mode: resolved.connection_mode,
+        idle_timeout: (!opts.idle_timeout.is_zero()).then_some(opts.idle_timeout),
+        exit_on_idle: false,
+        pin_cache: pin_cache_strategy,
+    };
 
     if let Some(socket) = opts.socket {
-        keyroost_agent::run(
-            &socket,
-            piv_config,
-            openpgp_config,
-            opts.pinentry,
-            resolved.connection_mode,
-            idle_timeout,
-            false,
-            pin_cache_strategy,
-        )
-        .await?;
+        keyroost_agent::run(&socket, agent_options).await?;
     } else if let Some(listener) = systemd_listener()? {
         keyroost_agent::run_with_listener(
             listener,
-            piv_config,
-            openpgp_config,
-            opts.pinentry,
-            resolved.connection_mode,
-            idle_timeout,
-            true,
-            pin_cache_strategy,
+            KeyroostAgentOptions {
+                exit_on_idle: true,
+                ..agent_options
+            },
         )
         .await?;
     } else {
