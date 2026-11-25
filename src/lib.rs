@@ -193,16 +193,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 ///
 /// Returns an error if communicating with the PIV applet fails.
 pub fn probe_piv_identities(options: &PivOptions) -> Result<bool, std::io::Error> {
-    let agent = piv::PivSshAgent::new(
-        options.reader.clone(),
-        options.slots.clone(),
-        pinentry::SystemPinentry::default(),
-        ConnectionMode::Ephemeral,
-        None,
-    );
-    agent
-        .request_identities()
-        .map(|identities| !identities.is_empty())
+    piv::PivSshAgent::probe_identities(&options.reader, options.slots.clone())
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
@@ -263,9 +254,10 @@ async fn wait_for_idle_exit(tracker: &IdleTracker, timeout: Duration) {
     }
 }
 
-async fn run_idle_disconnect_loop<F>(tracker: IdleTracker, timeout: Duration, mut on_idle: F)
+async fn run_idle_disconnect_loop<F, Fut>(tracker: IdleTracker, timeout: Duration, mut on_idle: F)
 where
-    F: FnMut(),
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
 {
     loop {
         tracker.wait_for_activity().await;
@@ -275,7 +267,7 @@ where
                 biased;
                 () = tracker.wait_for_activity() => {}
                 () = tokio::time::sleep(timeout) => {
-                    on_idle();
+                    on_idle().await;
                     break;
                 }
             }
@@ -283,7 +275,7 @@ where
     }
 }
 
-async fn run_with_idle_exit<Fut, F>(
+async fn run_with_idle_exit<Fut, F, IdleFut>(
     server: Fut,
     tracker: &IdleTracker,
     timeout: Duration,
@@ -291,16 +283,17 @@ async fn run_with_idle_exit<Fut, F>(
 ) -> Result<(), std::io::Error>
 where
     Fut: Future<Output = Result<(), std::io::Error>>,
-    F: FnOnce(),
+    F: FnOnce() -> IdleFut,
+    IdleFut: Future<Output = ()>,
 {
     tokio::select! {
         result = server => {
-            on_idle();
+            on_idle().await;
             result
         }
         () = wait_for_idle_exit(tracker, timeout) => {
             info!(?timeout, "idle timeout elapsed; disconnecting and exiting");
-            on_idle();
+            on_idle().await;
             Ok(())
         }
     }
@@ -316,9 +309,9 @@ struct KeyroostAgent {
 }
 
 impl KeyroostAgent {
-    fn disconnect(&self) {
+    async fn disconnect(&self) {
         if let Some(piv) = &self.piv {
-            piv.disconnect();
+            piv.disconnect().await;
         }
         if let Some(openpgp) = &self.openpgp {
             openpgp.disconnect();
@@ -335,7 +328,7 @@ impl KeyroostAgent {
         self.identity_cache.clear();
     }
 
-    fn sign_piv(
+    async fn sign_piv(
         &self,
         credential: &PublicCredential,
         cached: Option<identity_cache::PivCachedIdentity>,
@@ -345,7 +338,7 @@ impl KeyroostAgent {
         let Some(piv) = &self.piv else {
             return Ok(None);
         };
-        let result = piv.sign(credential, cached, data, rsa_sig_hash)?;
+        let result = piv.sign(credential, cached, data, rsa_sig_hash).await?;
         if let Some(discovered) = result.discovered {
             self.identity_cache.replace_piv(discovered);
         }
@@ -377,7 +370,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         self.idle_tracker.record_activity();
         let mut identities = Vec::new();
         if let Some(piv) = &self.piv {
-            let discovered = piv.request_identities_with_metadata()?;
+            let discovered = piv.request_identities_with_metadata().await?;
             self.identity_cache.replace_piv(
                 discovered
                     .iter()
@@ -422,7 +415,8 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
                         Some(piv_cached),
                         &request.data,
                         rsa_sig_hash,
-                    )?
+                    )
+                    .await?
                 }
                 identity_cache::CachedIdentity::OpenPgp(pgp_cached) => {
                     skip_openpgp = true;
@@ -450,8 +444,9 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         }
 
         if !skip_piv
-            && let Some(outcome) =
-                self.sign_piv(&request.credential, None, &request.data, rsa_sig_hash)?
+            && let Some(outcome) = self
+                .sign_piv(&request.credential, None, &request.data, rsa_sig_hash)
+                .await?
         {
             match outcome {
                 identity_cache::SignOutcome::Signed(signature) => {
@@ -489,7 +484,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
         debug!("remove_all_identities");
-        self.disconnect();
+        self.disconnect().await;
         self.clear_pin_cache();
         self.clear_identity_cache();
         Ok(())
@@ -497,7 +492,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
 
     async fn lock(&mut self, _key: String) -> Result<(), AgentError> {
         debug!("lock");
-        self.disconnect();
+        self.disconnect().await;
         self.clear_pin_cache();
         self.clear_identity_cache();
         Ok(())
@@ -578,7 +573,11 @@ pub async fn run_with_listener(
             let server = async {
                 map_listen_result(ssh_agent_lib::agent::listen(listener, agent.clone()).await)
             };
-            return run_with_idle_exit(server, &idle_tracker, timeout, || agent.disconnect()).await;
+            let disconnect_agent = agent.clone();
+            return run_with_idle_exit(server, &idle_tracker, timeout, move || async move {
+                disconnect_agent.disconnect().await;
+            })
+            .await;
         }
 
         let disconnect_agent = agent.clone();
@@ -586,16 +585,19 @@ pub async fn run_with_listener(
             idle_tracker,
             timeout,
             move || {
-                debug!(
-                    ?timeout,
-                    "idle timeout elapsed; disconnecting persistent session"
-                );
-                disconnect_agent.disconnect();
+                let disconnect_agent = disconnect_agent.clone();
+                async move {
+                    debug!(
+                        ?timeout,
+                        "idle timeout elapsed; disconnecting persistent session"
+                    );
+                    disconnect_agent.disconnect().await;
+                }
             },
         )));
 
         let result = map_listen_result(ssh_agent_lib::agent::listen(listener, agent.clone()).await);
-        agent.disconnect();
+        agent.disconnect().await;
         return result;
     }
 
@@ -726,7 +728,10 @@ mod tests {
             tracker.clone(),
             Duration::from_millis(60),
             move || {
-                disconnects_clone.fetch_add(1, Ordering::SeqCst);
+                let disconnects_clone = Arc::clone(&disconnects_clone);
+                async move {
+                    disconnects_clone.fetch_add(1, Ordering::SeqCst);
+                }
             },
         )));
 
@@ -772,7 +777,7 @@ mod tests {
             std::future::pending::<Result<(), std::io::Error>>(),
             &tracker,
             Duration::from_millis(70),
-            move || {
+            move || async move {
                 disconnects_clone.fetch_add(1, Ordering::SeqCst);
             },
         )

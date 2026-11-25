@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex, mpsc};
 
+use tokio::sync::oneshot;
+
 use keyroost_piv::{
     KeyAlg, PinPolicy, PublicKey, Slot,
     x509::{SigHash, X509Error},
@@ -53,10 +55,10 @@ enum PivResponse {
 enum WorkerMessage<Req, Res, E> {
     Request {
         request: Req,
-        reply: mpsc::Sender<Result<Res, E>>,
+        reply: oneshot::Sender<Result<Res, E>>,
     },
     Disconnect {
-        reply: mpsc::Sender<()>,
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -81,7 +83,7 @@ impl<Req, Res, E> PersistentWorker<Req, Res, E> {
         }
     }
 
-    fn send_request(
+    async fn send_request(
         &self,
         request: Req,
         spawn_worker: impl FnOnce(mpsc::Receiver<WorkerMessage<Req, Res, E>>),
@@ -101,7 +103,7 @@ impl<Req, Res, E> PersistentWorker<Req, Res, E> {
                 .clone()
         };
 
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         if tx
             .send(WorkerMessage::Request {
                 request,
@@ -117,11 +119,11 @@ impl<Req, Res, E> PersistentWorker<Req, Res, E> {
         }
 
         reply_rx
-            .recv()
+            .await
             .map_err(|_| on_worker_gone("PIV worker thread dropped reply"))?
     }
 
-    fn disconnect(&self) {
+    async fn disconnect(&self) {
         let tx = {
             let guard = self
                 .sender
@@ -132,22 +134,22 @@ impl<Req, Res, E> PersistentWorker<Req, Res, E> {
         let Some(tx) = tx else {
             return;
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         if tx.send(WorkerMessage::Disconnect { reply: reply_tx }).is_ok() {
-            let _ = reply_rx.recv();
+            let _ = reply_rx.await;
         }
     }
 }
 
 enum TransactionExit {
-    Disconnect(mpsc::Sender<()>),
+    Disconnect(oneshot::Sender<()>),
     Closed,
     TransportError,
 }
 
 fn serve_in_transaction<Req, Res, E>(
     first_req: Req,
-    first_reply: mpsc::Sender<Result<Res, E>>,
+    first_reply: oneshot::Sender<Result<Res, E>>,
     rx: &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
     mut handle: impl FnMut(Req) -> Result<Res, E>,
     is_fatal: impl Fn(&E) -> bool,
@@ -175,7 +177,7 @@ fn serve_in_transaction<Req, Res, E>(
 fn run_worker<Req, Res, E>(
     rx: &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
     mut open_and_serve: impl FnMut(
-        &mut Option<(Req, mpsc::Sender<Result<Res, E>>)>,
+        &mut Option<(Req, oneshot::Sender<Result<Res, E>>)>,
         &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
     ) -> Result<TransactionExit, E>,
 ) {
@@ -361,18 +363,27 @@ impl PivSshAgent {
         }
     }
 
-    pub(super) fn disconnect(&self) {
+    pub(super) async fn disconnect(&self) {
         if let PivBackend::Persistent(worker) = &self.backend {
-            worker.disconnect();
+            worker.disconnect().await;
         }
     }
 
-    pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
-        self.request_identities_with_metadata()
-            .map(|items| items.into_iter().map(|(identity, _)| identity).collect())
+    pub(super) fn probe_identities(
+        reader: &str,
+        slots: Option<Vec<Slot>>,
+    ) -> Result<bool, crate::Error> {
+        let slots = match slots {
+            Some(slots) => dedup_slots(slots),
+            None => default_slots(),
+        };
+        PivSession::with_transaction(reader, |session| {
+            let serial = session.status().ok().and_then(|status| status.serial);
+            list_ssh_identities(&slots, session, serial).map(|ids| !ids.is_empty())
+        })
     }
 
-    pub(super) fn request_identities_with_metadata(
+    pub(super) async fn request_identities_with_metadata(
         &self,
     ) -> Result<Vec<(Identity, PivCachedIdentity)>, crate::Error> {
         match &self.backend {
@@ -391,7 +402,9 @@ impl PivSshAgent {
                     connection_mode = ?ConnectionMode::Persistent,
                     "requesting PIV identities"
                 );
-                let response = self.send_persistent(worker, PivRequest::ListIdentities)?;
+                let response = self
+                    .send_persistent(worker, PivRequest::ListIdentities)
+                    .await?;
                 match response {
                     PivResponse::Identities(identities) => Ok(identities),
                     PivResponse::Signature(_) => {
@@ -402,25 +415,29 @@ impl PivSshAgent {
         }
     }
 
-    pub(super) fn sign(
+    pub(super) async fn sign(
         &self,
         public_credential: &PublicCredential,
         cached: Option<PivCachedIdentity>,
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<SignResult<PivCachedIdentity>, crate::Error> {
-        match self.sign_once(public_credential, cached, data, rsa_sig_hash) {
+        match self
+            .sign_once(public_credential, cached, data, rsa_sig_hash)
+            .await
+        {
             Err(err) if cached.is_some() && err.is_transport_error() => {
                 tracing::debug!(
                     "cached PIV sign hit transport error, retrying with fresh scan: {err}"
                 );
                 self.sign_once(public_credential, None, data, rsa_sig_hash)
+                    .await
             }
             other => other,
         }
     }
 
-    fn sign_once(
+    async fn sign_once(
         &self,
         public_credential: &PublicCredential,
         cached: Option<PivCachedIdentity>,
@@ -445,15 +462,17 @@ impl PivSshAgent {
                 })
             }
             PivBackend::Persistent(worker) => {
-                let response = self.send_persistent(
-                    worker,
-                    PivRequest::Sign {
-                        credential: Box::new(public_credential.clone()),
-                        cached,
-                        data: data.to_vec(),
-                        rsa_sig_hash,
-                    },
-                )?;
+                let response = self
+                    .send_persistent(
+                        worker,
+                        PivRequest::Sign {
+                            credential: Box::new(public_credential.clone()),
+                            cached,
+                            data: data.to_vec(),
+                            rsa_sig_hash,
+                        },
+                    )
+                    .await?;
                 match response {
                     PivResponse::Signature(result) => Ok(result),
                     PivResponse::Identities(_) => {
@@ -464,7 +483,7 @@ impl PivSshAgent {
         }
     }
 
-    fn send_persistent(
+    async fn send_persistent(
         &self,
         worker: &PersistentWorker<PivRequest, PivResponse, crate::Error>,
         request: PivRequest,
@@ -472,61 +491,63 @@ impl PivSshAgent {
         let reader = self.reader.clone();
         let config = self.config.clone();
         let session_state = Arc::clone(&self.session_state);
-        worker.send_request(
-            request,
-            move |rx| {
-                std::thread::spawn(move || {
-                    run_worker(&rx, |pending, rx| {
-                        let exit = with_piv_transaction(&reader, &session_state, |session| {
-                            // Read serial ONCE when the persistent session opens: on Token2 cards,
-                            // `status()` performs a cross-applet OTP read which resets PIV PIN state.
-                            let mut serial =
-                                session.status().ok().and_then(|status| status.serial);
-                            let (first_req, first_reply) = pending
-                                .take()
-                                .expect("pending request present when entering transaction");
-                            Ok(serve_in_transaction(
-                                first_req,
-                                first_reply,
-                                rx,
-                                |req| match req {
-                                    PivRequest::ListIdentities => {
-                                        list_ssh_identities(&config.slots, session, serial)
-                                            .map(PivResponse::Identities)
-                                    }
-                                    PivRequest::Sign {
-                                        credential,
-                                        cached,
-                                        data,
-                                        rsa_sig_hash,
-                                    } => sign_in_session(
-                                        &config.slots,
-                                        session,
-                                        &mut serial,
-                                        &credential,
-                                        cached,
-                                        &data,
-                                        rsa_sig_hash,
-                                        &config.pinentry,
-                                        config.pin_cache.as_ref(),
-                                    )
-                                    .map(PivResponse::Signature),
-                                },
-                                crate::Error::is_transport_error,
-                            ))
-                        })?;
-                        if matches!(exit, TransactionExit::TransportError) {
-                            *session_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                PivSessionState::default();
-                        }
-                        Ok(exit)
+        worker
+            .send_request(
+                request,
+                move |rx| {
+                    std::thread::spawn(move || {
+                        run_worker(&rx, |pending, rx| {
+                            let exit = with_piv_transaction(&reader, &session_state, |session| {
+                                // Read serial ONCE when the persistent session opens: on Token2 cards,
+                                // `status()` performs a cross-applet OTP read which resets PIV PIN state.
+                                let mut serial =
+                                    session.status().ok().and_then(|status| status.serial);
+                                let (first_req, first_reply) = pending
+                                    .take()
+                                    .expect("pending request present when entering transaction");
+                                Ok(serve_in_transaction(
+                                    first_req,
+                                    first_reply,
+                                    rx,
+                                    |req| match req {
+                                        PivRequest::ListIdentities => {
+                                            list_ssh_identities(&config.slots, session, serial)
+                                                .map(PivResponse::Identities)
+                                        }
+                                        PivRequest::Sign {
+                                            credential,
+                                            cached,
+                                            data,
+                                            rsa_sig_hash,
+                                        } => sign_in_session(
+                                            &config.slots,
+                                            session,
+                                            &mut serial,
+                                            &credential,
+                                            cached,
+                                            &data,
+                                            rsa_sig_hash,
+                                            &config.pinentry,
+                                            config.pin_cache.as_ref(),
+                                        )
+                                        .map(PivResponse::Signature),
+                                    },
+                                    crate::Error::is_transport_error,
+                                ))
+                            })?;
+                            if matches!(exit, TransactionExit::TransportError) {
+                                *session_state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    PivSessionState::default();
+                            }
+                            Ok(exit)
+                        });
                     });
-                });
-            },
-            |msg| crate::Error::Other(msg.into()),
-        )
+                },
+                |msg| crate::Error::Other(msg.into()),
+            )
+            .await
     }
 }
 
@@ -1729,55 +1750,57 @@ mod tests {
         }
     }
 
-    fn send_mock(
+    async fn send_mock(
         worker: &super::PersistentWorker<MockReq, usize, MockErr>,
         counters: &std::sync::Arc<MockCounters>,
         req: MockReq,
     ) -> Result<usize, MockErr> {
         let counters = std::sync::Arc::clone(counters);
-        worker.send_request(
-            req,
-            move |rx| {
-                std::thread::spawn(move || {
-                    super::run_worker(&rx, |pending, rx| {
-                        if counters
-                            .fail_next_open
-                            .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
-                            return Err(MockErr::Transport);
-                        }
-                        let session_id = counters
-                            .opens
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            + 1;
-                        counters
-                            .active
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let _guard = ActiveGuard(std::sync::Arc::clone(&counters));
-                        counters
-                            .status_reads
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let (first_req, first_reply) = pending.take().unwrap();
-                        Ok(super::serve_in_transaction(
-                            first_req,
-                            first_reply,
-                            rx,
-                            |req| match req {
-                                MockReq::Ping => Ok(session_id),
-                                MockReq::AppErr => Err(MockErr::App),
-                                MockReq::TransportErr => Err(MockErr::Transport),
-                            },
-                            MockErr::is_transport,
-                        ))
+        worker
+            .send_request(
+                req,
+                move |rx| {
+                    std::thread::spawn(move || {
+                        super::run_worker(&rx, |pending, rx| {
+                            if counters
+                                .fail_next_open
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                return Err(MockErr::Transport);
+                            }
+                            let session_id = counters
+                                .opens
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1;
+                            counters
+                                .active
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let _guard = ActiveGuard(std::sync::Arc::clone(&counters));
+                            counters
+                                .status_reads
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let (first_req, first_reply) = pending.take().unwrap();
+                            Ok(super::serve_in_transaction(
+                                first_req,
+                                first_reply,
+                                rx,
+                                |req| match req {
+                                    MockReq::Ping => Ok(session_id),
+                                    MockReq::AppErr => Err(MockErr::App),
+                                    MockReq::TransportErr => Err(MockErr::Transport),
+                                },
+                                MockErr::is_transport,
+                            ))
+                        });
                     });
-                });
-            },
-            MockErr::WorkerGone,
-        )
+                },
+                MockErr::WorkerGone,
+            )
+            .await
     }
 
-    #[test]
-    fn persistent_worker_lazily_opens_and_reuses_transaction_reading_status_once() {
+    #[tokio::test]
+    async fn persistent_worker_lazily_opens_and_reuses_transaction_reading_status_once() {
         let counters = MockCounters::new();
         let worker = super::PersistentWorker::new();
 
@@ -1789,8 +1812,8 @@ mod tests {
             0
         );
 
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             counters
@@ -1801,31 +1824,31 @@ mod tests {
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn persistent_worker_keeps_session_on_non_transport_error() {
+    #[tokio::test]
+    async fn persistent_worker_keeps_session_on_non_transport_error() {
         let counters = MockCounters::new();
         let worker = super::PersistentWorker::new();
 
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(
-            send_mock(&worker, &counters, MockReq::AppErr),
+            send_mock(&worker, &counters, MockReq::AppErr).await,
             Err(MockErr::App)
         );
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn persistent_worker_drops_and_reopens_session_on_transport_error() {
+    #[tokio::test]
+    async fn persistent_worker_drops_and_reopens_session_on_transport_error() {
         let counters = MockCounters::new();
         let worker = super::PersistentWorker::new();
 
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(
-            send_mock(&worker, &counters, MockReq::TransportErr),
+            send_mock(&worker, &counters, MockReq::TransportErr).await,
             Err(MockErr::Transport)
         );
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(2));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(2));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             counters
@@ -1835,44 +1858,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persistent_worker_disconnect_drops_session_synchronously_and_reopens_next() {
+    #[tokio::test]
+    async fn persistent_worker_disconnect_drops_session_synchronously_and_reopens_next() {
         let counters = MockCounters::new();
         let worker = super::PersistentWorker::new();
 
         // Disconnect before any request is a no-op and does not open a session.
-        worker.disconnect();
+        worker.disconnect().await;
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        worker.disconnect();
+        worker.disconnect().await;
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // Next request lazily opens a new transaction.
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(2));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(2));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn persistent_worker_clone_shares_active_transaction() {
+    #[tokio::test]
+    async fn persistent_worker_clone_shares_active_transaction() {
         let counters = MockCounters::new();
         let worker1 = super::PersistentWorker::new();
         let worker2 = worker1.clone();
 
-        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping), Ok(1));
-        assert_eq!(send_mock(&worker2, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping).await, Ok(1));
+        assert_eq!(send_mock(&worker2, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        worker2.disconnect();
+        worker2.disconnect().await;
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping), Ok(2));
+        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping).await, Ok(2));
     }
 
-    #[test]
-    fn persistent_worker_propagates_open_failure_and_retries_next_request() {
+    #[tokio::test]
+    async fn persistent_worker_propagates_open_failure_and_retries_next_request() {
         let counters = MockCounters::new();
         counters
             .fail_next_open
@@ -1880,12 +1903,12 @@ mod tests {
         let worker = super::PersistentWorker::new();
 
         assert_eq!(
-            send_mock(&worker, &counters, MockReq::Ping),
+            send_mock(&worker, &counters, MockReq::Ping).await,
             Err(MockErr::Transport)
         );
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
