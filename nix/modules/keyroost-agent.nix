@@ -145,6 +145,22 @@ in
         '';
       };
     };
+
+    logLevel = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "error"
+        "warn"
+        "info"
+        "debug"
+        "trace"
+      ];
+      default = "error";
+      description = ''
+        Verbosity level for `keyroost-agent` logging, mapped to
+        {option}`-q` / {option}`-v` flags.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -185,28 +201,40 @@ in
           RefuseManualStart = true;
         };
         Service = {
-          ExecStart = lib.concatStringsSep " " (
-            [ "${cfg.package}/bin/keyroost-agent" ]
-            ++ lib.optional (cfg.reader != null) "--reader=${lib.escapeShellArg cfg.reader}"
-            ++ lib.optional (cfg.applets != "auto") "--applet=${cfg.applets}"
-            ++ lib.optionals (cfg.pivSlots != null) (
-              map (slot: "--piv-slot=${lib.escapeShellArg slot}") cfg.pivSlots
-            )
-            ++ lib.optional (cfg.connection != "auto") "--connection=${cfg.connection}"
-            ++ lib.optional (
-              cfg.idleTimeout != null
-            ) "--idle-timeout=${lib.escapeShellArg cfg.idleTimeout}"
-            ++ lib.optional (
-              cfg.pinentry.package != null
-            ) "--pinentry=${lib.getExe' cfg.pinentry.package cfg.pinentry.program}"
-            ++ lib.optional (cfg.pinCache.mode != "none") "--pin-cache=${cfg.pinCache.mode}"
-            ++ lib.optional (
-              cfg.pinCache.ttl != null
-            ) "--pin-cache-ttl=${lib.escapeShellArg cfg.pinCache.ttl}"
-            ++ lib.optional (
-              cfg.pinCache.maxTtl != null
-            ) "--pin-cache-max-ttl=${lib.escapeShellArg cfg.pinCache.maxTtl}"
-          );
+          ExecStart =
+            let
+              verbosityFlag = {
+                off = "-q";
+                error = null;
+                warn = "-v";
+                info = "-vv";
+                debug = "-vvv";
+                trace = "-vvvv";
+              }.${cfg.logLevel};
+            in
+            lib.concatStringsSep " " (
+              [ "${cfg.package}/bin/keyroost-agent" ]
+              ++ lib.optional (verbosityFlag != null) verbosityFlag
+              ++ lib.optional (cfg.reader != null) "--reader=${lib.escapeShellArg cfg.reader}"
+              ++ lib.optional (cfg.applets != "auto") "--applet=${cfg.applets}"
+              ++ lib.optionals (cfg.pivSlots != null) (
+                map (slot: "--piv-slot=${lib.escapeShellArg slot}") cfg.pivSlots
+              )
+              ++ lib.optional (cfg.connection != "auto") "--connection=${cfg.connection}"
+              ++ lib.optional (
+                cfg.idleTimeout != null
+              ) "--idle-timeout=${lib.escapeShellArg cfg.idleTimeout}"
+              ++ lib.optional (
+                cfg.pinentry.package != null
+              ) "--pinentry=${lib.getExe' cfg.pinentry.package cfg.pinentry.program}"
+              ++ lib.optional (cfg.pinCache.mode != "none") "--pin-cache=${cfg.pinCache.mode}"
+              ++ lib.optional (
+                cfg.pinCache.ttl != null
+              ) "--pin-cache-ttl=${lib.escapeShellArg cfg.pinCache.ttl}"
+              ++ lib.optional (
+                cfg.pinCache.maxTtl != null
+              ) "--pin-cache-max-ttl=${lib.escapeShellArg cfg.pinCache.maxTtl}"
+            );
         };
       };
     };
