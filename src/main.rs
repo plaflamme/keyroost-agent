@@ -1,5 +1,6 @@
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use keyroost_agent::ConnectionMode;
@@ -146,6 +147,15 @@ struct Cli {
     /// Smart-card connection mode
     #[arg(long, value_enum, default_value_t = ConnectionSelection::Auto)]
     connection: ConnectionSelection,
+
+    /// Idle timeout after which persistent smart-card sessions are released (0 disables; e.g. 30s, 30m, 1h)
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "30m",
+        value_parser = keyroost_agent::parse_duration
+    )]
+    idle_timeout: Duration,
 }
 
 fn systemd_listener() -> Result<Option<tokio::net::UnixListener>, Box<dyn std::error::Error>> {
@@ -237,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let piv_reader = resolved.use_piv.then(|| reader.reader_name.clone());
     let openpgp_reader = resolved.use_openpgp.then(|| reader.reader_name.clone());
+    let idle_timeout = (!opts.idle_timeout.is_zero()).then_some(opts.idle_timeout);
 
     if let Some(socket) = opts.socket {
         keyroost_agent::run(
@@ -245,6 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             openpgp_reader,
             opts.pinentry,
             resolved.connection_mode,
+            idle_timeout,
+            false,
         )
         .await?;
     } else if let Some(listener) = systemd_listener()? {
@@ -254,6 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             openpgp_reader,
             opts.pinentry,
             resolved.connection_mode,
+            idle_timeout,
+            true,
         )
         .await?;
     } else {
@@ -268,12 +283,38 @@ mod tests {
     use super::{AppletSelection, Cli, ConnectionSelection, ResolvedConfig, resolve_config};
     use clap::Parser;
     use keyroost_agent::ConnectionMode;
+    use std::time::Duration;
 
     #[test]
     fn cli_defaults_applet_and_connection_to_auto() {
         let cli = Cli::try_parse_from(["keyroost-agent"]).unwrap();
         assert_eq!(cli.applet, AppletSelection::Auto);
         assert_eq!(cli.connection, ConnectionSelection::Auto);
+        assert_eq!(cli.idle_timeout, Duration::from_mins(30));
+    }
+
+    #[test]
+    fn cli_parses_idle_timeout_options() {
+        let default_cli = Cli::try_parse_from(["keyroost-agent"]).unwrap();
+        assert_eq!(default_cli.idle_timeout, Duration::from_mins(30));
+
+        let five_min = Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "5m"]).unwrap();
+        assert_eq!(five_min.idle_timeout, Duration::from_secs(300));
+
+        let disabled = Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "0"]).unwrap();
+        assert!(disabled.idle_timeout.is_zero());
+        assert_eq!(
+            (!disabled.idle_timeout.is_zero()).then_some(disabled.idle_timeout),
+            None
+        );
+
+        let bare_secs = Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "45"]).unwrap();
+        assert_eq!(bare_secs.idle_timeout, Duration::from_secs(45));
+
+        let one_hour = Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "1h"]).unwrap();
+        assert_eq!(one_hour.idle_timeout, Duration::from_secs(3600));
+
+        assert!(Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "bogus"]).is_err());
     }
 
     #[test]
