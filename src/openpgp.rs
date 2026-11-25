@@ -13,7 +13,10 @@ use ssh_agent_lib::{
     },
 };
 
-use crate::pinentry::{Applet, Pinentry, SystemPinentry};
+use crate::{
+    ConnectionMode,
+    pinentry::{Applet, Pinentry, SystemPinentry},
+};
 
 const OPENPGP_SLOTS: [KeyCrt; 2] = [KeyCrt::Auth, KeyCrt::Sign];
 
@@ -43,14 +46,24 @@ impl From<OpenPgpIdentity> for Identity {
 pub(super) struct OpenPgpSshAgent {
     reader: String,
     pinentry: SystemPinentry,
+    connection_mode: ConnectionMode,
 }
 
 impl OpenPgpSshAgent {
-    pub(super) fn new(reader: String, pinentry: SystemPinentry) -> Self {
-        Self { reader, pinentry }
+    pub(super) fn new(
+        reader: String,
+        pinentry: SystemPinentry,
+        connection_mode: ConnectionMode,
+    ) -> Self {
+        Self {
+            reader,
+            pinentry,
+            connection_mode,
+        }
     }
 
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
+        tracing::debug!(connection_mode = ?self.connection_mode, "requesting OpenPGP identities");
         let mut session = OpenPgpSession::open(&self.reader)?;
         let status = session.status()?;
         let identities = list_identities(&mut session, &status);

@@ -15,6 +15,50 @@ mod piv;
 
 pub(crate) use crate::error::Error;
 
+/// Strategy for managing PC/SC connections to a smart-card applet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionMode {
+    /// Keep a persistent connection open to a single applet so on-card PIN verification persists.
+    Persistent,
+    /// Open a fresh connection per operation.
+    #[default]
+    Ephemeral,
+}
+
+/// Check whether the PIV applet on `reader` has at least one usable SSH identity.
+///
+/// # Errors
+///
+/// Returns an error if communicating with the PIV applet fails.
+pub fn probe_piv_identities(reader: &str) -> Result<bool, std::io::Error> {
+    let agent = piv::PivSshAgent::new(
+        reader.to_owned(),
+        pinentry::SystemPinentry::default(),
+        ConnectionMode::Ephemeral,
+    );
+    agent
+        .request_identities()
+        .map(|identities| !identities.is_empty())
+        .map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+/// Check whether the `OpenPGP` applet on `reader` has at least one usable SSH identity.
+///
+/// # Errors
+///
+/// Returns an error if communicating with the `OpenPGP` applet fails.
+pub fn probe_openpgp_identities(reader: &str) -> Result<bool, std::io::Error> {
+    let agent = openpgp::OpenPgpSshAgent::new(
+        reader.to_owned(),
+        pinentry::SystemPinentry::default(),
+        ConnectionMode::Ephemeral,
+    );
+    agent
+        .request_identities()
+        .map(|identities| !identities.is_empty())
+        .map_err(|err| std::io::Error::other(err.to_string()))
+}
+
 #[derive(Clone)]
 struct KeyroostAgent {
     piv: Option<piv::PivSshAgent>,
@@ -74,9 +118,17 @@ pub async fn run(
     piv_reader: Option<String>,
     openpgp_reader: Option<String>,
     pinentry_binary: Option<String>,
+    connection_mode: ConnectionMode,
 ) -> Result<(), std::io::Error> {
     let listener = UnixListener::bind(socket_path)?;
-    run_with_listener(listener, piv_reader, openpgp_reader, pinentry_binary).await
+    run_with_listener(
+        listener,
+        piv_reader,
+        openpgp_reader,
+        pinentry_binary,
+        connection_mode,
+    )
+    .await
 }
 
 /// Launch an SSH agent on an already-bound Unix-domain socket listener.
@@ -89,13 +141,16 @@ pub async fn run_with_listener(
     piv_reader: Option<String>,
     openpgp_reader: Option<String>,
     pinentry_binary: Option<String>,
+    connection_mode: ConnectionMode,
 ) -> Result<(), std::io::Error> {
     let pinentry = pinentry::SystemPinentry::new(pinentry_binary);
     let result = ssh_agent_lib::agent::listen(
         listener,
         KeyroostAgent {
-            piv: piv_reader.map(|reader| piv::PivSshAgent::new(reader, pinentry.clone())),
-            openpgp: openpgp_reader.map(|reader| openpgp::OpenPgpSshAgent::new(reader, pinentry)),
+            piv: piv_reader
+                .map(|reader| piv::PivSshAgent::new(reader, pinentry.clone(), connection_mode)),
+            openpgp: openpgp_reader
+                .map(|reader| openpgp::OpenPgpSshAgent::new(reader, pinentry, connection_mode)),
         },
     )
     .await;

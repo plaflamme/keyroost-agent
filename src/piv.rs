@@ -14,7 +14,10 @@ use ssh_agent_lib::{
     },
 };
 
-use crate::pinentry::{Applet, Pinentry, SystemPinentry};
+use crate::{
+    ConnectionMode,
+    pinentry::{Applet, Pinentry, SystemPinentry},
+};
 
 struct PivIdentity {
     slot: Slot,
@@ -33,11 +36,16 @@ pub(super) struct PivSshAgent {
     reader: String,
     slots: Vec<Slot>,
     pinentry: SystemPinentry,
+    connection_mode: ConnectionMode,
 }
 
 impl PivSshAgent {
     // TODO: manually select slots
-    pub(super) fn new(reader: String, pinentry: SystemPinentry) -> Self {
+    pub(super) fn new(
+        reader: String,
+        pinentry: SystemPinentry,
+        connection_mode: ConnectionMode,
+    ) -> Self {
         // default signature-related slots
         let sign_slots: &[Slot] = &[
             Slot::Authentication,
@@ -49,10 +57,12 @@ impl PivSshAgent {
             reader,
             pinentry,
             slots: Vec::from_iter([sign_slots, &Slot::retired_all()].concat()),
+            connection_mode,
         }
     }
 
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
+        tracing::debug!(connection_mode = ?self.connection_mode, "requesting PIV identities");
         PivSession::with_transaction(&self.reader, |session| {
             let identities = self.list_identities(session);
             Ok(identities
