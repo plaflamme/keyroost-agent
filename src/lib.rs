@@ -35,6 +35,7 @@ pub fn probe_piv_identities(reader: &str) -> Result<bool, std::io::Error> {
         reader.to_owned(),
         pinentry::SystemPinentry::default(),
         ConnectionMode::Ephemeral,
+        None,
     );
     agent
         .request_identities()
@@ -52,6 +53,7 @@ pub fn probe_openpgp_identities(reader: &str) -> Result<bool, std::io::Error> {
         reader.to_owned(),
         pinentry::SystemPinentry::default(),
         ConnectionMode::Ephemeral,
+        None,
     );
     agent
         .request_identities()
@@ -147,10 +149,12 @@ pub async fn run_with_listener(
     let result = ssh_agent_lib::agent::listen(
         listener,
         KeyroostAgent {
-            piv: piv_reader
-                .map(|reader| piv::PivSshAgent::new(reader, pinentry.clone(), connection_mode)),
-            openpgp: openpgp_reader
-                .map(|reader| openpgp::OpenPgpSshAgent::new(reader, pinentry, connection_mode)),
+            piv: piv_reader.map(|reader| {
+                piv::PivSshAgent::new(reader, pinentry.clone(), connection_mode, None)
+            }),
+            openpgp: openpgp_reader.map(|reader| {
+                openpgp::OpenPgpSshAgent::new(reader, pinentry, connection_mode, None)
+            }),
         },
     )
     .await;

@@ -4,9 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use keyroost_transport::TransportError;
 use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
 
-use crate::pinentry::Applet;
+use crate::pinentry::{Applet, Pinentry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PinCacheKey {
@@ -41,13 +42,12 @@ impl PinCacheInner {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct PinCache {
     inner: Arc<Mutex<PinCacheInner>>,
 }
 
-#[allow(dead_code)]
 impl PinCache {
+    #[allow(dead_code)]
     pub(crate) fn new(ttl: Duration, max_ttl: Option<Duration>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(PinCacheInner {
@@ -75,9 +75,19 @@ impl PinCache {
         inner.entries.remove(&PinCacheKey { applet, serial });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expires_at(&self, applet: Applet, serial: Option<u128>) -> Option<Instant> {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner
+            .entries
+            .get(&PinCacheKey { applet, serial })
+            .map(|entry| entry.expires_at)
     }
 
     fn get_at(&self, applet: Applet, serial: Option<u128>, now: Instant) -> Option<SecretBox<str>> {
@@ -134,6 +144,49 @@ impl PinCache {
             },
         );
     }
+}
+
+pub(crate) fn verify_pin_with_cache(
+    applet: Applet,
+    serial: Option<u128>,
+    allow_cache: bool,
+    pin_cache: Option<&PinCache>,
+    pinentry: &impl Pinentry,
+    mut verify: impl FnMut(&[u8]) -> Result<(), TransportError>,
+    is_wrong_pin: impl Fn(&TransportError) -> bool,
+) -> Result<bool, crate::Error> {
+    if allow_cache
+        && let Some(cache) = pin_cache
+        && let Some(cached_pin) = cache.get(applet, serial)
+    {
+        match verify(cached_pin.expose_secret().as_bytes()) {
+            Ok(()) => {
+                cache.touch(applet, serial);
+                return Ok(true);
+            }
+            Err(err) if is_wrong_pin(&err) => {
+                tracing::debug!(
+                    %applet,
+                    ?serial,
+                    "cached PIN rejected by card, evicting and re-prompting"
+                );
+                cache.evict(applet, serial);
+            }
+            Err(err) => {
+                cache.evict(applet, serial);
+                return Err(err.into());
+            }
+        }
+    }
+
+    let Some(fresh_pin) = pinentry.prompt_pin(applet, serial)? else {
+        return Ok(false);
+    };
+    verify(fresh_pin.expose_secret().as_bytes())?;
+    if allow_cache && let Some(cache) = pin_cache {
+        cache.insert(applet, serial, fresh_pin);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

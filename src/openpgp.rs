@@ -5,7 +5,6 @@ use keyroost_transport::{OpenPgpSession, OpenPgpStatus, TransportError};
 use sha2::Digest;
 use ssh_agent_lib::{
     proto::{Identity, PublicCredential},
-    secrecy::ExposeSecret,
     ssh_key::{
         Algorithm, HashAlg, Mpint, Signature,
         public::{EcdsaPublicKey, Ed25519PublicKey, KeyData, RsaPublicKey},
@@ -15,6 +14,7 @@ use ssh_agent_lib::{
 
 use crate::{
     ConnectionMode,
+    pin_cache::{PinCache, verify_pin_with_cache},
     pinentry::{Applet, Pinentry, SystemPinentry},
 };
 
@@ -47,6 +47,7 @@ pub(super) struct OpenPgpSshAgent {
     reader: String,
     pinentry: SystemPinentry,
     connection_mode: ConnectionMode,
+    pin_cache: Option<PinCache>,
 }
 
 impl OpenPgpSshAgent {
@@ -54,11 +55,13 @@ impl OpenPgpSshAgent {
         reader: String,
         pinentry: SystemPinentry,
         connection_mode: ConnectionMode,
+        pin_cache: Option<PinCache>,
     ) -> Self {
         Self {
             reader,
             pinentry,
             connection_mode,
+            pin_cache,
         }
     }
 
@@ -99,6 +102,7 @@ impl OpenPgpSshAgent {
             &prepared,
             status.full_serial(),
             &self.pinentry,
+            self.pin_cache.as_ref(),
         )?
         else {
             return Ok(None);
@@ -357,12 +361,26 @@ fn attempt_sign(
     }
 }
 
+fn is_openpgp_wrong_pin(err: &TransportError) -> bool {
+    matches!(
+        err,
+        TransportError::OpenPgpPinRejected {
+            tries_remaining: Some(1..),
+        } | TransportError::Apdu {
+            sw1: 0x63,
+            sw2: 0xC1..=0xCF,
+            ..
+        }
+    )
+}
+
 fn sign_with_pin(
     signer: &mut impl OpenPgpSigner,
     slot: KeyCrt,
     prepared: &[u8],
     serial: Option<u128>,
     pinentry: &impl Pinentry,
+    pin_cache: Option<&PinCache>,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     let pw_ref = match slot {
         KeyCrt::Sign => PW1_SIGN,
@@ -381,10 +399,17 @@ fn sign_with_pin(
             sw2: 0x82,
             ..
         }) => {
-            let Some(pin) = pinentry.prompt_pin(Applet::OpenPgp, serial)? else {
+            if !verify_pin_with_cache(
+                Applet::OpenPgp,
+                serial,
+                true,
+                pin_cache,
+                pinentry,
+                |pin| signer.verify_pin(pw_ref, pin),
+                is_openpgp_wrong_pin,
+            )? {
                 return Ok(None);
-            };
-            signer.verify_pin(pw_ref, pin.expose_secret().as_bytes())?;
+            }
             Ok(Some(attempt_sign(signer, slot, prepared)?))
         }
         Err(err) => Err(err.into()),
@@ -396,7 +421,10 @@ mod tests {
     use super::{
         OpenPgpSigner, encode_signature, prepare_sign_input, sign_with_pin, ssh_public_credentials,
     };
-    use crate::pinentry::{Applet, Pinentry};
+    use crate::{
+        pin_cache::PinCache,
+        pinentry::{Applet, Pinentry},
+    };
     use keyroost_openpgp::{
         AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey, RsaAttributes,
         RsaImportFormat,
@@ -404,10 +432,14 @@ mod tests {
     use keyroost_transport::TransportError;
     use ssh_agent_lib::{
         proto::PublicCredential,
-        secrecy::SecretBox,
+        secrecy::{ExposeSecret, SecretBox},
         ssh_key::{Algorithm, HashAlg},
     };
-    use std::cell::Cell;
+    use std::{cell::Cell, time::Duration};
+
+    fn secret(pin: &str) -> SecretBox<str> {
+        SecretBox::from(Box::<str>::from(pin))
+    }
 
     struct MockPinentry {
         pin: Option<&'static str>,
@@ -440,13 +472,17 @@ mod tests {
         }
     }
 
+    type VerifyHandler = fn(&[u8]) -> Result<(), TransportError>;
+
     struct MockSigner {
         verified: bool,
         verified_refs: Vec<u8>,
+        verified_pins: Vec<Vec<u8>>,
         signs: usize,
         authenticates: usize,
         result: Vec<u8>,
         error: Option<fn() -> TransportError>,
+        verify_handler: VerifyHandler,
     }
 
     impl MockSigner {
@@ -454,18 +490,29 @@ mod tests {
             Self {
                 verified,
                 verified_refs: Vec::new(),
+                verified_pins: Vec::new(),
                 signs: 0,
                 authenticates: 0,
                 result,
                 error: None,
+                verify_handler: |pin| {
+                    if pin == b"123456" {
+                        Ok(())
+                    } else {
+                        Err(TransportError::OpenPgpPinRejected {
+                            tries_remaining: Some(2),
+                        })
+                    }
+                },
             }
         }
     }
 
     impl OpenPgpSigner for MockSigner {
         fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
-            assert_eq!(pin, b"123456");
             self.verified_refs.push(pw_ref);
+            self.verified_pins.push(pin.to_vec());
+            (self.verify_handler)(pin)?;
             self.verified = true;
             Ok(())
         }
@@ -505,8 +552,15 @@ mod tests {
     fn already_verified_card_signs_without_prompting() {
         let mut signer = MockSigner::new(true, vec![1, 2, 3]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(&mut signer, KeyCrt::Sign, b"digest", Some(1234), &pinentry)
-            .unwrap();
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Sign,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(res, Some(vec![1, 2, 3]));
         assert_eq!(pinentry.prompts(), 0);
@@ -522,6 +576,7 @@ mod tests {
             b"digest",
             Some(1234),
             &auth_pinentry,
+            None,
         )
         .unwrap();
 
@@ -536,8 +591,15 @@ mod tests {
     fn sign_slot_verifies_pw1_sign_and_retries_pso_sign() {
         let mut signer = MockSigner::new(false, vec![1, 2, 3]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(&mut signer, KeyCrt::Sign, b"digest", Some(1234), &pinentry)
-            .unwrap();
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Sign,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(res, Some(vec![1, 2, 3]));
         assert_eq!(pinentry.prompts(), 1);
@@ -550,8 +612,15 @@ mod tests {
     fn auth_slot_verifies_pw1_other_and_retries_internal_authenticate() {
         let mut signer = MockSigner::new(false, vec![4, 5, 6]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
-            .unwrap();
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(res, Some(vec![4, 5, 6]));
         assert_eq!(pinentry.prompts(), 1);
@@ -564,8 +633,15 @@ mod tests {
     fn cancelled_pin_returns_none_without_verifying() {
         let mut signer = MockSigner::new(false, vec![7, 8, 9]);
         let pinentry = MockPinentry::new(None);
-        let res = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
-            .unwrap();
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(res, None);
         assert_eq!(pinentry.prompts(), 1);
@@ -584,14 +660,232 @@ mod tests {
         });
         let pinentry = MockPinentry::new(Some("123456"));
 
-        let err = sign_with_pin(&mut signer, KeyCrt::Auth, b"digest", Some(1234), &pinentry)
-            .unwrap_err();
+        let err = sign_with_pin(
+            &mut signer,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, crate::Error::Other(_)));
         assert_eq!(pinentry.prompts(), 0);
         assert_eq!(signer.verified_refs, [] as [u8; 0]);
         assert_eq!(signer.signs, 0);
         assert_eq!(signer.authenticates, 1);
+    }
+
+    #[test]
+    fn cache_miss_inserts_pin_and_second_sign_hits_cache_and_refreshes_ttl() {
+        let cache = PinCache::new(Duration::from_secs(60), None);
+        let pinentry = MockPinentry::new(Some("123456"));
+
+        let mut signer1 = MockSigner::new(false, vec![1, 2, 3]);
+        let res1 = sign_with_pin(
+            &mut signer1,
+            KeyCrt::Sign,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(res1, Some(vec![1, 2, 3]));
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(signer1.verified_refs, vec![PW1_SIGN]);
+        assert_eq!(
+            cache
+                .get(Applet::OpenPgp, Some(1234))
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("123456")
+        );
+        let expires_before = cache.expires_at(Applet::OpenPgp, Some(1234)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(2));
+
+        // Second sign on Auth slot reuses the same cached PW1 PIN with 0 prompts.
+        let mut signer2 = MockSigner::new(false, vec![4, 5, 6]);
+        let res2 = sign_with_pin(
+            &mut signer2,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(res2, Some(vec![4, 5, 6]));
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(signer2.verified_refs, vec![PW1_OTHER]);
+        assert_eq!(signer2.verified_pins, vec![b"123456".to_vec()]);
+        let expires_after = cache.expires_at(Applet::OpenPgp, Some(1234)).unwrap();
+        assert!(expires_after > expires_before);
+    }
+
+    #[test]
+    fn fresh_prompt_verify_failure_does_not_cache_wrong_pin() {
+        let cache = PinCache::new(Duration::from_secs(60), None);
+        let pinentry = MockPinentry::new(Some("000000"));
+        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+
+        let err = sign_with_pin(
+            &mut signer,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            Some(&cache),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Other(_)));
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
+        assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
+    }
+
+    #[test]
+    fn wrong_cached_pin_evicts_reprompts_and_caches_new_pin() {
+        let wrong_pin_handlers: [VerifyHandler; 2] = [
+            |pin| {
+                if pin == b"123456" {
+                    Ok(())
+                } else {
+                    Err(TransportError::OpenPgpPinRejected {
+                        tries_remaining: Some(2),
+                    })
+                }
+            },
+            |pin| {
+                if pin == b"123456" {
+                    Ok(())
+                } else {
+                    Err(TransportError::Apdu {
+                        label: "openpgp verify",
+                        sw1: 0x63,
+                        sw2: 0xC2,
+                    })
+                }
+            },
+        ];
+
+        for handler in wrong_pin_handlers {
+            let cache = PinCache::new(Duration::from_secs(60), None);
+            cache.insert(Applet::OpenPgp, Some(1234), secret("stale1"));
+
+            let pinentry = MockPinentry::new(Some("123456"));
+            let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+            signer.verify_handler = handler;
+
+            let res = sign_with_pin(
+                &mut signer,
+                KeyCrt::Auth,
+                b"digest",
+                Some(1234),
+                &pinentry,
+                Some(&cache),
+            )
+            .unwrap();
+
+            assert_eq!(res, Some(vec![9, 8, 7]));
+            assert_eq!(pinentry.prompts(), 1);
+            assert_eq!(signer.verified_refs, vec![PW1_OTHER, PW1_OTHER]);
+            assert_eq!(
+                signer.verified_pins,
+                vec![b"stale1".to_vec(), b"123456".to_vec()]
+            );
+            assert_eq!(
+                cache
+                    .get(Applet::OpenPgp, Some(1234))
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret),
+                Some("123456")
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_cached_pin_with_cancelled_reprompt_evicts_and_returns_none() {
+        let cache = PinCache::new(Duration::from_secs(60), None);
+        cache.insert(Applet::OpenPgp, Some(1234), secret("stale1"));
+
+        let pinentry = MockPinentry::new(None);
+        let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Sign,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(res, None);
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(signer.verified_refs, vec![PW1_SIGN]);
+        assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
+    }
+
+    #[test]
+    fn non_wrong_pin_error_on_cache_hit_evicts_without_reprompting() {
+        let fatal_handlers: [VerifyHandler; 5] = [
+            |_| {
+                Err(TransportError::OpenPgpPinRejected {
+                    tries_remaining: Some(0),
+                })
+            },
+            |_| {
+                Err(TransportError::OpenPgpPinRejected {
+                    tries_remaining: None,
+                })
+            },
+            |_| {
+                Err(TransportError::Apdu {
+                    label: "openpgp verify",
+                    sw1: 0x69,
+                    sw2: 0x83,
+                })
+            },
+            |_| {
+                Err(TransportError::Apdu {
+                    label: "openpgp verify",
+                    sw1: 0x63,
+                    sw2: 0xC0,
+                })
+            },
+            |_| Err(TransportError::NoOpenPgpApplet),
+        ];
+
+        for handler in fatal_handlers {
+            let cache = PinCache::new(Duration::from_secs(60), None);
+            cache.insert(Applet::OpenPgp, Some(1234), secret("123456"));
+
+            let pinentry = MockPinentry::new(Some("123456"));
+            let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+            signer.verify_handler = handler;
+
+            let err = sign_with_pin(
+                &mut signer,
+                KeyCrt::Auth,
+                b"digest",
+                Some(1234),
+                &pinentry,
+                Some(&cache),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, crate::Error::Other(_)));
+            assert_eq!(pinentry.prompts(), 0);
+            assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
+            assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
+        }
     }
 
     #[test]
