@@ -69,8 +69,32 @@
         }@inputs:
         let
           keyroostctl = keyroost.packages.${system}.keyroostctl;
+          eval = pkgs.lib.evalModules {
+            specialArgs = { inherit pkgs; };
+            modules = [
+              keyroostAgentModule
+              { _module.check = false; }
+            ];
+          };
+          optionsDoc = pkgs.nixosOptionsDoc { options = eval.options; };
           craneLib = config.rust-project.crane-lib;
           src = config.rust-project.src;
+          rustdoc = craneLib.cargoDoc (
+            config.rust-project.crates.keyroost-agent.crane.args
+            // {
+              inherit src;
+              pname = "keyroost-agent-rustdoc";
+              cargoArtifacts = craneLib.buildDepsOnly (
+                config.rust-project.crates.keyroost-agent.crane.args
+                // {
+                  inherit src;
+                  pname = "keyroost-agent-rustdoc-deps";
+                }
+              );
+              cargoDocExtraArgs = "--workspace --no-deps";
+              RUSTDOCFLAGS = "-Z unstable-options --enable-index-page";
+            }
+          );
         in
         {
           rust-project = {
@@ -89,6 +113,9 @@
 
           packages = {
             default = config.packages.keyroost-agent;
+            docs = pkgs.callPackage ./nix/docs.nix {
+              inherit optionsDoc rustdoc;
+            };
             keyroost-agent-debug = craneLib.buildPackage (
               config.rust-project.crates.keyroost-agent.crane.args
               // {
