@@ -87,14 +87,14 @@ let
     "openpgp"
   ];
 
-  mkCheck = suite: test: {
-    name = "e2e-${suite}-${test}";
+  mkCheck = name: path: {
+    inherit name;
     value = pkgs.testers.runNixOSTest {
 
-      name = "e2e-${suite}-${test}";
+      inherit name;
 
       imports = [
-        (./. + "/${suite}/${test}.nix")
+        path
       ];
 
       sshBackdoor.enable = true;
@@ -168,9 +168,16 @@ pkgs.lib.optionalAttrs (system == "x86_64-linux") (
   builtins.listToAttrs (
     pkgs.lib.concatMap (
       suite:
-      map (name: mkCheck suite (pkgs.lib.strings.removeSuffix ".nix" name)) (
-        builtins.attrNames (builtins.readDir (./. + "/${suite}"))
-      )
+      map (
+        name:
+        let
+          test = pkgs.lib.strings.removeSuffix ".nix" name;
+        in
+        mkCheck "e2e-${suite}-${test}" (./. + "/${suite}/${name}")
+      ) (builtins.attrNames (builtins.readDir (./. + "/${suite}")))
     ) suites
+    ++ [
+      (mkCheck "e2e-pin-cache" ./pin-cache.nix)
+    ]
   )
 )
