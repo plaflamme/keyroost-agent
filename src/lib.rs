@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info};
 
 mod error;
+mod identity_cache;
 mod openpgp;
 mod pin_cache;
 mod pinentry;
@@ -311,6 +312,7 @@ struct KeyroostAgent {
     openpgp: Option<openpgp::OpenPgpSshAgent>,
     idle_tracker: IdleTracker,
     pin_cache: Option<pin_cache::PinCache>,
+    identity_cache: identity_cache::IdentityCache,
 }
 
 impl KeyroostAgent {
@@ -328,6 +330,44 @@ impl KeyroostAgent {
             pin_cache.clear();
         }
     }
+
+    fn clear_identity_cache(&self) {
+        self.identity_cache.clear();
+    }
+
+    fn sign_piv(
+        &self,
+        credential: &PublicCredential,
+        cached: Option<identity_cache::PivCachedIdentity>,
+        data: &[u8],
+        rsa_sig_hash: Option<HashAlg>,
+    ) -> Result<Option<identity_cache::SignOutcome>, AgentError> {
+        let Some(piv) = &self.piv else {
+            return Ok(None);
+        };
+        let result = piv.sign(credential, cached, data, rsa_sig_hash)?;
+        if let Some(discovered) = result.discovered {
+            self.identity_cache.replace_piv(discovered);
+        }
+        Ok(Some(result.outcome))
+    }
+
+    fn sign_openpgp(
+        &self,
+        credential: &PublicCredential,
+        cached: Option<identity_cache::OpenPgpCachedIdentity>,
+        data: &[u8],
+        rsa_sig_hash: Option<HashAlg>,
+    ) -> Result<Option<identity_cache::SignOutcome>, AgentError> {
+        let Some(openpgp) = &self.openpgp else {
+            return Ok(None);
+        };
+        let result = openpgp.sign(credential, cached, data, rsa_sig_hash)?;
+        if let Some(discovered) = result.discovered {
+            self.identity_cache.replace_openpgp(discovered);
+        }
+        Ok(Some(result.outcome))
+    }
 }
 
 #[ssh_agent_lib::async_trait]
@@ -335,13 +375,24 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         debug!("request_identities");
         self.idle_tracker.record_activity();
-        // TODO: cache identities so we can directly look them up later by public key
         let mut identities = Vec::new();
         if let Some(piv) = &self.piv {
-            identities.extend(piv.request_identities()?);
+            let discovered = piv.request_identities_with_metadata()?;
+            self.identity_cache.replace_piv(
+                discovered
+                    .iter()
+                    .map(|(id, meta)| (id.credential.clone(), *meta)),
+            );
+            identities.extend(discovered.into_iter().map(|(id, _)| id));
         }
         if let Some(openpgp) = &self.openpgp {
-            identities.extend(openpgp.request_identities()?);
+            let discovered = openpgp.request_identities_with_metadata()?;
+            self.identity_cache.replace_openpgp(
+                discovered
+                    .iter()
+                    .map(|(id, meta)| (id.credential.clone(), *meta)),
+            );
+            identities.extend(discovered.into_iter().map(|(id, _)| id));
         }
         self.idle_tracker.record_activity();
         Ok(identities)
@@ -359,19 +410,77 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
             None
         };
 
-        if let Some(piv) = &self.piv
-            && let Some(signature) = piv.sign(&request.credential, &request.data, rsa_sig_hash)?
-        {
-            self.idle_tracker.record_activity();
-            return Ok(signature);
+        let mut skip_piv = false;
+        let mut skip_openpgp = false;
+
+        if let Some(cached) = self.identity_cache.get(&request.credential) {
+            let outcome = match cached {
+                identity_cache::CachedIdentity::Piv(piv_cached) => {
+                    skip_piv = true;
+                    self.sign_piv(
+                        &request.credential,
+                        Some(piv_cached),
+                        &request.data,
+                        rsa_sig_hash,
+                    )?
+                }
+                identity_cache::CachedIdentity::OpenPgp(pgp_cached) => {
+                    skip_openpgp = true;
+                    self.sign_openpgp(
+                        &request.credential,
+                        Some(pgp_cached),
+                        &request.data,
+                        rsa_sig_hash,
+                    )?
+                }
+            };
+
+            match outcome {
+                Some(identity_cache::SignOutcome::Signed(signature)) => {
+                    self.idle_tracker.record_activity();
+                    return Ok(signature);
+                }
+                Some(identity_cache::SignOutcome::UserCancelled) => {
+                    self.idle_tracker.record_activity();
+                    return Err(AgentError::Failure);
+                }
+                Some(identity_cache::SignOutcome::NotFound) => {}
+                None => self.identity_cache.evict(&request.credential),
+            }
         }
 
-        if let Some(openpgp) = &self.openpgp
-            && let Some(signature) =
-                openpgp.sign(&request.credential, &request.data, rsa_sig_hash)?
+        if !skip_piv
+            && let Some(outcome) =
+                self.sign_piv(&request.credential, None, &request.data, rsa_sig_hash)?
         {
-            self.idle_tracker.record_activity();
-            return Ok(signature);
+            match outcome {
+                identity_cache::SignOutcome::Signed(signature) => {
+                    self.idle_tracker.record_activity();
+                    return Ok(signature);
+                }
+                identity_cache::SignOutcome::UserCancelled => {
+                    self.idle_tracker.record_activity();
+                    return Err(AgentError::Failure);
+                }
+                identity_cache::SignOutcome::NotFound => {}
+            }
+        }
+
+        if !skip_openpgp
+            && let Some(outcome) =
+                self.sign_openpgp(&request.credential, None, &request.data, rsa_sig_hash)?
+        {
+            match outcome {
+                identity_cache::SignOutcome::Signed(signature) => {
+                    self.idle_tracker.record_activity();
+                    return Ok(signature);
+                }
+                identity_cache::SignOutcome::UserCancelled => {
+                    self.idle_tracker.record_activity();
+                    return Err(AgentError::Failure);
+                }
+                identity_cache::SignOutcome::NotFound => {}
+            }
         }
 
         self.idle_tracker.record_activity();
@@ -382,6 +491,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         debug!("remove_all_identities");
         self.disconnect();
         self.clear_pin_cache();
+        self.clear_identity_cache();
         Ok(())
     }
 
@@ -389,6 +499,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         debug!("lock");
         self.disconnect();
         self.clear_pin_cache();
+        self.clear_identity_cache();
         Ok(())
     }
 }
@@ -453,6 +564,7 @@ pub async fn run_with_listener(
         }),
         idle_tracker: idle_tracker.clone(),
         pin_cache,
+        identity_cache: identity_cache::IdentityCache::new(),
     };
 
     let active_timeout = if connection_mode == ConnectionMode::Persistent {
@@ -502,7 +614,11 @@ mod tests {
         format_credential, openpgp, parse_duration, pinentry, piv, run_idle_disconnect_loop,
         run_with_idle_exit, run_with_listener,
     };
-    use crate::{pin_cache::PinCache, pinentry::Applet};
+    use crate::{
+        identity_cache::{CachedIdentity, IdentityCache, PivCachedIdentity},
+        pin_cache::PinCache,
+        pinentry::Applet,
+    };
     use ssh_agent_lib::{
         agent::Session,
         proto::PublicCredential,
@@ -593,6 +709,7 @@ mod tests {
             )),
             idle_tracker: IdleTracker::new(),
             pin_cache: None,
+            identity_cache: IdentityCache::new(),
         };
 
         agent.remove_all_identities().await.unwrap();
@@ -731,17 +848,40 @@ mod tests {
             SecretBox::from(Box::<str>::from("654321")),
         );
 
+        let identity_cache = IdentityCache::new();
+        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x42; 32])));
+        identity_cache.replace_piv([(
+            cred.clone(),
+            PivCachedIdentity {
+                slot: keyroost_piv::Slot::Authentication,
+                key_alg: keyroost_piv::KeyAlg::Ed25519,
+                serial: Some(1),
+            },
+        )]);
+
         let mut agent = KeyroostAgent {
             piv: None,
             openpgp: None,
             idle_tracker: IdleTracker::new(),
             pin_cache: Some(cache.clone()),
+            identity_cache: identity_cache.clone(),
         };
+        let cloned_agent = agent.clone();
+        assert_eq!(
+            cloned_agent.identity_cache.get(&cred),
+            Some(CachedIdentity::Piv(PivCachedIdentity {
+                slot: keyroost_piv::Slot::Authentication,
+                key_alg: keyroost_piv::KeyAlg::Ed25519,
+                serial: Some(1),
+            }))
+        );
 
         agent.remove_all_identities().await.unwrap();
 
         assert!(cache.get(Applet::Piv, Some(1)).is_none());
         assert!(cache.get(Applet::OpenPgp, Some(2)).is_none());
+        assert!(identity_cache.get(&cred).is_none());
+        assert!(cloned_agent.identity_cache.get(&cred).is_none());
     }
 
     #[tokio::test]
@@ -752,16 +892,28 @@ mod tests {
             Some(1),
             SecretBox::from(Box::<str>::from("123456")),
         );
+        let identity_cache = IdentityCache::new();
+        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x24; 32])));
+        identity_cache.replace_piv([(
+            cred.clone(),
+            PivCachedIdentity {
+                slot: keyroost_piv::Slot::Signature,
+                key_alg: keyroost_piv::KeyAlg::Ed25519,
+                serial: Some(1),
+            },
+        )]);
 
         let mut agent = KeyroostAgent {
             piv: None,
             openpgp: None,
             idle_tracker: IdleTracker::new(),
             pin_cache: Some(cache.clone()),
+            identity_cache: identity_cache.clone(),
         };
 
         agent.lock("passphrase".to_owned()).await.unwrap();
 
         assert!(cache.get(Applet::Piv, Some(1)).is_none());
+        assert!(identity_cache.get(&cred).is_none());
     }
 }
