@@ -9,6 +9,7 @@ use tracing::debug;
 
 mod error;
 mod openpgp;
+mod pin_cache;
 mod pinentry;
 mod piv;
 

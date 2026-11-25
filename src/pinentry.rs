@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ssh_agent_lib::secrecy::SecretBox;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Applet {
     Piv,
     OpenPgp,
