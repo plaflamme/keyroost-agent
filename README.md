@@ -71,26 +71,40 @@ By default (`--applet=auto`, `--connection=auto`), `keyroost-agent` probes the c
 - **Single applet has identities**: Activates only that applet and selects a `persistent` connection, relying on native on-card PIN verification state with zero PINs held in RAM.
 - **Both applets have identities**: Activates both applets and selects `ephemeral` connections so each operation can select the required applet cleanly.
 
-### Connection Modes & Idle Timeout
+### Connection Modes
 
-- **`persistent`**: Keeps the PC/SC card session open so on-card PIN verification persists across signing operations (PIV `Once`/`Default` slots; OpenPGP `PW1_OTHER` / `PW1_SIGN`, unless Force Signature PIN is enabled on the card). Cannot be used when both applets are active. While connected, other PC/SC tools (`gpg`, `ykman`, `keyroostctl`) cannot access the card.
-- **`ephemeral`**: Opens and releases a card session for each operation, allowing concurrent card sharing with other tools and dual-applet operation.
-- **Idle timeout (`--idle-timeout` / `idleTimeout`, default `30m`, `0` disables)**: Applies in `persistent` mode. When running under systemd socket activation, the agent exits cleanly on idle and systemd restarts it on the next request. When running standalone (`--socket`), it disconnects the card session in-place while continuing to listen on the socket.
-- **Manual reset**: Running `ssh-add -D` or locking the agent immediately disconnects any persistent card session and clears all cached PINs.
+`keyroost-agent` supports two PC/SC connection modes (`--connection` / `services.keyroost-agent.connection`):
+
+- **`persistent`**: Holds a single PC/SC session open across requests so the smart card itself retains PIN verification state.
+- **`ephemeral`**: Opens and closes a fresh PC/SC session for each operation, immediately releasing the card between requests.
+
+#### Persistent
+
+- **On-card PIN caching**: Keeps the card unlocked across signing operations without storing the PIN in agent RAM (PIV `Once`/`Default` slots; OpenPGP `PW1_OTHER` and `PW1_SIGN`, unless Force Signature PIN is enabled on the card).
+- **Single-applet only**: Cannot be used when both PIV and OpenPGP applets are active, because switching applets resets on-card PIN verification.
+- **Exclusive card access**: While a persistent session is open, other PC/SC tools (`gpg`, `ykman`, `keyroostctl`) cannot access the card.
+- **Idle timeout (`--idle-timeout` / `idleTimeout`, default `30m`, `0` disables)**: Automatically releases the persistent session after inactivity. Under systemd socket activation, the agent exits cleanly on idle and systemd restarts it on the next request. When running standalone (`--socket`), it disconnects the card session in-place while continuing to listen on the socket.
+- **Manual release**: Running `ssh-add -D` or locking the agent immediately disconnects the persistent session (and clears any cached PINs).
+
+#### Ephemeral
+
+- **Card sharing**: Releases the card after every operation so other tools (`gpg`, `ykman`, `keyroostctl`) can use it without stopping the agent.
+- **Dual-applet support**: Required when exposing both PIV and OpenPGP identities from the same card.
+- **PIN caching**: Because each operation starts a fresh PC/SC session, the card's internal PIN verification state is reset between calls, requiring the PIN each time, see [PIN Caching](#pin-caching-strategies) to mitigate this.
 
 ### PIN Caching Strategies
 
 | Mode | Where PIN is stored | Trade-offs | Best use case |
 | --- | --- | --- | --- |
 | `none` (default) | Nowhere (card state only) | Requires a PIN prompt on every new session in `ephemeral` mode | Single-applet `persistent` mode, or maximum security |
-| `memory` | Process RAM (`SecretBox`) | Cleared on exit/idle/lock; does not survive agent restarts | `ephemeral` mode (dual-applet or card sharing) without OS keyring |
-| `pinentry` | External OS keyring via `pinentry` | Persists across restarts; governed by keyring lock/timeout policy | Desktop environments using GNOME Keyring, KWallet, or Keychain |
+| `memory` | Process RAM (using [secrecy](https://crates.io/crates/secrecy)) | Cleared on exit/idle/lock; does not survive agent restarts | `ephemeral` mode (dual-applet or card sharing) without OS keyring |
+| `pinentry` | External OS keyring via `pinentry` | Persists across restarts; less secure than `memory` (stored on disk and accessible to desktop session processes via the keyring) | Desktop environments using GNOME Keyring, KWallet, or Keychain |
 
 Security and runtime behavior:
 
 - PIN caching is opt-in; `none` is always the default.
 - **`memory`**: Uses a sliding TTL (`--pin-cache-ttl`, default `10m`) and an optional absolute lifetime cap (`--pin-cache-max-ttl`, `0` disables the cap). PINs are stored only in zeroized `SecretBox` memory. On Linux, `PR_SET_DUMPABLE=0` is enabled to block core dumps and non-root `ptrace` attachment. A wrong or changed PIN is evicted immediately and triggers a single re-prompt.
-- **`pinentry`**: Sends `OPTION allow-external-password-cache` and `SETKEYINFO keyroost-agent-<applet>-<serial>` to `pinentry`. On an incorrect PIN, it retries once with `SETERROR Incorrect PIN` while bypassing the external cache.
+- **`pinentry`**: Sends `OPTION allow-external-password-cache` and `SETKEYINFO keyroost-agent-<applet>-<serial>` to `pinentry`. On an incorrect PIN, it retries once with `SETERROR Incorrect PIN` while bypassing the external cache. Note that this is generally considered **less secure** than in-process `memory` caching: the OS keyring persists the PIN to disk (encrypted with your login password) and usually allows any process in your desktop session to query stored secrets over D-Bus/IPC.
 - **PIV `PinPolicy::Always`**: Slots configured with `Always` always prompt via `pinentry` and never read from or write to in-memory or external caches.
 
 ### Common Configurations
