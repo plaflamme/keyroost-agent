@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use keyroost_openpgp::{
     self as pgp, AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey,
 };
@@ -42,11 +44,75 @@ impl From<OpenPgpIdentity> for Identity {
     }
 }
 
+struct PersistentOpenPgp<S = OpenPgpSession, St = OpenPgpStatus> {
+    session: S,
+    status: St,
+}
+
+struct PersistentSlot<S = OpenPgpSession, St = OpenPgpStatus> {
+    state: Arc<Mutex<Option<PersistentOpenPgp<S, St>>>>,
+}
+
+impl<S, St> Clone for PersistentSlot<S, St> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<S, St> PersistentSlot<S, St> {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn with_session<T, E>(
+        &self,
+        open: impl FnOnce() -> Result<(S, St), E>,
+        is_fatal: impl Fn(&E) -> bool,
+        f: impl FnOnce(&mut S, &St) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            let (session, status) = open()?;
+            *guard = Some(PersistentOpenPgp { session, status });
+        }
+        let persistent = guard.as_mut().expect("persistent session initialized above");
+        let result = f(&mut persistent.session, &persistent.status);
+        if result.as_ref().err().is_some_and(is_fatal) {
+            tracing::debug!("dropping persistent OpenPGP session after transport error");
+            *guard = None;
+        }
+        result
+    }
+
+    fn disconnect(&self) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.take().is_some() {
+            tracing::debug!("disconnected persistent OpenPGP session");
+        }
+    }
+}
+
+#[derive(Clone)]
+enum OpenPgpBackend {
+    Ephemeral,
+    Persistent(PersistentSlot),
+}
+
 #[derive(Clone)]
 pub(super) struct OpenPgpSshAgent {
     reader: String,
     pinentry: SystemPinentry,
-    connection_mode: ConnectionMode,
+    backend: OpenPgpBackend,
     pin_cache: Option<PinCache>,
 }
 
@@ -57,24 +123,63 @@ impl OpenPgpSshAgent {
         connection_mode: ConnectionMode,
         pin_cache: Option<PinCache>,
     ) -> Self {
+        let backend = match connection_mode {
+            ConnectionMode::Ephemeral => OpenPgpBackend::Ephemeral,
+            ConnectionMode::Persistent => OpenPgpBackend::Persistent(PersistentSlot::new()),
+        };
+
         Self {
             reader,
             pinentry,
-            connection_mode,
+            backend,
             pin_cache,
         }
     }
 
+    pub(super) fn disconnect(&self) {
+        if let OpenPgpBackend::Persistent(slot) = &self.backend {
+            slot.disconnect();
+        }
+    }
+
+    fn with_session<T>(
+        &self,
+        f: impl FnOnce(&mut OpenPgpSession, &OpenPgpStatus) -> Result<T, crate::Error>,
+    ) -> Result<T, crate::Error> {
+        match &self.backend {
+            OpenPgpBackend::Ephemeral => {
+                let mut session = OpenPgpSession::open(&self.reader)?;
+                let status = session.status()?;
+                f(&mut session, &status)
+            }
+            OpenPgpBackend::Persistent(slot) => slot.with_session(
+                || {
+                    let mut session = OpenPgpSession::open(&self.reader)?;
+                    // Read status ONCE when the persistent session opens: on Token2 cards,
+                    // `status()` performs a cross-applet OTP read which resets OpenPGP PIN state.
+                    let status = session.status()?;
+                    Ok((session, status))
+                },
+                crate::Error::is_transport_error,
+                f,
+            ),
+        }
+    }
+
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
-        tracing::debug!(connection_mode = ?self.connection_mode, "requesting OpenPGP identities");
-        let mut session = OpenPgpSession::open(&self.reader)?;
-        let status = session.status()?;
-        let identities = list_identities(&mut session, &status);
-        Ok(identities
-            .into_iter()
-            .inspect(|id| tracing::info!("found usable OpenPGP identity on slot {:?}", id.slot))
-            .map(Into::into)
-            .collect())
+        let mode = match self.backend {
+            OpenPgpBackend::Ephemeral => ConnectionMode::Ephemeral,
+            OpenPgpBackend::Persistent(_) => ConnectionMode::Persistent,
+        };
+        tracing::debug!(connection_mode = ?mode, "requesting OpenPGP identities");
+        self.with_session(|session, status| {
+            let identities = list_identities(session, status)?;
+            Ok(identities
+                .into_iter()
+                .inspect(|id| tracing::info!("found usable OpenPGP identity on slot {:?}", id.slot))
+                .map(Into::into)
+                .collect())
+        })
     }
 
     pub(super) fn sign(
@@ -83,48 +188,51 @@ impl OpenPgpSshAgent {
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<Option<Signature>, crate::Error> {
-        let mut session = OpenPgpSession::open(&self.reader)?;
-        let status = session.status()?;
+        self.with_session(|session, status| {
+            let identity = list_identities(session, status)?
+                .into_iter()
+                .find(|id| &id.ssh_identity.credential == public_credential);
 
-        let identity = list_identities(&mut session, &status)
-            .into_iter()
-            .find(|id| &id.ssh_identity.credential == public_credential);
+            let Some(identity) = identity else {
+                tracing::debug!("no matching OpenPGP identity for requested public key");
+                return Ok(None);
+            };
 
-        let Some(identity) = identity else {
-            tracing::debug!("no matching OpenPGP identity for requested public key");
-            return Ok(None);
-        };
+            let prepared = prepare_sign_input(identity.attrs, data, rsa_sig_hash)?;
+            let Some(signature) = sign_with_pin(
+                session,
+                identity.slot,
+                &prepared,
+                status.full_serial(),
+                &self.pinentry,
+                self.pin_cache.as_ref(),
+            )?
+            else {
+                return Ok(None);
+            };
 
-        let prepared = prepare_sign_input(identity.attrs, data, rsa_sig_hash)?;
-        let Some(signature) = sign_with_pin(
-            &mut session,
-            identity.slot,
-            &prepared,
-            status.full_serial(),
-            &self.pinentry,
-            self.pin_cache.as_ref(),
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let signature = encode_signature(identity.attrs, &signature, rsa_sig_hash)?;
-        Ok(Some(signature))
+            let signature = encode_signature(identity.attrs, &signature, rsa_sig_hash)?;
+            Ok(Some(signature))
+        })
     }
 }
 
-fn list_identities<'a>(
-    session: &'a mut OpenPgpSession,
-    status: &'a OpenPgpStatus,
-) -> impl Iterator<Item = OpenPgpIdentity> + 'a {
-    OPENPGP_SLOTS.iter().filter_map(|&slot| {
-        slot_to_ssh_identity(session, status, slot)
-            .inspect_err(|e| {
-                tracing::warn!("failed to configure slot {slot:?} as OpenPGP identity: {e}");
-            })
-            .ok()
-            .flatten()
-    })
+fn list_identities(
+    session: &mut OpenPgpSession,
+    status: &OpenPgpStatus,
+) -> Result<Vec<OpenPgpIdentity>, crate::Error> {
+    let mut identities = Vec::new();
+    for slot in OPENPGP_SLOTS {
+        match slot_to_ssh_identity(session, status, slot) {
+            Ok(Some(identity)) => identities.push(identity),
+            Ok(None) => {}
+            Err(err) if err.is_transport_error() => return Err(err),
+            Err(err) => {
+                tracing::warn!("failed to configure slot {slot:?} as OpenPGP identity: {err}");
+            }
+        }
+    }
+    Ok(identities)
 }
 
 fn slot_to_ssh_identity(
@@ -973,5 +1081,179 @@ mod tests {
         )
         .unwrap();
         assert!(res.is_none());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum MockErr {
+        App,
+        Transport,
+    }
+
+    impl MockErr {
+        fn is_transport(&self) -> bool {
+            matches!(self, Self::Transport)
+        }
+    }
+
+    struct MockSession {
+        id: usize,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for MockSession {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn persistent_slot_lazily_opens_and_reads_status_once() {
+        let slot = super::PersistentSlot::<MockSession, usize>::new();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opens = 0usize;
+
+        let open = |opens: &mut usize| {
+            *opens += 1;
+            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, MockErr>((
+                MockSession {
+                    id: *opens,
+                    active: std::sync::Arc::clone(&active),
+                },
+                *opens * 100,
+            ))
+        };
+
+        let first = slot
+            .with_session(
+                || open(&mut opens),
+                MockErr::is_transport,
+                |sess, &status| Ok((sess.id, status)),
+            )
+            .unwrap();
+        let second = slot
+            .with_session(
+                || open(&mut opens),
+                MockErr::is_transport,
+                |sess, &status| Ok((sess.id, status)),
+            )
+            .unwrap();
+
+        assert_eq!(first, (1, 100));
+        assert_eq!(second, (1, 100));
+        assert_eq!(opens, 1);
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_slot_keeps_session_on_non_transport_error() {
+        let slot = super::PersistentSlot::<MockSession, usize>::new();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opens = 0usize;
+
+        let mut open_fn = || {
+            opens += 1;
+            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, MockErr>((
+                MockSession {
+                    id: opens,
+                    active: std::sync::Arc::clone(&active),
+                },
+                opens,
+            ))
+        };
+
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(1)
+        );
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |_, _| Err::<usize, _>(
+                MockErr::App
+            )),
+            Err(MockErr::App)
+        );
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(1)
+        );
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn persistent_slot_drops_and_reopens_session_on_transport_error() {
+        let slot = super::PersistentSlot::<MockSession, usize>::new();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opens = 0usize;
+
+        let mut open_fn = || {
+            opens += 1;
+            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, MockErr>((
+                MockSession {
+                    id: opens,
+                    active: std::sync::Arc::clone(&active),
+                },
+                opens,
+            ))
+        };
+
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(1)
+        );
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |_, _| Err::<usize, _>(
+                MockErr::Transport
+            )),
+            Err(MockErr::Transport)
+        );
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            slot.with_session(&mut open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(2)
+        );
+        assert_eq!(opens, 2);
+    }
+
+    #[test]
+    fn persistent_slot_disconnect_and_clone_share_state() {
+        let slot1 = super::PersistentSlot::<MockSession, usize>::new();
+        let slot2 = slot1.clone();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opens = Cell::new(0usize);
+
+        let open_fn = || {
+            let next = opens.get() + 1;
+            opens.set(next);
+            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, MockErr>((
+                MockSession {
+                    id: next,
+                    active: std::sync::Arc::clone(&active),
+                },
+                next,
+            ))
+        };
+
+        assert_eq!(
+            slot1.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(1)
+        );
+        assert_eq!(
+            slot2.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(1)
+        );
+        assert_eq!(opens.get(), 1);
+
+        slot2.disconnect();
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert_eq!(
+            slot1.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            Ok(2)
+        );
+        assert_eq!(opens.get(), 2);
     }
 }

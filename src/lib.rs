@@ -67,6 +67,17 @@ struct KeyroostAgent {
     openpgp: Option<openpgp::OpenPgpSshAgent>,
 }
 
+impl KeyroostAgent {
+    fn disconnect(&self) {
+        if let Some(piv) = &self.piv {
+            piv.disconnect();
+        }
+        if let Some(openpgp) = &self.openpgp {
+            openpgp.disconnect();
+        }
+    }
+}
+
 #[ssh_agent_lib::async_trait]
 impl ssh_agent_lib::agent::Session for KeyroostAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
@@ -107,6 +118,18 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         }
 
         Err(AgentError::Failure)
+    }
+
+    async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
+        debug!("remove_all_identities");
+        self.disconnect();
+        Ok(())
+    }
+
+    async fn lock(&mut self, _key: String) -> Result<(), AgentError> {
+        debug!("lock");
+        self.disconnect();
+        Ok(())
     }
 }
 
@@ -173,8 +196,9 @@ fn format_credential(credential: &PublicCredential) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_credential;
+    use super::{ConnectionMode, KeyroostAgent, format_credential, openpgp, pinentry, piv};
     use ssh_agent_lib::{
+        agent::Session,
         proto::PublicCredential,
         ssh_key::public::{Ed25519PublicKey, KeyData},
     };
@@ -184,5 +208,26 @@ mod tests {
         let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x11; 32])));
         let formatted = format_credential(&cred);
         assert!(formatted.starts_with("ssh-ed25519 SHA256:"));
+    }
+
+    #[tokio::test]
+    async fn remove_all_identities_and_lock_disconnect_cleanly() {
+        let mut agent = KeyroostAgent {
+            piv: Some(piv::PivSshAgent::new(
+                "mock-reader".to_owned(),
+                pinentry::SystemPinentry::default(),
+                ConnectionMode::Persistent,
+                None,
+            )),
+            openpgp: Some(openpgp::OpenPgpSshAgent::new(
+                "mock-reader".to_owned(),
+                pinentry::SystemPinentry::default(),
+                ConnectionMode::Persistent,
+                None,
+            )),
+        };
+
+        agent.remove_all_identities().await.unwrap();
+        agent.lock("passphrase".to_owned()).await.unwrap();
     }
 }

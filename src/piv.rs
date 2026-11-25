@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, mpsc};
+
 use keyroost_piv::{
     KeyAlg, PinPolicy, PublicKey, Slot,
     x509::{SigHash, X509Error},
@@ -32,12 +34,184 @@ impl From<PivIdentity> for Identity {
 }
 
 #[derive(Clone)]
-pub(super) struct PivSshAgent {
-    reader: String,
+struct PivConfig {
     slots: Vec<Slot>,
     pinentry: SystemPinentry,
-    connection_mode: ConnectionMode,
     pin_cache: Option<PinCache>,
+}
+
+enum PivRequest {
+    ListIdentities,
+    Sign {
+        credential: PublicCredential,
+        data: Vec<u8>,
+        rsa_sig_hash: Option<HashAlg>,
+    },
+}
+
+enum PivResponse {
+    Identities(Vec<Identity>),
+    Signature(Option<Signature>),
+}
+
+enum WorkerMessage<Req, Res, E> {
+    Request {
+        request: Req,
+        reply: mpsc::Sender<Result<Res, E>>,
+    },
+    Disconnect {
+        reply: mpsc::Sender<()>,
+    },
+}
+
+type WorkerSender<Req, Res, E> = mpsc::Sender<WorkerMessage<Req, Res, E>>;
+
+struct PersistentWorker<Req, Res, E> {
+    sender: Arc<Mutex<Option<WorkerSender<Req, Res, E>>>>,
+}
+
+impl<Req, Res, E> Clone for PersistentWorker<Req, Res, E> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: Arc::clone(&self.sender),
+        }
+    }
+}
+
+impl<Req, Res, E> PersistentWorker<Req, Res, E> {
+    fn new() -> Self {
+        Self {
+            sender: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn send_request(
+        &self,
+        request: Req,
+        spawn_worker: impl FnOnce(mpsc::Receiver<WorkerMessage<Req, Res, E>>),
+        on_worker_gone: impl Fn(&'static str) -> E,
+    ) -> Result<Res, E> {
+        let tx = {
+            let mut guard = self
+                .sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .get_or_insert_with(|| {
+                    let (tx, rx) = mpsc::channel();
+                    spawn_worker(rx);
+                    tx
+                })
+                .clone()
+        };
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(WorkerMessage::Request {
+                request,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            *self
+                .sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Err(on_worker_gone("PIV worker thread disconnected"));
+        }
+
+        reply_rx
+            .recv()
+            .map_err(|_| on_worker_gone("PIV worker thread dropped reply"))?
+    }
+
+    fn disconnect(&self) {
+        let tx = {
+            let guard = self
+                .sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx.send(WorkerMessage::Disconnect { reply: reply_tx }).is_ok() {
+            let _ = reply_rx.recv();
+        }
+    }
+}
+
+fn serve_in_transaction<Req, Res, E>(
+    first_req: Req,
+    first_reply: mpsc::Sender<Result<Res, E>>,
+    rx: &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
+    mut handle: impl FnMut(Req) -> Result<Res, E>,
+    is_fatal: impl Fn(&E) -> bool,
+) -> Option<mpsc::Sender<()>> {
+    let mut pending = Some((first_req, first_reply));
+    loop {
+        let (req, reply) = match pending.take() {
+            Some(pair) => pair,
+            None => match rx.recv() {
+                Ok(WorkerMessage::Request { request, reply }) => (request, reply),
+                Ok(WorkerMessage::Disconnect { reply }) => return Some(reply),
+                Err(_) => return None,
+            },
+        };
+        let result = handle(req);
+        let broken = result.as_ref().err().is_some_and(&is_fatal);
+        let _ = reply.send(result);
+        if broken {
+            tracing::debug!("dropping persistent PIV session after transport error");
+            return None;
+        }
+    }
+}
+
+fn run_worker<Req, Res, E>(
+    rx: &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
+    mut open_and_serve: impl FnMut(
+        &mut Option<(Req, mpsc::Sender<Result<Res, E>>)>,
+        &mpsc::Receiver<WorkerMessage<Req, Res, E>>,
+    ) -> Result<Option<mpsc::Sender<()>>, E>,
+) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WorkerMessage::Disconnect { reply } => {
+                let _ = reply.send(());
+            }
+            WorkerMessage::Request { request, reply } => {
+                let mut pending = Some((request, reply));
+                match open_and_serve(&mut pending, rx) {
+                    Ok(Some(disconnect_reply)) => {
+                        tracing::debug!("disconnected persistent PIV session");
+                        let _ = disconnect_reply.send(());
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if let Some((_, reply)) = pending.take() {
+                            let _ = reply.send(Err(err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PivBackend {
+    Ephemeral,
+    Persistent(PersistentWorker<PivRequest, PivResponse, crate::Error>),
+}
+
+#[derive(Clone)]
+pub(super) struct PivSshAgent {
+    reader: String,
+    config: PivConfig,
+    backend: PivBackend,
 }
 
 impl PivSshAgent {
@@ -55,25 +229,54 @@ impl PivSshAgent {
             Slot::Signature,
         ];
 
+        let backend = match connection_mode {
+            ConnectionMode::Ephemeral => PivBackend::Ephemeral,
+            ConnectionMode::Persistent => PivBackend::Persistent(PersistentWorker::new()),
+        };
+
         Self {
             reader,
-            pinentry,
-            slots: Vec::from_iter([sign_slots, &Slot::retired_all()].concat()),
-            connection_mode,
-            pin_cache,
+            config: PivConfig {
+                slots: Vec::from_iter([sign_slots, &Slot::retired_all()].concat()),
+                pinentry,
+                pin_cache,
+            },
+            backend,
+        }
+    }
+
+    pub(super) fn disconnect(&self) {
+        if let PivBackend::Persistent(worker) = &self.backend {
+            worker.disconnect();
         }
     }
 
     pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
-        tracing::debug!(connection_mode = ?self.connection_mode, "requesting PIV identities");
-        PivSession::with_transaction(&self.reader, |session| {
-            let identities = self.list_identities(session);
-            Ok(identities
-                .into_iter()
-                .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
-                .map(Into::into)
-                .collect())
-        })
+        match &self.backend {
+            PivBackend::Ephemeral => {
+                tracing::debug!(
+                    connection_mode = ?ConnectionMode::Ephemeral,
+                    "requesting PIV identities"
+                );
+                PivSession::with_transaction(&self.reader, |session| {
+                    let serial = session.status().ok().and_then(|status| status.serial);
+                    list_ssh_identities(&self.config.slots, session, serial)
+                })
+            }
+            PivBackend::Persistent(worker) => {
+                tracing::debug!(
+                    connection_mode = ?ConnectionMode::Persistent,
+                    "requesting PIV identities"
+                );
+                let response = self.send_persistent(worker, PivRequest::ListIdentities)?;
+                match response {
+                    PivResponse::Identities(identities) => Ok(identities),
+                    PivResponse::Signature(_) => {
+                        Err(crate::Error::Other("unexpected PIV worker response".into()))
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn sign(
@@ -82,107 +285,212 @@ impl PivSshAgent {
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<Option<Signature>, crate::Error> {
-        PivSession::with_transaction(&self.reader, |session| {
-            let piv_identity = self
-                .list_identities(session)
-                .into_iter()
-                .find(|id| &id.ssh_identity.credential == public_credential);
-
-            let Some(piv_identity) = piv_identity else {
-                tracing::debug!("not matching PIV identity for requested public key");
-                return Ok(None);
-            };
-
-            let sig_hash = match keyroost_piv::x509::signature_hash(piv_identity.key_alg) {
-                Ok(sig_hash) => sig_hash,
-                Err(X509Error::UnsupportedAlgorithm) => return Ok(None),
-                Err(other) => return Err(crate::Error::Other(Box::new(other))),
-            };
-
-            let prepared = match sig_hash {
-                SigHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                SigHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                SigHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                SigHash::None => data.to_vec(),
-            };
-
-            let pin_policy = session
-                .slot_policy(piv_identity.slot)
-                .map(|(pin, _touch)| pin);
-            tracing::debug!("slot {:?} PIN policy: {:?}", piv_identity.slot, pin_policy);
-
-            let serial = session.status().ok().and_then(|status| status.serial);
-
-            let Some(signature) = sign_with_policy(
-                session,
-                piv_identity.slot,
-                piv_identity.key_alg,
-                &prepared,
-                pin_policy,
-                serial,
-                &self.pinentry,
-                self.pin_cache.as_ref(),
-            )?
-            else {
-                return Ok(None);
-            };
-
-            let signature = match piv_identity.key_alg {
-                KeyAlg::EccP256 => {
-                    Signature::try_from(ecdsa::Signature::<p256::NistP256>::from_der(&signature)?)?
+        match &self.backend {
+            PivBackend::Ephemeral => PivSession::with_transaction(&self.reader, |session| {
+                let serial = session.status().ok().and_then(|status| status.serial);
+                sign_in_session(
+                    &self.config,
+                    session,
+                    serial,
+                    public_credential,
+                    data,
+                    rsa_sig_hash,
+                )
+            }),
+            PivBackend::Persistent(worker) => {
+                let response = self.send_persistent(
+                    worker,
+                    PivRequest::Sign {
+                        credential: public_credential.clone(),
+                        data: data.to_vec(),
+                        rsa_sig_hash,
+                    },
+                )?;
+                match response {
+                    PivResponse::Signature(signature) => Ok(signature),
+                    PivResponse::Identities(_) => {
+                        Err(crate::Error::Other("unexpected PIV worker response".into()))
+                    }
                 }
-                KeyAlg::EccP384 => {
-                    Signature::try_from(ecdsa::Signature::<p384::NistP384>::from_der(&signature)?)?
-                }
-                KeyAlg::EccP521 => {
-                    Signature::try_from(ecdsa::Signature::<p521::NistP521>::from_der(&signature)?)?
-                }
+            }
+        }
+    }
 
-                KeyAlg::Ed25519 => {
-                    Signature::new(ssh_agent_lib::ssh_key::Algorithm::Ed25519, signature)?
-                }
-                KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-                    let signature = match rsa_sig_hash {
-                        Some(HashAlg::Sha256) => sha2::Sha256::digest(signature).to_vec(),
-                        Some(HashAlg::Sha512) => sha2::Sha512::digest(signature).to_vec(),
-                        None => signature,
-                        Some(other) => {
-                            return Err(crate::Error::Other(
-                                format!("Unsupported RSA hash algorithm {other}").into(),
-                            ));
-                        }
-                    };
-                    Signature::new(Algorithm::Rsa { hash: rsa_sig_hash }, signature)?
-                }
-                KeyAlg::X25519 => {
+    fn send_persistent(
+        &self,
+        worker: &PersistentWorker<PivRequest, PivResponse, crate::Error>,
+        request: PivRequest,
+    ) -> Result<PivResponse, crate::Error> {
+        let reader = self.reader.clone();
+        let config = self.config.clone();
+        worker.send_request(
+            request,
+            move |rx| {
+                std::thread::spawn(move || {
+                    run_worker(&rx, |pending, rx| {
+                        PivSession::with_transaction(&reader, |session| {
+                            // Read serial ONCE when the persistent session opens: on Token2 cards,
+                            // `status()` performs a cross-applet OTP read which resets PIV PIN state.
+                            let serial = session.status().ok().and_then(|status| status.serial);
+                            let (first_req, first_reply) = pending
+                                .take()
+                                .expect("pending request present when entering transaction");
+                            Ok(serve_in_transaction(
+                                first_req,
+                                first_reply,
+                                rx,
+                                |req| match req {
+                                    PivRequest::ListIdentities => {
+                                        list_ssh_identities(&config.slots, session, serial)
+                                            .map(PivResponse::Identities)
+                                    }
+                                    PivRequest::Sign {
+                                        credential,
+                                        data,
+                                        rsa_sig_hash,
+                                    } => sign_in_session(
+                                        &config,
+                                        session,
+                                        serial,
+                                        &credential,
+                                        &data,
+                                        rsa_sig_hash,
+                                    )
+                                    .map(PivResponse::Signature),
+                                },
+                                crate::Error::is_transport_error,
+                            ))
+                        })
+                    });
+                });
+            },
+            |msg| crate::Error::Other(msg.into()),
+        )
+    }
+}
+
+fn list_identities(
+    slots: &[Slot],
+    session: &mut PivSession,
+    serial: Option<u128>,
+) -> Result<Vec<PivIdentity>, crate::Error> {
+    let mut identities = Vec::new();
+    for &slot in slots {
+        match slot_to_ssh_identity(session, slot, serial) {
+            Ok(Some(identity)) => identities.push(identity),
+            Ok(None) => {}
+            Err(err) if err.is_transport_error() => return Err(err),
+            Err(err) => {
+                tracing::warn!("failed to configure slot {slot:?} as PIV identity: {err}");
+            }
+        }
+    }
+    Ok(identities)
+}
+
+fn list_ssh_identities(
+    slots: &[Slot],
+    session: &mut PivSession,
+    serial: Option<u128>,
+) -> Result<Vec<Identity>, crate::Error> {
+    let identities = list_identities(slots, session, serial)?;
+    Ok(identities
+        .into_iter()
+        .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
+        .map(Into::into)
+        .collect())
+}
+
+fn sign_in_session(
+    config: &PivConfig,
+    session: &mut PivSession,
+    serial: Option<u128>,
+    public_credential: &PublicCredential,
+    data: &[u8],
+    rsa_sig_hash: Option<HashAlg>,
+) -> Result<Option<Signature>, crate::Error> {
+    let piv_identity = list_identities(&config.slots, session, serial)?
+        .into_iter()
+        .find(|id| &id.ssh_identity.credential == public_credential);
+
+    let Some(piv_identity) = piv_identity else {
+        tracing::debug!("not matching PIV identity for requested public key");
+        return Ok(None);
+    };
+
+    let sig_hash = match keyroost_piv::x509::signature_hash(piv_identity.key_alg) {
+        Ok(sig_hash) => sig_hash,
+        Err(X509Error::UnsupportedAlgorithm) => return Ok(None),
+        Err(other) => return Err(crate::Error::Other(Box::new(other))),
+    };
+
+    let prepared = match sig_hash {
+        SigHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+        SigHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+        SigHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+        SigHash::None => data.to_vec(),
+    };
+
+    let pin_policy = session
+        .slot_policy(piv_identity.slot)
+        .map(|(pin, _touch)| pin);
+    tracing::debug!("slot {:?} PIN policy: {:?}", piv_identity.slot, pin_policy);
+
+    let Some(signature) = sign_with_policy(
+        session,
+        piv_identity.slot,
+        piv_identity.key_alg,
+        &prepared,
+        pin_policy,
+        serial,
+        &config.pinentry,
+        config.pin_cache.as_ref(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let signature = match piv_identity.key_alg {
+        KeyAlg::EccP256 => {
+            Signature::try_from(ecdsa::Signature::<p256::NistP256>::from_der(&signature)?)?
+        }
+        KeyAlg::EccP384 => {
+            Signature::try_from(ecdsa::Signature::<p384::NistP384>::from_der(&signature)?)?
+        }
+        KeyAlg::EccP521 => {
+            Signature::try_from(ecdsa::Signature::<p521::NistP521>::from_der(&signature)?)?
+        }
+
+        KeyAlg::Ed25519 => {
+            Signature::new(ssh_agent_lib::ssh_key::Algorithm::Ed25519, signature)?
+        }
+        KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
+            let signature = match rsa_sig_hash {
+                Some(HashAlg::Sha256) => sha2::Sha256::digest(signature).to_vec(),
+                Some(HashAlg::Sha512) => sha2::Sha512::digest(signature).to_vec(),
+                None => signature,
+                Some(other) => {
                     return Err(crate::Error::Other(
-                        "Unsupported signature algorithm X25519".into(),
+                        format!("Unsupported RSA hash algorithm {other}").into(),
                     ));
                 }
             };
+            Signature::new(Algorithm::Rsa { hash: rsa_sig_hash }, signature)?
+        }
+        KeyAlg::X25519 => {
+            return Err(crate::Error::Other(
+                "Unsupported signature algorithm X25519".into(),
+            ));
+        }
+    };
 
-            Ok(Some(signature))
-        })
-    }
-
-    fn list_identities<'a: 'b, 'b>(
-        &'a self,
-        session: &'b mut PivSession,
-    ) -> impl Iterator<Item = PivIdentity> + 'b {
-        self.slots.iter().filter_map(|slot| {
-            slot_to_ssh_identity(session, *slot)
-                .inspect_err(|e| {
-                    tracing::warn!("failed to configure slot {slot:?} as PIV identity: {e}");
-                })
-                .ok()
-                .flatten()
-        })
-    }
+    Ok(Some(signature))
 }
 
 fn slot_to_ssh_identity(
     session: &mut PivSession,
     slot: Slot,
+    serial: Option<u128>,
 ) -> Result<Option<PivIdentity>, crate::Error> {
     let Some(cert) = session.read_certificate(slot)? else {
         return Ok(None);
@@ -190,7 +498,7 @@ fn slot_to_ssh_identity(
 
     let (key_alg, public_key) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)?;
 
-    let comment = if let Some(serial) = session.status().ok().and_then(|status| status.serial) {
+    let comment = if let Some(serial) = serial {
         format!("PIV {serial}:{slot:?}")
     } else {
         format!("PIV {slot:?}")
@@ -884,5 +1192,213 @@ mod tests {
                 .map(ExposeSecret::expose_secret),
             Some("cached")
         );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum MockErr {
+        App,
+        Transport,
+        WorkerGone(&'static str),
+    }
+
+    impl MockErr {
+        fn is_transport(&self) -> bool {
+            matches!(self, Self::Transport)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockReq {
+        Ping,
+        AppErr,
+        TransportErr,
+    }
+
+    struct MockCounters {
+        opens: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        status_reads: std::sync::atomic::AtomicUsize,
+        fail_next_open: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockCounters {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                opens: std::sync::atomic::AtomicUsize::new(0),
+                active: std::sync::atomic::AtomicUsize::new(0),
+                status_reads: std::sync::atomic::AtomicUsize::new(0),
+                fail_next_open: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    struct ActiveGuard(std::sync::Arc<MockCounters>);
+
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn send_mock(
+        worker: &super::PersistentWorker<MockReq, usize, MockErr>,
+        counters: &std::sync::Arc<MockCounters>,
+        req: MockReq,
+    ) -> Result<usize, MockErr> {
+        let counters = std::sync::Arc::clone(counters);
+        worker.send_request(
+            req,
+            move |rx| {
+                std::thread::spawn(move || {
+                    super::run_worker(&rx, |pending, rx| {
+                        if counters
+                            .fail_next_open
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(MockErr::Transport);
+                        }
+                        let session_id = counters
+                            .opens
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        counters
+                            .active
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _guard = ActiveGuard(std::sync::Arc::clone(&counters));
+                        counters
+                            .status_reads
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (first_req, first_reply) = pending.take().unwrap();
+                        Ok(super::serve_in_transaction(
+                            first_req,
+                            first_reply,
+                            rx,
+                            |req| match req {
+                                MockReq::Ping => Ok(session_id),
+                                MockReq::AppErr => Err(MockErr::App),
+                                MockReq::TransportErr => Err(MockErr::Transport),
+                            },
+                            MockErr::is_transport,
+                        ))
+                    });
+                });
+            },
+            MockErr::WorkerGone,
+        )
+    }
+
+    #[test]
+    fn persistent_worker_lazily_opens_and_reuses_transaction_reading_status_once() {
+        let counters = MockCounters::new();
+        let worker = super::PersistentWorker::new();
+
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            counters
+                .status_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            counters
+                .status_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_worker_keeps_session_on_non_transport_error() {
+        let counters = MockCounters::new();
+        let worker = super::PersistentWorker::new();
+
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(
+            send_mock(&worker, &counters, MockReq::AppErr),
+            Err(MockErr::App)
+        );
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_worker_drops_and_reopens_session_on_transport_error() {
+        let counters = MockCounters::new();
+        let worker = super::PersistentWorker::new();
+
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(
+            send_mock(&worker, &counters, MockReq::TransportErr),
+            Err(MockErr::Transport)
+        );
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(2));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            counters
+                .status_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn persistent_worker_disconnect_drops_session_synchronously_and_reopens_next() {
+        let counters = MockCounters::new();
+        let worker = super::PersistentWorker::new();
+
+        // Disconnect before any request is a no-op and does not open a session.
+        worker.disconnect();
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        worker.disconnect();
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Next request lazily opens a new transaction.
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(2));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_worker_clone_shares_active_transaction() {
+        let counters = MockCounters::new();
+        let worker1 = super::PersistentWorker::new();
+        let worker2 = worker1.clone();
+
+        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(send_mock(&worker2, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        worker2.disconnect();
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping), Ok(2));
+    }
+
+    #[test]
+    fn persistent_worker_propagates_open_failure_and_retries_next_request() {
+        let counters = MockCounters::new();
+        counters
+            .fail_next_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let worker = super::PersistentWorker::new();
+
+        assert_eq!(
+            send_mock(&worker, &counters, MockReq::Ping),
+            Err(MockErr::Transport)
+        );
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert_eq!(send_mock(&worker, &counters, MockReq::Ping), Ok(1));
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
