@@ -54,20 +54,9 @@ fn resolve_pin_cache(
 
 #[cfg(target_os = "linux")]
 fn harden_process_memory() {
-    const PR_SET_DUMPABLE: std::ffi::c_int = 4;
-
-    unsafe extern "C" {
-        fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
-    }
-
-    let zero: std::ffi::c_ulong = 0;
-    // SAFETY: `prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)` is a standard Linux syscall wrapper
-    // taking scalar integer arguments; setting dumpable to 0 disables core dumps and
-    // non-privileged ptrace attachment for this process.
-    let rc = unsafe { prctl(PR_SET_DUMPABLE, zero, zero, zero, zero) };
-    if rc != 0 {
+    if let Err(errno) = prctl::set_dumpable(false) {
         tracing::warn!(
-            error = %std::io::Error::last_os_error(),
+            error = %std::io::Error::from_raw_os_error(errno),
             "failed to disable process dumpability (PR_SET_DUMPABLE=0)"
         );
     }

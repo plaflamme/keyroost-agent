@@ -28,5 +28,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+prctl = "1"
+
 [lints.clippy]
 pedantic = "warn"
