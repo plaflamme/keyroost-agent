@@ -15,6 +15,10 @@
   - Prompts for smart-card PINs via `pinentry` (configurable binary or system default)
 - **Systemd Socket Activation**:
   - Supports `LISTEN_FDS` / `LISTEN_PID` socket activation in addition to `--socket <PATH>`
+- **Smart-Card Connection Modes**:
+  - Persistent single-applet connections using native on-card PIN state, or ephemeral connections for card sharing and dual-applet use
+- **Opt-in PIN Caching**:
+  - Disabled by default (`none`), with optional hardened in-memory sliding-TTL caching (`memory`) or delegation to `pinentry`/OS keyring (`pinentry`)
 
 ## Getting Started
 
@@ -56,18 +60,108 @@ nix run github:plaflamme/keyroost-agent -- --socket /tmp/keyroost-agent.sock
 cargo run -- --socket /tmp/keyroost-agent.sock
 ```
 
-Available CLI options:
+## Applets, Connections & PIN Caching
 
-- `-s, --socket <SOCKET>`: Bind the agent to the specified Unix-domain socket (otherwise systemd socket activation via `LISTEN_FDS` is used)
-- `-r, --reader <READER>`: Smart-card reader whose name contains this text (case-insensitive)
-- `-p, --pinentry <PINENTRY>`: Path or name of the pinentry binary to use for PIN prompts
-- `--applet <auto|piv|openpgp|both>`: Smart-card applet to expose (default: `auto`, enabling applets with usable SSH identities)
-- `--connection <auto|persistent|ephemeral>`: Smart-card connection mode (default: `auto`, using `persistent` for a single active applet and `ephemeral` when both are active)
-- `--idle-timeout <DURATION>`: Idle timeout after which persistent smart-card sessions are released, e.g. `30s`, `30m`, `1h` (`0` disables; default: `30m`)
-- `--pin-cache <none|memory|pinentry>`: PIN caching strategy (default: `none`; `memory` caches PINs in process memory; `pinentry` delegates caching to `pinentry`'s external password cache / OS keyring via `OPTION allow-external-password-cache` and `SETKEYINFO`)
-- `--pin-cache-ttl <DURATION>`: Sliding TTL for cached PINs in `memory` mode, e.g. `30s`, `10m`, `1h` (default: `10m`)
-- `--pin-cache-max-ttl <DURATION>`: Optional absolute maximum lifetime for cached PINs (`0` disables the cap; default: `0`)
-- `-v, --verbose` / `-q, --quiet`: Increase or decrease logging verbosity
+### How Auto-Detection Works
+
+Switching between ISO 7816-4 applets (PIV and OpenPGP) or resetting a PC/SC connection clears the card's internal PIN verification state.
+
+By default (`--applet=auto`, `--connection=auto`), `keyroost-agent` probes the card at startup for usable SSH identities:
+
+- **Single applet has identities**: Activates only that applet and selects a `persistent` connection, relying on native on-card PIN verification state with zero PINs held in RAM.
+- **Both applets have identities**: Activates both applets and selects `ephemeral` connections so each operation can select the required applet cleanly.
+
+### Connection Modes & Idle Timeout
+
+- **`persistent`**: Keeps the PC/SC card session open so on-card PIN verification persists across signing operations (PIV `Once`/`Default` slots; OpenPGP `PW1_OTHER` / `PW1_SIGN`, unless Force Signature PIN is enabled on the card). Cannot be used when both applets are active. While connected, other PC/SC tools (`gpg`, `ykman`, `keyroostctl`) cannot access the card.
+- **`ephemeral`**: Opens and releases a card session for each operation, allowing concurrent card sharing with other tools and dual-applet operation.
+- **Idle timeout (`--idle-timeout` / `idleTimeout`, default `30m`, `0` disables)**: Applies in `persistent` mode. When running under systemd socket activation, the agent exits cleanly on idle and systemd restarts it on the next request. When running standalone (`--socket`), it disconnects the card session in-place while continuing to listen on the socket.
+- **Manual reset**: Running `ssh-add -D` or locking the agent immediately disconnects any persistent card session and clears all cached PINs.
+
+### PIN Caching Strategies
+
+| Mode | Where PIN is stored | Trade-offs | Best use case |
+| --- | --- | --- | --- |
+| `none` (default) | Nowhere (card state only) | Requires a PIN prompt on every new session in `ephemeral` mode | Single-applet `persistent` mode, or maximum security |
+| `memory` | Process RAM (`SecretBox`) | Cleared on exit/idle/lock; does not survive agent restarts | `ephemeral` mode (dual-applet or card sharing) without OS keyring |
+| `pinentry` | External OS keyring via `pinentry` | Persists across restarts; governed by keyring lock/timeout policy | Desktop environments using GNOME Keyring, KWallet, or Keychain |
+
+Security and runtime behavior:
+
+- PIN caching is opt-in; `none` is always the default.
+- **`memory`**: Uses a sliding TTL (`--pin-cache-ttl`, default `10m`) and an optional absolute lifetime cap (`--pin-cache-max-ttl`, `0` disables the cap). PINs are stored only in zeroized `SecretBox` memory. On Linux, `PR_SET_DUMPABLE=0` is enabled to block core dumps and non-root `ptrace` attachment. A wrong or changed PIN is evicted immediately and triggers a single re-prompt.
+- **`pinentry`**: Sends `OPTION allow-external-password-cache` and `SETKEYINFO keyroost-agent-<applet>-<serial>` to `pinentry`. On an incorrect PIN, it retries once with `SETERROR Incorrect PIN` while bypassing the external cache.
+- **PIV `PinPolicy::Always`**: Slots configured with `Always` always prompt via `pinentry` and never read from or write to in-memory or external caches.
+
+### Common Configurations
+
+#### 1. Single-applet, zero PINs in RAM
+
+This is the automatic default when only one applet on the card holds SSH identities. To pin it explicitly:
+
+```nix
+services.keyroost-agent = {
+  enable = true;
+  applets = "piv"; # or "openpgp"
+  connection = "persistent";
+  idleTimeout = "30m";
+  pinCache.mode = "none";
+};
+```
+
+```bash
+keyroost-agent --socket /tmp/keyroost-agent.sock \
+  --applet=piv --connection=persistent --idle-timeout=30m --pin-cache=none
+```
+
+#### 2. Dual-applet or sharing the card with `gpg`/`ykman`, with in-memory TTL cache
+
+```nix
+services.keyroost-agent = {
+  enable = true;
+  connection = "ephemeral";
+  pinCache = {
+    mode = "memory";
+    ttl = "10m";
+    maxTtl = "1h";
+  };
+};
+```
+
+```bash
+keyroost-agent --socket /tmp/keyroost-agent.sock \
+  --connection=ephemeral --pin-cache=memory --pin-cache-ttl=10m --pin-cache-max-ttl=1h
+```
+
+#### 3. Delegating PIN caching to the desktop keyring
+
+```nix
+services.keyroost-agent = {
+  enable = true;
+  connection = "ephemeral";
+  pinCache.mode = "pinentry";
+};
+```
+
+```bash
+keyroost-agent --socket /tmp/keyroost-agent.sock \
+  --connection=ephemeral --pin-cache=pinentry
+```
+
+## CLI Reference
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-s, --socket <SOCKET>` | systemd `LISTEN_FDS` | Bind the agent to the specified Unix-domain socket instead of using systemd socket activation |
+| `-r, --reader <READER>` | — | Filter PC/SC smart-card reader by case-insensitive substring |
+| `-p, --pinentry <PINENTRY>` | system default | Path or name of the `pinentry` binary to use for PIN prompts |
+| `--applet <auto\|piv\|openpgp\|both>` | `auto` | Smart-card applet(s) to expose (`auto` enables applets with usable SSH identities) |
+| `--connection <auto\|persistent\|ephemeral>` | `auto` | Smart-card connection mode (`auto` uses `persistent` for a single active applet and `ephemeral` when both are active) |
+| `--idle-timeout <DURATION>` | `30m` | Idle timeout after which persistent sessions are released, e.g. `30s`, `30m`, `1h` (`0` disables) |
+| `--pin-cache <none\|memory\|pinentry>` | `none` | PIN caching strategy |
+| `--pin-cache-ttl <DURATION>` | `10m` | Sliding TTL for cached PINs in `memory` mode, e.g. `30s`, `10m`, `1h` |
+| `--pin-cache-max-ttl <DURATION>` | `0` | Optional absolute maximum lifetime for cached PINs in `memory` mode (`0` disables the cap) |
+| `-v, --verbose` / `-q, --quiet` | — | Increase or decrease logging verbosity |
 
 ## Development & Testing
 
