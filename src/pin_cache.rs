@@ -47,7 +47,6 @@ pub(crate) struct PinCache {
 }
 
 impl PinCache {
-    #[allow(dead_code)]
     pub(crate) fn new(ttl: Duration, max_ttl: Option<Duration>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(PinCacheInner {
@@ -75,7 +74,6 @@ impl PinCache {
         inner.entries.remove(&PinCacheKey { applet, serial });
     }
 
-    #[allow(dead_code)]
     pub(crate) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.entries.clear();

@@ -52,6 +52,41 @@ in
         '';
       };
     };
+
+    pinCache = {
+      mode = lib.mkOption {
+        type = lib.types.enum [
+          "none"
+          "memory"
+        ];
+        default = "none";
+        description = ''
+          PIN caching strategy passed via {option}`--pin-cache`.
+          `"none"` disables caching; `"memory"` caches PINs in process memory
+          for the configured TTL.
+        '';
+      };
+
+      ttl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "10m";
+        description = ''
+          Sliding TTL for cached PINs passed via {option}`--pin-cache-ttl`
+          (for example `"30s"`, `"10m"`, `"1h"`).
+        '';
+      };
+
+      maxTtl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "1h";
+        description = ''
+          Optional absolute maximum lifetime for cached PINs passed via
+          {option}`--pin-cache-max-ttl` (`"0"` disables the cap).
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -98,6 +133,13 @@ in
             ++ lib.optional (
               cfg.pinentry.package != null
             ) "--pinentry=${lib.getExe' cfg.pinentry.package cfg.pinentry.program}"
+            ++ lib.optional (cfg.pinCache.mode != "none") "--pin-cache=${cfg.pinCache.mode}"
+            ++ lib.optional (
+              cfg.pinCache.ttl != null
+            ) "--pin-cache-ttl=${lib.escapeShellArg cfg.pinCache.ttl}"
+            ++ lib.optional (
+              cfg.pinCache.maxTtl != null
+            ) "--pin-cache-max-ttl=${lib.escapeShellArg cfg.pinCache.maxTtl}"
           );
         };
       };

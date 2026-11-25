@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use keyroost_agent::ConnectionMode;
+use keyroost_agent::{ConnectionMode, PinCacheConfig};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum AppletSelection {
@@ -22,6 +22,57 @@ enum ConnectionSelection {
     Persistent,
     Ephemeral,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum PinCacheMode {
+    #[default]
+    None,
+    Memory,
+}
+
+fn resolve_pin_cache(
+    mode: PinCacheMode,
+    ttl: Duration,
+    max_ttl: Duration,
+) -> Result<Option<PinCacheConfig>, String> {
+    match mode {
+        PinCacheMode::None => Ok(None),
+        PinCacheMode::Memory => {
+            if ttl.is_zero() {
+                return Err(
+                    "--pin-cache-ttl must be greater than 0 when --pin-cache=memory is enabled."
+                        .to_owned(),
+                );
+            }
+            let max_ttl = (!max_ttl.is_zero()).then_some(max_ttl);
+            Ok(Some(PinCacheConfig { ttl, max_ttl }))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn harden_process_memory() {
+    const PR_SET_DUMPABLE: std::ffi::c_int = 4;
+
+    unsafe extern "C" {
+        fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+
+    let zero: std::ffi::c_ulong = 0;
+    // SAFETY: `prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)` is a standard Linux syscall wrapper
+    // taking scalar integer arguments; setting dumpable to 0 disables core dumps and
+    // non-privileged ptrace attachment for this process.
+    let rc = unsafe { prctl(PR_SET_DUMPABLE, zero, zero, zero, zero) };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to disable process dumpability (PR_SET_DUMPABLE=0)"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harden_process_memory() {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResolvedConfig {
@@ -156,6 +207,18 @@ struct Cli {
         value_parser = keyroost_agent::parse_duration
     )]
     idle_timeout: Duration,
+
+    /// PIN caching strategy
+    #[arg(long, value_enum, default_value_t = PinCacheMode::None)]
+    pin_cache: PinCacheMode,
+
+    /// Sliding TTL for cached PINs (e.g. 30s, 10m, 1h)
+    #[arg(long, value_parser = keyroost_agent::parse_duration, default_value = "10m")]
+    pin_cache_ttl: Duration,
+
+    /// Optional absolute maximum lifetime for cached PINs (0 disables the cap)
+    #[arg(long, value_parser = keyroost_agent::parse_duration, default_value = "0")]
+    pin_cache_max_ttl: Duration,
 }
 
 fn systemd_listener() -> Result<Option<tokio::net::UnixListener>, Box<dyn std::error::Error>> {
@@ -189,6 +252,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_max_level(opts.verbosity)
         .init();
+
+    let pin_cache_config = resolve_pin_cache(
+        opts.pin_cache,
+        opts.pin_cache_ttl,
+        opts.pin_cache_max_ttl,
+    )?;
+    if pin_cache_config.is_some() {
+        harden_process_memory();
+    }
 
     let mut readers = keyroost_transport::probe_readers()?
         .into_iter()
@@ -242,8 +314,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         piv = resolved.use_piv,
         openpgp = resolved.use_openpgp,
         connection = ?resolved.connection_mode,
+        pin_cache = ?opts.pin_cache,
         "resolved agent configuration"
     );
+
+    if resolved.use_piv && resolved.use_openpgp && opts.pin_cache == PinCacheMode::None {
+        tracing::info!(
+            "both PIV and OpenPGP applets are active in ephemeral mode; consider --pin-cache=memory to avoid repeated PIN prompts when switching applets"
+        );
+    }
 
     let piv_reader = resolved.use_piv.then(|| reader.reader_name.clone());
     let openpgp_reader = resolved.use_openpgp.then(|| reader.reader_name.clone());
@@ -258,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resolved.connection_mode,
             idle_timeout,
             false,
+            pin_cache_config,
         )
         .await?;
     } else if let Some(listener) = systemd_listener()? {
@@ -269,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resolved.connection_mode,
             idle_timeout,
             true,
+            pin_cache_config,
         )
         .await?;
     } else {
@@ -280,17 +361,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppletSelection, Cli, ConnectionSelection, ResolvedConfig, resolve_config};
+    use super::{
+        AppletSelection, Cli, ConnectionSelection, PinCacheMode, ResolvedConfig, resolve_config,
+        resolve_pin_cache,
+    };
     use clap::Parser;
-    use keyroost_agent::ConnectionMode;
+    use keyroost_agent::{ConnectionMode, PinCacheConfig};
     use std::time::Duration;
 
     #[test]
-    fn cli_defaults_applet_and_connection_to_auto() {
+    fn cli_defaults_applet_connection_and_pin_cache() {
         let cli = Cli::try_parse_from(["keyroost-agent"]).unwrap();
         assert_eq!(cli.applet, AppletSelection::Auto);
         assert_eq!(cli.connection, ConnectionSelection::Auto);
         assert_eq!(cli.idle_timeout, Duration::from_mins(30));
+        assert_eq!(cli.pin_cache, PinCacheMode::None);
+        assert_eq!(cli.pin_cache_ttl, Duration::from_mins(10));
+        assert_eq!(cli.pin_cache_max_ttl, Duration::ZERO);
     }
 
     #[test]
@@ -315,6 +402,51 @@ mod tests {
         assert_eq!(one_hour.idle_timeout, Duration::from_secs(3600));
 
         assert!(Cli::try_parse_from(["keyroost-agent", "--idle-timeout", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_explicit_pin_cache_options() {
+        let cli = Cli::try_parse_from([
+            "keyroost-agent",
+            "--pin-cache=memory",
+            "--pin-cache-ttl=30s",
+            "--pin-cache-max-ttl=1h",
+        ])
+        .unwrap();
+        assert_eq!(cli.pin_cache, PinCacheMode::Memory);
+        assert_eq!(cli.pin_cache_ttl, Duration::from_secs(30));
+        assert_eq!(cli.pin_cache_max_ttl, Duration::from_hours(1));
+    }
+
+    #[test]
+    fn resolve_pin_cache_validates_ttl_and_max_ttl() {
+        assert_eq!(
+            resolve_pin_cache(PinCacheMode::None, Duration::ZERO, Duration::ZERO),
+            Ok(None)
+        );
+        assert!(resolve_pin_cache(PinCacheMode::Memory, Duration::ZERO, Duration::ZERO).is_err());
+        assert_eq!(
+            resolve_pin_cache(
+                PinCacheMode::Memory,
+                Duration::from_mins(10),
+                Duration::ZERO,
+            ),
+            Ok(Some(PinCacheConfig {
+                ttl: Duration::from_mins(10),
+                max_ttl: None,
+            }))
+        );
+        assert_eq!(
+            resolve_pin_cache(
+                PinCacheMode::Memory,
+                Duration::from_mins(5),
+                Duration::from_hours(1),
+            ),
+            Ok(Some(PinCacheConfig {
+                ttl: Duration::from_mins(5),
+                max_ttl: Some(Duration::from_hours(1)),
+            }))
+        );
     }
 
     #[test]

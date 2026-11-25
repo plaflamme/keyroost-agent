@@ -61,6 +61,9 @@ Available CLI options:
 - `-s, --socket <SOCKET>`: Bind the agent to the specified Unix-domain socket (otherwise systemd socket activation via `LISTEN_FDS` is used)
 - `-r, --reader <READER>`: Smart-card reader whose name contains this text (case-insensitive)
 - `-p, --pinentry <PINENTRY>`: Path or name of the pinentry binary to use for PIN prompts
+- `--pin-cache <none|memory>`: PIN caching strategy (default: `none`; `memory` caches PINs in process memory)
+- `--pin-cache-ttl <DURATION>`: Sliding TTL for cached PINs in `memory` mode, e.g. `30s`, `10m`, `1h` (default: `10m`)
+- `--pin-cache-max-ttl <DURATION>`: Optional absolute maximum lifetime for cached PINs (`0` disables the cap; default: `0`)
 - `-v, --verbose` / `-q, --quiet`: Increase or decrease logging verbosity
 
 ## Development & Testing
