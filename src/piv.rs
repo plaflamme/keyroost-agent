@@ -633,32 +633,49 @@ mod tests {
     use super::{PivSigner, sign_with_policy};
     use crate::{
         pin_cache::PinCache,
-        pinentry::{Applet, Pinentry},
+        pinentry::{Applet, PinPromptOptions, Pinentry},
     };
     use keyroost_piv::{KeyAlg, PinPolicy, Slot};
     use keyroost_transport::TransportError;
     use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
-    use std::{cell::Cell, time::Duration};
+    use std::{cell::RefCell, collections::VecDeque, time::Duration};
 
     fn secret(pin: &str) -> SecretBox<str> {
         SecretBox::from(Box::<str>::from(pin))
     }
 
     struct MockPinentry {
-        pin: Option<&'static str>,
-        prompts: Cell<usize>,
+        default_pin: Option<&'static str>,
+        responses: RefCell<VecDeque<Option<&'static str>>>,
+        external_cache: bool,
+        calls: RefCell<Vec<(bool, Option<String>)>>,
     }
 
     impl MockPinentry {
         fn new(pin: Option<&'static str>) -> Self {
             Self {
-                pin,
-                prompts: Cell::new(0),
+                default_pin: pin,
+                responses: RefCell::new(VecDeque::new()),
+                external_cache: false,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_external_cache(responses: impl IntoIterator<Item = Option<&'static str>>) -> Self {
+            Self {
+                default_pin: None,
+                responses: RefCell::new(responses.into_iter().collect()),
+                external_cache: true,
+                calls: RefCell::new(Vec::new()),
             }
         }
 
         fn prompts(&self) -> usize {
-            self.prompts.get()
+            self.calls.borrow().len()
+        }
+
+        fn calls(&self) -> Vec<(bool, Option<String>)> {
+            self.calls.borrow().clone()
         }
     }
 
@@ -667,11 +684,22 @@ mod tests {
             &self,
             _applet: Applet,
             _serial: Option<u128>,
+            options: PinPromptOptions<'_>,
         ) -> Result<Option<SecretBox<str>>, crate::Error> {
-            self.prompts.set(self.prompts.get() + 1);
-            Ok(self
-                .pin
-                .map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
+            self.calls.borrow_mut().push((
+                options.allow_external_cache,
+                options.error.map(ToOwned::to_owned),
+            ));
+            let pin = self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.default_pin);
+            Ok(pin.map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
+        }
+
+        fn external_cache_enabled(&self) -> bool {
+            self.external_cache
         }
     }
 
@@ -1192,6 +1220,77 @@ mod tests {
                 .map(ExposeSecret::expose_secret),
             Some("cached")
         );
+    }
+
+    #[test]
+    fn external_cache_wrong_pin_retries_once_without_external_cache_and_with_error() {
+        let pinentry = MockPinentry::with_external_cache([Some("stale1"), Some("123456")]);
+        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+
+        let res = sign_with_policy(
+            &mut signer,
+            Slot::Authentication,
+            KeyAlg::EccP256,
+            b"msg",
+            Some(PinPolicy::Once),
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(res, Some(vec![1, 2, 3]));
+        assert_eq!(
+            pinentry.calls(),
+            vec![(true, None), (false, Some("Incorrect PIN".to_owned()))]
+        );
+        assert_eq!(
+            signer.verified_pins,
+            vec![b"stale1".to_vec(), b"123456".to_vec()]
+        );
+
+        // If retry also fails with wrong PIN, it propagates the error without looping.
+        let pinentry2 = MockPinentry::with_external_cache([Some("stale1"), Some("wrong2")]);
+        let mut signer2 = MockSigner::new(false, vec![1, 2, 3]);
+        let err = sign_with_policy(
+            &mut signer2,
+            Slot::Authentication,
+            KeyAlg::EccP256,
+            b"msg",
+            Some(PinPolicy::Once),
+            Some(1234),
+            &pinentry2,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::Other(_)));
+        assert_eq!(
+            pinentry2.calls(),
+            vec![(true, None), (false, Some("Incorrect PIN".to_owned()))]
+        );
+        assert_eq!(signer2.verifies, 2);
+    }
+
+    #[test]
+    fn external_cache_always_policy_never_enables_external_cache_or_retries() {
+        let pinentry = MockPinentry::with_external_cache([Some("wrong1"), Some("123456")]);
+        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+
+        let err = sign_with_policy(
+            &mut signer,
+            Slot::Signature,
+            KeyAlg::EccP256,
+            b"msg",
+            Some(PinPolicy::Always),
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Other(_)));
+        assert_eq!(pinentry.calls(), vec![(false, None)]);
+        assert_eq!(signer.verifies, 1);
     }
 
     #[derive(Debug, PartialEq, Eq)]

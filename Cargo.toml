@@ -14,7 +14,6 @@ keyroost-transport = { version = "0.14.0" }
 p256 = "0.13"
 p384 = "0.13"
 p521 = "0.13"
-pinentry = "0.8"
 sha2 = "0.10"
 signature = "2"
 ssh-agent-lib = "0.6"

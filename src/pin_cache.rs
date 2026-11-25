@@ -7,7 +7,7 @@ use std::{
 use keyroost_transport::TransportError;
 use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
 
-use crate::pinentry::{Applet, Pinentry};
+use crate::pinentry::{Applet, PinPromptOptions, Pinentry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PinCacheKey {
@@ -177,14 +177,48 @@ pub(crate) fn verify_pin_with_cache(
         }
     }
 
-    let Some(fresh_pin) = pinentry.prompt_pin(applet, serial)? else {
+    let use_external_cache = allow_cache && serial.is_some() && pinentry.external_cache_enabled();
+    let Some(fresh_pin) = pinentry.prompt_pin(
+        applet,
+        serial,
+        PinPromptOptions {
+            allow_external_cache: use_external_cache,
+            error: None,
+        },
+    )?
+    else {
         return Ok(false);
     };
-    verify(fresh_pin.expose_secret().as_bytes())?;
-    if allow_cache && let Some(cache) = pin_cache {
-        cache.insert(applet, serial, fresh_pin);
+
+    match verify(fresh_pin.expose_secret().as_bytes()) {
+        Ok(()) => {
+            if allow_cache && let Some(cache) = pin_cache {
+                cache.insert(applet, serial, fresh_pin);
+            }
+            Ok(true)
+        }
+        Err(err) if use_external_cache && is_wrong_pin(&err) => {
+            tracing::debug!(
+                %applet,
+                ?serial,
+                "PIN from external-cache-enabled pinentry rejected by card, retrying once without external cache"
+            );
+            let Some(retry_pin) = pinentry.prompt_pin(
+                applet,
+                serial,
+                PinPromptOptions {
+                    allow_external_cache: false,
+                    error: Some("Incorrect PIN"),
+                },
+            )?
+            else {
+                return Ok(false);
+            };
+            verify(retry_pin.expose_secret().as_bytes())?;
+            Ok(true)
+        }
+        Err(err) => Err(err.into()),
     }
-    Ok(true)
 }
 
 #[cfg(test)]

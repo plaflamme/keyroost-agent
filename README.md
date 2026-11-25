@@ -64,7 +64,7 @@ Available CLI options:
 - `--applet <auto|piv|openpgp|both>`: Smart-card applet to expose (default: `auto`, enabling applets with usable SSH identities)
 - `--connection <auto|persistent|ephemeral>`: Smart-card connection mode (default: `auto`, using `persistent` for a single active applet and `ephemeral` when both are active)
 - `--idle-timeout <DURATION>`: Idle timeout after which persistent smart-card sessions are released, e.g. `30s`, `30m`, `1h` (`0` disables; default: `30m`)
-- `--pin-cache <none|memory>`: PIN caching strategy (default: `none`; `memory` caches PINs in process memory)
+- `--pin-cache <none|memory|pinentry>`: PIN caching strategy (default: `none`; `memory` caches PINs in process memory; `pinentry` delegates caching to `pinentry`'s external password cache / OS keyring via `OPTION allow-external-password-cache` and `SETKEYINFO`)
 - `--pin-cache-ttl <DURATION>`: Sliding TTL for cached PINs in `memory` mode, e.g. `30s`, `10m`, `1h` (default: `10m`)
 - `--pin-cache-max-ttl <DURATION>`: Optional absolute maximum lifetime for cached PINs (`0` disables the cap; default: `0`)
 - `-v, --verbose` / `-q, --quiet`: Increase or decrease logging verbosity

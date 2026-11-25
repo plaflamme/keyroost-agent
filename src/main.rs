@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use keyroost_agent::{ConnectionMode, PinCacheConfig};
+use keyroost_agent::{ConnectionMode, PinCacheStrategy};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum AppletSelection {
@@ -28,15 +28,16 @@ enum PinCacheMode {
     #[default]
     None,
     Memory,
+    Pinentry,
 }
 
 fn resolve_pin_cache(
     mode: PinCacheMode,
     ttl: Duration,
     max_ttl: Duration,
-) -> Result<Option<PinCacheConfig>, String> {
+) -> Result<PinCacheStrategy, String> {
     match mode {
-        PinCacheMode::None => Ok(None),
+        PinCacheMode::None => Ok(PinCacheStrategy::None),
         PinCacheMode::Memory => {
             if ttl.is_zero() {
                 return Err(
@@ -45,8 +46,9 @@ fn resolve_pin_cache(
                 );
             }
             let max_ttl = (!max_ttl.is_zero()).then_some(max_ttl);
-            Ok(Some(PinCacheConfig { ttl, max_ttl }))
+            Ok(PinCacheStrategy::Memory { ttl, max_ttl })
         }
+        PinCacheMode::Pinentry => Ok(PinCacheStrategy::Pinentry),
     }
 }
 
@@ -253,12 +255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_level(opts.verbosity)
         .init();
 
-    let pin_cache_config = resolve_pin_cache(
-        opts.pin_cache,
-        opts.pin_cache_ttl,
-        opts.pin_cache_max_ttl,
-    )?;
-    if pin_cache_config.is_some() {
+    let pin_cache_strategy =
+        resolve_pin_cache(opts.pin_cache, opts.pin_cache_ttl, opts.pin_cache_max_ttl)?;
+    if matches!(pin_cache_strategy, PinCacheStrategy::Memory { .. }) {
         harden_process_memory();
     }
 
@@ -320,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if resolved.use_piv && resolved.use_openpgp && opts.pin_cache == PinCacheMode::None {
         tracing::info!(
-            "both PIV and OpenPGP applets are active in ephemeral mode; consider --pin-cache=memory to avoid repeated PIN prompts when switching applets"
+            "both PIV and OpenPGP applets are active in ephemeral mode; consider --pin-cache=memory or --pin-cache=pinentry to avoid repeated PIN prompts when switching applets"
         );
     }
 
@@ -337,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resolved.connection_mode,
             idle_timeout,
             false,
-            pin_cache_config,
+            pin_cache_strategy,
         )
         .await?;
     } else if let Some(listener) = systemd_listener()? {
@@ -349,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resolved.connection_mode,
             idle_timeout,
             true,
-            pin_cache_config,
+            pin_cache_strategy,
         )
         .await?;
     } else {
@@ -366,7 +365,7 @@ mod tests {
         resolve_pin_cache,
     };
     use clap::Parser;
-    use keyroost_agent::{ConnectionMode, PinCacheConfig};
+    use keyroost_agent::{ConnectionMode, PinCacheStrategy};
     use std::time::Duration;
 
     #[test]
@@ -416,13 +415,20 @@ mod tests {
         assert_eq!(cli.pin_cache, PinCacheMode::Memory);
         assert_eq!(cli.pin_cache_ttl, Duration::from_secs(30));
         assert_eq!(cli.pin_cache_max_ttl, Duration::from_hours(1));
+
+        let pinentry_cli = Cli::try_parse_from(["keyroost-agent", "--pin-cache=pinentry"]).unwrap();
+        assert_eq!(pinentry_cli.pin_cache, PinCacheMode::Pinentry);
     }
 
     #[test]
     fn resolve_pin_cache_validates_ttl_and_max_ttl() {
         assert_eq!(
             resolve_pin_cache(PinCacheMode::None, Duration::ZERO, Duration::ZERO),
-            Ok(None)
+            Ok(PinCacheStrategy::None)
+        );
+        assert_eq!(
+            resolve_pin_cache(PinCacheMode::Pinentry, Duration::ZERO, Duration::ZERO),
+            Ok(PinCacheStrategy::Pinentry)
         );
         assert!(resolve_pin_cache(PinCacheMode::Memory, Duration::ZERO, Duration::ZERO).is_err());
         assert_eq!(
@@ -431,10 +437,10 @@ mod tests {
                 Duration::from_mins(10),
                 Duration::ZERO,
             ),
-            Ok(Some(PinCacheConfig {
+            Ok(PinCacheStrategy::Memory {
                 ttl: Duration::from_mins(10),
                 max_ttl: None,
-            }))
+            })
         );
         assert_eq!(
             resolve_pin_cache(
@@ -442,10 +448,10 @@ mod tests {
                 Duration::from_mins(5),
                 Duration::from_hours(1),
             ),
-            Ok(Some(PinCacheConfig {
+            Ok(PinCacheStrategy::Memory {
                 ttl: Duration::from_mins(5),
                 max_ttl: Some(Duration::from_hours(1)),
-            }))
+            })
         );
     }
 

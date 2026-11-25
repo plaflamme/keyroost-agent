@@ -531,7 +531,7 @@ mod tests {
     };
     use crate::{
         pin_cache::PinCache,
-        pinentry::{Applet, Pinentry},
+        pinentry::{Applet, PinPromptOptions, Pinentry},
     };
     use keyroost_openpgp::{
         AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey, RsaAttributes,
@@ -543,27 +543,48 @@ mod tests {
         secrecy::{ExposeSecret, SecretBox},
         ssh_key::{Algorithm, HashAlg},
     };
-    use std::{cell::Cell, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        time::Duration,
+    };
 
     fn secret(pin: &str) -> SecretBox<str> {
         SecretBox::from(Box::<str>::from(pin))
     }
 
     struct MockPinentry {
-        pin: Option<&'static str>,
-        prompts: Cell<usize>,
+        default_pin: Option<&'static str>,
+        responses: RefCell<VecDeque<Option<&'static str>>>,
+        external_cache: bool,
+        calls: RefCell<Vec<(bool, Option<String>)>>,
     }
 
     impl MockPinentry {
         fn new(pin: Option<&'static str>) -> Self {
             Self {
-                pin,
-                prompts: Cell::new(0),
+                default_pin: pin,
+                responses: RefCell::new(VecDeque::new()),
+                external_cache: false,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_external_cache(responses: impl IntoIterator<Item = Option<&'static str>>) -> Self {
+            Self {
+                default_pin: None,
+                responses: RefCell::new(responses.into_iter().collect()),
+                external_cache: true,
+                calls: RefCell::new(Vec::new()),
             }
         }
 
         fn prompts(&self) -> usize {
-            self.prompts.get()
+            self.calls.borrow().len()
+        }
+
+        fn calls(&self) -> Vec<(bool, Option<String>)> {
+            self.calls.borrow().clone()
         }
     }
 
@@ -572,11 +593,22 @@ mod tests {
             &self,
             _applet: Applet,
             _serial: Option<u128>,
+            options: PinPromptOptions<'_>,
         ) -> Result<Option<SecretBox<str>>, crate::Error> {
-            self.prompts.set(self.prompts.get() + 1);
-            Ok(self
-                .pin
-                .map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
+            self.calls.borrow_mut().push((
+                options.allow_external_cache,
+                options.error.map(ToOwned::to_owned),
+            ));
+            let pin = self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.default_pin);
+            Ok(pin.map(|value| SecretBox::new(value.to_owned().into_boxed_str())))
+        }
+
+        fn external_cache_enabled(&self) -> bool {
+            self.external_cache
         }
     }
 
@@ -994,6 +1026,33 @@ mod tests {
             assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
             assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
         }
+    }
+
+    #[test]
+    fn external_cache_wrong_pin_retries_once_without_external_cache_and_with_error() {
+        let pinentry = MockPinentry::with_external_cache([Some("stale1"), Some("123456")]);
+        let mut signer = MockSigner::new(false, vec![4, 5, 6]);
+
+        let res = sign_with_pin(
+            &mut signer,
+            KeyCrt::Auth,
+            b"digest",
+            Some(1234),
+            &pinentry,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(res, Some(vec![4, 5, 6]));
+        assert_eq!(
+            pinentry.calls(),
+            vec![(true, None), (false, Some("Incorrect PIN".to_owned()))]
+        );
+        assert_eq!(signer.verified_refs, vec![PW1_OTHER, PW1_OTHER]);
+        assert_eq!(
+            signer.verified_pins,
+            vec![b"stale1".to_vec(), b"123456".to_vec()]
+        );
     }
 
     #[test]

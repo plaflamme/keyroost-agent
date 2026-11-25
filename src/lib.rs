@@ -29,13 +29,21 @@ pub enum ConnectionMode {
     Ephemeral,
 }
 
-/// Configuration for in-memory smart-card PIN caching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PinCacheConfig {
-    /// Sliding time-to-live refreshed on each successful cached PIN verification.
-    pub ttl: Duration,
-    /// Optional absolute maximum lifetime from initial PIN entry (`None` or zero means no cap).
-    pub max_ttl: Option<Duration>,
+/// Strategy for smart-card PIN caching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PinCacheStrategy {
+    /// Do not cache PINs; prompt on every card verification.
+    #[default]
+    None,
+    /// Cache PINs in process memory for the configured TTL.
+    Memory {
+        /// Sliding time-to-live refreshed on each successful cached PIN verification.
+        ttl: Duration,
+        /// Optional absolute maximum lifetime from initial PIN entry (`None` or zero means no cap).
+        max_ttl: Option<Duration>,
+    },
+    /// Delegate PIN caching to `pinentry`'s external password cache (OS keyring).
+    Pinentry,
 }
 
 /// Parse a human-friendly duration string into a [`Duration`].
@@ -323,7 +331,7 @@ pub async fn run(
     connection_mode: ConnectionMode,
     idle_timeout: Option<Duration>,
     exit_on_idle: bool,
-    pin_cache: Option<PinCacheConfig>,
+    pin_cache: PinCacheStrategy,
 ) -> Result<(), std::io::Error> {
     let listener = UnixListener::bind(socket_path)?;
     run_with_listener(
@@ -353,10 +361,16 @@ pub async fn run_with_listener(
     connection_mode: ConnectionMode,
     idle_timeout: Option<Duration>,
     exit_on_idle: bool,
-    pin_cache: Option<PinCacheConfig>,
+    pin_cache: PinCacheStrategy,
 ) -> Result<(), std::io::Error> {
-    let pin_cache = pin_cache.map(|cfg| pin_cache::PinCache::new(cfg.ttl, cfg.max_ttl));
-    let pinentry = pinentry::SystemPinentry::new(pinentry_binary);
+    let (pin_cache, external_pin_cache) = match pin_cache {
+        PinCacheStrategy::None => (None, false),
+        PinCacheStrategy::Memory { ttl, max_ttl } => {
+            (Some(pin_cache::PinCache::new(ttl, max_ttl)), false)
+        }
+        PinCacheStrategy::Pinentry => (None, true),
+    };
+    let pinentry = pinentry::SystemPinentry::new(pinentry_binary, external_pin_cache);
     let idle_tracker = IdleTracker::new();
     let agent = KeyroostAgent {
         piv: piv_reader.map(|reader| {
@@ -409,9 +423,9 @@ fn format_credential(credential: &PublicCredential) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortOnDrop, ConnectionMode, IdleTracker, KeyroostAgent, format_credential, openpgp,
-        parse_duration, pinentry, piv, run_idle_disconnect_loop, run_with_idle_exit,
-        run_with_listener,
+        AbortOnDrop, ConnectionMode, IdleTracker, KeyroostAgent, PinCacheStrategy,
+        format_credential, openpgp, parse_duration, pinentry, piv, run_idle_disconnect_loop,
+        run_with_idle_exit, run_with_listener,
     };
     use crate::{pin_cache::PinCache, pinentry::Applet};
     use ssh_agent_lib::{
@@ -615,7 +629,7 @@ mod tests {
             ConnectionMode::Persistent,
             Some(Duration::from_millis(80)),
             true,
-            None,
+            PinCacheStrategy::None,
         )
         .await;
 

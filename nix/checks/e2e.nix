@@ -179,6 +179,7 @@ pkgs.lib.optionalAttrs (system == "x86_64-linux") (
     ) suites
     ++ [
       (mkCheck "e2e-pin-cache" ./pin-cache.nix)
+      (mkCheck "e2e-pinentry-cache" ./pinentry-cache.nix)
     ]
   )
 )

@@ -98,12 +98,15 @@ in
         type = lib.types.enum [
           "none"
           "memory"
+          "pinentry"
         ];
         default = "none";
         description = ''
           PIN caching strategy passed via {option}`--pin-cache`.
           `"none"` disables caching; `"memory"` caches PINs in process memory
-          for the configured TTL.
+          for the configured TTL; `"pinentry"` delegates PIN caching to
+          `pinentry`'s external password cache (for example GNOME Keyring,
+          KWallet, or macOS Keychain).
         '';
       };
 
