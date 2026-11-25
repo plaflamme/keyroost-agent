@@ -34,6 +34,46 @@ in
       '';
     };
 
+    applets = lib.mkOption {
+      type = lib.types.enum [
+        "auto"
+        "piv"
+        "openpgp"
+        "both"
+      ];
+      default = "auto";
+      description = ''
+        Smart-card applet selection passed via {option}`--applet`.
+        `"auto"` enables applets that have usable SSH identities; `"piv"`,
+        `"openpgp"`, and `"both"` explicitly select the corresponding applet(s).
+      '';
+    };
+
+    connection = lib.mkOption {
+      type = lib.types.enum [
+        "auto"
+        "persistent"
+        "ephemeral"
+      ];
+      default = "auto";
+      description = ''
+        Smart-card connection mode passed via {option}`--connection`.
+        `"auto"` uses `"persistent"` when a single applet is active and
+        `"ephemeral"` when both applets are active.
+      '';
+    };
+
+    idleTimeout = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "30m";
+      description = ''
+        Idle timeout after which persistent smart-card sessions are released,
+        passed via {option}`--idle-timeout` (for example `"30s"`, `"30m"`,
+        `"1h"`, or `"0"` to disable).
+      '';
+    };
+
     pinentry = {
       package = lib.mkPackageOption pkgs "pinentry-gnome3" {
         nullable = true;
@@ -130,6 +170,11 @@ in
           ExecStart = lib.concatStringsSep " " (
             [ "${cfg.package}/bin/keyroost-agent" ]
             ++ lib.optional (cfg.reader != null) "--reader=${lib.escapeShellArg cfg.reader}"
+            ++ lib.optional (cfg.applets != "auto") "--applet=${cfg.applets}"
+            ++ lib.optional (cfg.connection != "auto") "--connection=${cfg.connection}"
+            ++ lib.optional (
+              cfg.idleTimeout != null
+            ) "--idle-timeout=${lib.escapeShellArg cfg.idleTimeout}"
             ++ lib.optional (
               cfg.pinentry.package != null
             ) "--pinentry=${lib.getExe' cfg.pinentry.package cfg.pinentry.program}"

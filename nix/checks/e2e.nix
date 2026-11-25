@@ -85,6 +85,7 @@ let
   suites = [
     "piv"
     "openpgp"
+    "dual"
   ];
 
   mkCheck = name: path: {

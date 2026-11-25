@@ -69,13 +69,23 @@ in
           == socket
       )
 
-      # Authenticate over SSH with both Auth and Sign keys via socket-activated keyroost-agent
-      for ssh_cmd in [${sshCmd authPubFile}, ${sshCmd signPubFile}]:
-          host.succeed(${toPythonString (su "printf '123456\n' > /tmp/pinentry-responses")})
-          ssh_output = host.succeed(ssh_cmd).strip()
-          assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
+      # First Auth SSH authentication prompts for PW1_OTHER
+      host.succeed(${toPythonString (su "printf '123456\n' > /tmp/pinentry-responses")})
+      ssh_output = host.succeed(${sshCmd authPubFile}).strip()
+      assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
 
-      # Verify mockPinentry was invoked with the expected card description and GETPIN count
+      # Second Auth SSH authentication reuses the persistent session's verified PW1_OTHER without prompting
+      host.succeed(${toPythonString (su ": > /tmp/pinentry-responses")})
+      ssh_output = host.succeed(${sshCmd authPubFile}).strip()
+      assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
+
+      # Sign key uses PW1_SIGN (a separate OpenPGP PW1 mode from PW1_OTHER), so it prompts once
+      host.succeed(${toPythonString (su "printf '123456\n' > /tmp/pinentry-responses")})
+      ssh_output = host.succeed(${sshCmd signPubFile}).strip()
+      assert ssh_output == "ok", f"Expected 'ok', got {ssh_output!r}"
+
+      # Verify mockPinentry was invoked with the expected card description and GETPIN count:
+      # 1 for Auth (reused on second Auth via persistent session) + 1 for Sign = 2
       pinentry_log = host.succeed("cat /tmp/pinentry-commands.log")
       assert "SETDESC Please unlock OpenPGP card 87654321" in pinentry_log, f"Missing SETDESC in pinentry log:\n{pinentry_log}"
       assert pinentry_log.count("GETPIN") == 2, f"Expected 2 GETPIN calls, got:\n{pinentry_log}"

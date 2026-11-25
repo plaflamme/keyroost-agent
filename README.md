@@ -61,6 +61,9 @@ Available CLI options:
 - `-s, --socket <SOCKET>`: Bind the agent to the specified Unix-domain socket (otherwise systemd socket activation via `LISTEN_FDS` is used)
 - `-r, --reader <READER>`: Smart-card reader whose name contains this text (case-insensitive)
 - `-p, --pinentry <PINENTRY>`: Path or name of the pinentry binary to use for PIN prompts
+- `--applet <auto|piv|openpgp|both>`: Smart-card applet to expose (default: `auto`, enabling applets with usable SSH identities)
+- `--connection <auto|persistent|ephemeral>`: Smart-card connection mode (default: `auto`, using `persistent` for a single active applet and `ephemeral` when both are active)
+- `--idle-timeout <DURATION>`: Idle timeout after which persistent smart-card sessions are released, e.g. `30s`, `30m`, `1h` (`0` disables; default: `30m`)
 - `--pin-cache <none|memory>`: PIN caching strategy (default: `none`; `memory` caches PINs in process memory)
 - `--pin-cache-ttl <DURATION>`: Sliding TTL for cached PINs in `memory` mode, e.g. `30s`, `10m`, `1h` (default: `10m`)
 - `--pin-cache-max-ttl <DURATION>`: Optional absolute maximum lifetime for cached PINs (`0` disables the cap; default: `0`)
