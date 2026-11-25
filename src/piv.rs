@@ -392,10 +392,17 @@ impl PivSshAgent {
                     connection_mode = ?ConnectionMode::Ephemeral,
                     "requesting PIV identities"
                 );
-                with_piv_transaction(&self.reader, &self.session_state, |session| {
-                    let serial = session.status().ok().and_then(|status| status.serial);
-                    list_ssh_identities(&self.config.slots, session, serial)
+                let reader = self.reader.clone();
+                let slots = self.config.slots.clone();
+                let session_state = Arc::clone(&self.session_state);
+                tokio::task::spawn_blocking(move || {
+                    with_piv_transaction(&reader, &session_state, |session| {
+                        let serial = session.status().ok().and_then(|status| status.serial);
+                        list_ssh_identities(&slots, session, serial)
+                    })
                 })
+                .await
+                .map_err(|err| crate::Error::Other(Box::new(err)))?
             }
             PivBackend::Persistent(worker) => {
                 tracing::debug!(
@@ -446,20 +453,29 @@ impl PivSshAgent {
     ) -> Result<SignResult<PivCachedIdentity>, crate::Error> {
         match &self.backend {
             PivBackend::Ephemeral => {
-                with_piv_transaction(&self.reader, &self.session_state, |session| {
-                    let mut serial = session.status().ok().and_then(|status| status.serial);
-                    sign_in_session(
-                        &self.config.slots,
-                        session,
-                        &mut serial,
-                        public_credential,
-                        cached,
-                        data,
-                        rsa_sig_hash,
-                        &self.config.pinentry,
-                        self.config.pin_cache.as_ref(),
-                    )
+                let reader = self.reader.clone();
+                let config = self.config.clone();
+                let session_state = Arc::clone(&self.session_state);
+                let public_credential = public_credential.clone();
+                let data = data.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    with_piv_transaction(&reader, &session_state, |session| {
+                        let mut serial = session.status().ok().and_then(|status| status.serial);
+                        sign_in_session(
+                            &config.slots,
+                            session,
+                            &mut serial,
+                            &public_credential,
+                            cached,
+                            &data,
+                            rsa_sig_hash,
+                            &config.pinentry,
+                            config.pin_cache.as_ref(),
+                        )
+                    })
                 })
+                .await
+                .map_err(|err| crate::Error::Other(Box::new(err)))?
             }
             PivBackend::Persistent(worker) => {
                 let response = self

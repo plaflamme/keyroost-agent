@@ -149,10 +149,18 @@ impl OpenPgpSshAgent {
         }
     }
 
-    pub(super) fn disconnect(&self) {
+    pub(super) async fn disconnect(&self) {
         if let OpenPgpBackend::Persistent(slot) = &self.backend {
-            slot.disconnect();
+            let slot = slot.clone();
+            let _ = tokio::task::spawn_blocking(move || slot.disconnect()).await;
         }
+    }
+
+    pub(super) fn probe_identities(reader: &str) -> Result<bool, crate::Error> {
+        let mut session = OpenPgpSession::open(reader)?;
+        let status = session.status()?;
+        let status_view = OpenPgpStatusView::from(&status);
+        list_identities(&mut session, &status_view).map(|ids| !ids.is_empty())
     }
 
     fn with_session<T>(
@@ -179,12 +187,7 @@ impl OpenPgpSshAgent {
         }
     }
 
-    pub(super) fn request_identities(&self) -> Result<Vec<Identity>, crate::Error> {
-        self.request_identities_with_metadata()
-            .map(|items| items.into_iter().map(|(identity, _)| identity).collect())
-    }
-
-    pub(super) fn request_identities_with_metadata(
+    pub(super) async fn request_identities_with_metadata(
         &self,
     ) -> Result<Vec<(Identity, OpenPgpCachedIdentity)>, crate::Error> {
         let mode = match self.backend {
@@ -192,41 +195,55 @@ impl OpenPgpSshAgent {
             OpenPgpBackend::Persistent(_) => ConnectionMode::Persistent,
         };
         tracing::debug!(connection_mode = ?mode, "requesting OpenPGP identities");
-        self.with_session(|session, status| {
-            let status_view = OpenPgpStatusView::from(status);
-            let serial = status_view.full_serial;
-            let identities = list_identities(session, &status_view)?;
-            Ok(identities
-                .into_iter()
-                .inspect(|id| tracing::info!("found usable OpenPGP identity on slot {:?}", id.slot))
-                .map(|id| {
-                    let meta = OpenPgpCachedIdentity {
-                        slot: id.slot,
-                        attrs: id.attrs,
-                        serial,
-                    };
-                    (id.ssh_identity, meta)
-                })
-                .collect())
+        let agent = self.clone();
+        tokio::task::spawn_blocking(move || {
+            agent.with_session(|session, status| {
+                let status_view = OpenPgpStatusView::from(status);
+                let serial = status_view.full_serial;
+                let identities = list_identities(session, &status_view)?;
+                Ok(identities
+                    .into_iter()
+                    .inspect(|id| {
+                        tracing::info!("found usable OpenPGP identity on slot {:?}", id.slot);
+                    })
+                    .map(|id| {
+                        let meta = OpenPgpCachedIdentity {
+                            slot: id.slot,
+                            attrs: id.attrs,
+                            serial,
+                        };
+                        (id.ssh_identity, meta)
+                    })
+                    .collect())
+            })
         })
+        .await
+        .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
-    pub(super) fn sign(
+    pub(super) async fn sign(
         &self,
         public_credential: &PublicCredential,
         cached: Option<OpenPgpCachedIdentity>,
         data: &[u8],
         rsa_sig_hash: Option<HashAlg>,
     ) -> Result<SignResult<OpenPgpCachedIdentity>, crate::Error> {
-        match self.sign_once(public_credential, cached, data, rsa_sig_hash) {
-            Err(err) if cached.is_some() && err.is_transport_error() => {
-                tracing::debug!(
-                    "cached OpenPGP sign hit transport error, retrying with fresh scan: {err}"
-                );
-                self.sign_once(public_credential, None, data, rsa_sig_hash)
+        let agent = self.clone();
+        let public_credential = public_credential.clone();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            match agent.sign_once(&public_credential, cached, &data, rsa_sig_hash) {
+                Err(err) if cached.is_some() && err.is_transport_error() => {
+                    tracing::debug!(
+                        "cached OpenPGP sign hit transport error, retrying with fresh scan: {err}"
+                    );
+                    agent.sign_once(&public_credential, None, &data, rsa_sig_hash)
+                }
+                other => other,
             }
-            other => other,
-        }
+        })
+        .await
+        .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
     fn sign_once(

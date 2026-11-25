@@ -203,15 +203,7 @@ pub fn probe_piv_identities(options: &PivOptions) -> Result<bool, std::io::Error
 ///
 /// Returns an error if communicating with the `OpenPGP` applet fails.
 pub fn probe_openpgp_identities(options: &OpenPgpOptions) -> Result<bool, std::io::Error> {
-    let agent = openpgp::OpenPgpSshAgent::new(
-        options.reader.clone(),
-        pinentry::SystemPinentry::default(),
-        ConnectionMode::Ephemeral,
-        None,
-    );
-    agent
-        .request_identities()
-        .map(|identities| !identities.is_empty())
+    openpgp::OpenPgpSshAgent::probe_identities(&options.reader)
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
@@ -314,7 +306,7 @@ impl KeyroostAgent {
             piv.disconnect().await;
         }
         if let Some(openpgp) = &self.openpgp {
-            openpgp.disconnect();
+            openpgp.disconnect().await;
         }
     }
 
@@ -345,7 +337,7 @@ impl KeyroostAgent {
         Ok(Some(result.outcome))
     }
 
-    fn sign_openpgp(
+    async fn sign_openpgp(
         &self,
         credential: &PublicCredential,
         cached: Option<identity_cache::OpenPgpCachedIdentity>,
@@ -355,7 +347,7 @@ impl KeyroostAgent {
         let Some(openpgp) = &self.openpgp else {
             return Ok(None);
         };
-        let result = openpgp.sign(credential, cached, data, rsa_sig_hash)?;
+        let result = openpgp.sign(credential, cached, data, rsa_sig_hash).await?;
         if let Some(discovered) = result.discovered {
             self.identity_cache.replace_openpgp(discovered);
         }
@@ -379,7 +371,7 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
             identities.extend(discovered.into_iter().map(|(id, _)| id));
         }
         if let Some(openpgp) = &self.openpgp {
-            let discovered = openpgp.request_identities_with_metadata()?;
+            let discovered = openpgp.request_identities_with_metadata().await?;
             self.identity_cache.replace_openpgp(
                 discovered
                     .iter()
@@ -425,7 +417,8 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
                         Some(pgp_cached),
                         &request.data,
                         rsa_sig_hash,
-                    )?
+                    )
+                    .await?
                 }
             };
 
@@ -462,8 +455,9 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         }
 
         if !skip_openpgp
-            && let Some(outcome) =
-                self.sign_openpgp(&request.credential, None, &request.data, rsa_sig_hash)?
+            && let Some(outcome) = self
+                .sign_openpgp(&request.credential, None, &request.data, rsa_sig_hash)
+                .await?
         {
             match outcome {
                 identity_cache::SignOutcome::Signed(signature) => {
