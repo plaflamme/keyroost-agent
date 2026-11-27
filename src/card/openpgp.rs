@@ -1,41 +1,36 @@
 use std::sync::{Arc, Mutex};
 
-use keyroost_openpgp::{
-    self as pgp, AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey,
-};
+use keyroost_openpgp::{self as pgp, AlgorithmAttributes, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey};
 use keyroost_transport::{OpenPgpSession, OpenPgpStatus, TransportError};
-use sha2::Digest;
-use ssh_agent_lib::{
-    proto::{Identity, PublicCredential},
-    ssh_key::{
-        Algorithm, HashAlg, Mpint, Signature,
-        public::{EcdsaPublicKey, Ed25519PublicKey, KeyData, RsaPublicKey},
-        sec1::EncodedPoint,
-    },
-};
 
 use crate::{
     ConnectionMode,
-    identity_cache::{OpenPgpCachedIdentity, SignOutcome, SignResult},
+    card::CardOperationOutcome,
     pin_cache::{PinCache, verify_pin_with_cache},
-    pinentry::{Applet, Pinentry, SystemPinentry},
+    pinentry::{Applet, Pinentry, PinentryEnv, SystemPinentry},
 };
 
-const OPENPGP_SLOTS: [KeyCrt; 2] = [KeyCrt::Auth, KeyCrt::Sign];
-
-// RFC 8017 §9.2 DER-encoded DigestInfo prefixes (without the digest bytes).
-const SHA256_DIGEST_INFO_PREFIX: &[u8] = &[
-    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-    0x00, 0x04, 0x20,
-];
-const SHA512_DIGEST_INFO_PREFIX: &[u8] = &[
-    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
-    0x00, 0x04, 0x40,
-];
+#[derive(Clone, Debug)]
+pub(crate) struct OpenPgpKeyInfo {
+    pub(crate) slot: KeyCrt,
+    pub(crate) attrs: AlgorithmAttributes,
+    pub(crate) public_key: PublicKey,
+    #[allow(dead_code)]
+    pub(crate) fingerprint: [u8; 20],
+    #[allow(dead_code)]
+    pub(crate) aid: Vec<u8>,
+    pub(crate) serial: Option<u32>,
+    pub(crate) full_serial: Option<u128>,
+}
 
 struct OpenPgpStatusView<'a> {
+    aid: &'a [u8],
     sig_attrs: &'a [u8],
+    dec_attrs: &'a [u8],
     aut_attrs: &'a [u8],
+    fingerprint_sig: [u8; 20],
+    fingerprint_dec: [u8; 20],
+    fingerprint_aut: [u8; 20],
     serial: Option<u32>,
     full_serial: Option<u128>,
 }
@@ -43,18 +38,17 @@ struct OpenPgpStatusView<'a> {
 impl<'a> From<&'a OpenPgpStatus> for OpenPgpStatusView<'a> {
     fn from(status: &'a OpenPgpStatus) -> Self {
         Self {
+            aid: &status.aid,
             sig_attrs: &status.sig_attrs,
+            dec_attrs: &status.dec_attrs,
             aut_attrs: &status.aut_attrs,
+            fingerprint_sig: status.fingerprint_sig,
+            fingerprint_dec: status.fingerprint_dec,
+            fingerprint_aut: status.fingerprint_aut,
             serial: status.serial(),
             full_serial: status.full_serial(),
         }
     }
-}
-
-struct OpenPgpIdentity {
-    slot: KeyCrt,
-    attrs: AlgorithmAttributes,
-    ssh_identity: Identity,
 }
 
 struct PersistentOpenPgp<S = OpenPgpSession, St = OpenPgpStatus> {
@@ -122,15 +116,15 @@ enum OpenPgpBackend {
 }
 
 #[derive(Clone)]
-pub(super) struct OpenPgpSshAgent {
+pub(crate) struct OpenPgpCard {
     reader: String,
     pinentry: SystemPinentry,
     backend: OpenPgpBackend,
     pin_cache: Option<PinCache>,
 }
 
-impl OpenPgpSshAgent {
-    pub(super) fn new(
+impl OpenPgpCard {
+    pub(crate) fn new(
         reader: String,
         pinentry: SystemPinentry,
         connection_mode: ConnectionMode,
@@ -149,18 +143,26 @@ impl OpenPgpSshAgent {
         }
     }
 
-    pub(super) async fn disconnect(&self) {
+    pub(crate) async fn disconnect(&self) {
         if let OpenPgpBackend::Persistent(slot) = &self.backend {
             let slot = slot.clone();
             let _ = tokio::task::spawn_blocking(move || slot.disconnect()).await;
         }
     }
 
-    pub(super) fn probe_identities(reader: &str) -> Result<bool, crate::Error> {
+    pub(crate) fn list_keys_ephemeral(
+        reader: &str,
+        slots: &[KeyCrt],
+    ) -> Result<Vec<OpenPgpKeyInfo>, crate::Error> {
         let mut session = OpenPgpSession::open(reader)?;
         let status = session.status()?;
         let status_view = OpenPgpStatusView::from(&status);
-        list_identities(&mut session, &status_view).map(|ids| !ids.is_empty())
+        list_keys_in_session(&mut session, &status_view, slots)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn probe_keys(reader: &str, slots: &[KeyCrt]) -> Result<bool, crate::Error> {
+        Self::list_keys_ephemeral(reader, slots).map(|keys| !keys.is_empty())
     }
 
     fn with_session<T>(
@@ -187,85 +189,116 @@ impl OpenPgpSshAgent {
         }
     }
 
-    pub(super) async fn request_identities_with_metadata(
+    pub(crate) async fn list_keys(
         &self,
-    ) -> Result<Vec<(Identity, OpenPgpCachedIdentity)>, crate::Error> {
+        slots: &[KeyCrt],
+    ) -> Result<Vec<OpenPgpKeyInfo>, crate::Error> {
         let mode = match self.backend {
             OpenPgpBackend::Ephemeral => ConnectionMode::Ephemeral,
             OpenPgpBackend::Persistent(_) => ConnectionMode::Persistent,
         };
-        tracing::debug!(connection_mode = ?mode, "requesting OpenPGP identities");
-        let agent = self.clone();
+        tracing::debug!(connection_mode = ?mode, "requesting OpenPGP keys");
+        let card = self.clone();
+        let slots = slots.to_vec();
         tokio::task::spawn_blocking(move || {
-            agent.with_session(|session, status| {
+            card.with_session(|session, status| {
                 let status_view = OpenPgpStatusView::from(status);
-                let serial = status_view.full_serial;
-                let identities = list_identities(session, &status_view)?;
-                Ok(identities
-                    .into_iter()
-                    .inspect(|id| {
-                        tracing::info!("found usable OpenPGP identity on slot {:?}", id.slot);
-                    })
-                    .map(|id| {
-                        let meta = OpenPgpCachedIdentity {
-                            slot: id.slot,
-                            attrs: id.attrs,
-                            serial,
-                        };
-                        (id.ssh_identity, meta)
-                    })
-                    .collect())
+                list_keys_in_session(session, &status_view, &slots)
             })
         })
         .await
         .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
-    pub(super) async fn sign(
+    pub(crate) async fn sign_raw(
         &self,
-        public_credential: &PublicCredential,
-        cached: Option<OpenPgpCachedIdentity>,
+        slot: KeyCrt,
+        expected_serial: Option<u128>,
         data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<SignResult<OpenPgpCachedIdentity>, crate::Error> {
-        let agent = self.clone();
-        let public_credential = public_credential.clone();
+        prompt_desc: Option<&str>,
+        prompt_env: Option<&PinentryEnv>,
+    ) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+        let card = self.clone();
         let data = data.to_vec();
+        let prompt_desc = prompt_desc.map(ToOwned::to_owned);
+        let prompt_env = prompt_env.cloned();
         tokio::task::spawn_blocking(move || {
-            match agent.sign_once(&public_credential, cached, &data, rsa_sig_hash) {
-                Err(err) if cached.is_some() && err.is_transport_error() => {
-                    tracing::debug!(
-                        "cached OpenPGP sign hit transport error, retrying with fresh scan: {err}"
-                    );
-                    agent.sign_once(&public_credential, None, &data, rsa_sig_hash)
-                }
-                other => other,
-            }
+            card.with_session(|session, status| {
+                sign_raw_in_session(
+                    session,
+                    slot,
+                    status.full_serial(),
+                    expected_serial,
+                    &data,
+                    &card.pinentry,
+                    card.pin_cache.as_ref(),
+                    prompt_desc.as_deref(),
+                    prompt_env.as_ref(),
+                )
+            })
         })
         .await
         .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
-    fn sign_once(
+    #[allow(dead_code)]
+    pub(crate) async fn decrypt_rsa(
         &self,
-        public_credential: &PublicCredential,
-        cached: Option<OpenPgpCachedIdentity>,
-        data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<SignResult<OpenPgpCachedIdentity>, crate::Error> {
-        self.with_session(|session, status| {
-            let status_view = OpenPgpStatusView::from(status);
-            sign_in_session(
-                session,
-                &status_view,
-                public_credential,
-                cached,
-                data,
-                rsa_sig_hash,
-                &self.pinentry,
-                self.pin_cache.as_ref(),
-            )
+        expected_serial: Option<u128>,
+        cryptogram: &[u8],
+        prompt_desc: Option<&str>,
+        prompt_env: Option<&PinentryEnv>,
+    ) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+        let card = self.clone();
+        let cryptogram = cryptogram.to_vec();
+        let prompt_desc = prompt_desc.map(ToOwned::to_owned);
+        let prompt_env = prompt_env.cloned();
+        tokio::task::spawn_blocking(move || {
+            card.with_session(|session, status| {
+                decrypt_rsa_in_session(
+                    session,
+                    status.full_serial(),
+                    expected_serial,
+                    &cryptogram,
+                    &card.pinentry,
+                    card.pin_cache.as_ref(),
+                    prompt_desc.as_deref(),
+                    prompt_env.as_ref(),
+                )
+            })
         })
+        .await
+        .map_err(|err| crate::Error::Other(Box::new(err)))?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn decrypt_ecdh(
+        &self,
+        expected_serial: Option<u128>,
+        ephemeral_point: &[u8],
+        prompt_desc: Option<&str>,
+        prompt_env: Option<&PinentryEnv>,
+    ) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+        let card = self.clone();
+        let ephemeral_point = ephemeral_point.to_vec();
+        let prompt_desc = prompt_desc.map(ToOwned::to_owned);
+        let prompt_env = prompt_env.cloned();
+        tokio::task::spawn_blocking(move || {
+            card.with_session(|session, status| {
+                decrypt_ecdh_in_session(
+                    session,
+                    status.full_serial(),
+                    expected_serial,
+                    &ephemeral_point,
+                    &card.pinentry,
+                    card.pin_cache.as_ref(),
+                    prompt_desc.as_deref(),
+                    prompt_env.as_ref(),
+                )
+            })
+        })
+        .await
+        .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 }
 
@@ -283,155 +316,34 @@ fn is_openpgp_stale_apdu_error(err: &crate::Error) -> bool {
     )
 }
 
-#[expect(clippy::too_many_arguments)]
-fn sign_in_session(
+fn list_keys_in_session(
     session: &mut impl OpenPgpSlotSession,
     status: &OpenPgpStatusView<'_>,
-    public_credential: &PublicCredential,
-    cached: Option<OpenPgpCachedIdentity>,
-    data: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
-    pinentry: &impl Pinentry,
-    pin_cache: Option<&PinCache>,
-) -> Result<SignResult<OpenPgpCachedIdentity>, crate::Error> {
-    let serial = status.full_serial;
-
-    if let Some(cached) = cached {
-        if serial == cached.serial {
-            match sign_slot(
-                session,
-                cached.slot,
-                cached.attrs,
-                serial,
-                data,
-                rsa_sig_hash,
-                pinentry,
-                pin_cache,
-            ) {
-                Ok(Some(signature)) => {
-                    return Ok(SignResult {
-                        discovered: None,
-                        outcome: SignOutcome::Signed(signature),
-                    });
-                }
-                Ok(None) => {
-                    return Ok(SignResult {
-                        discovered: None,
-                        outcome: SignOutcome::UserCancelled,
-                    });
-                }
-                Err(err) if is_openpgp_stale_apdu_error(&err) => {
-                    tracing::debug!(
-                        slot = ?cached.slot,
-                        "cached OpenPGP slot sign failed with stale APDU error, re-scanning: {err}"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
-        } else {
-            tracing::debug!(
-                cached_serial = ?cached.serial,
-                current_serial = ?serial,
-                "OpenPGP card serial changed; re-scanning slots"
-            );
-        }
-    }
-
-    let identities = list_identities(session, status)?;
-    let discovered: Vec<(PublicCredential, OpenPgpCachedIdentity)> = identities
-        .iter()
-        .map(|id| {
-            (
-                id.ssh_identity.credential.clone(),
-                OpenPgpCachedIdentity {
-                    slot: id.slot,
-                    attrs: id.attrs,
-                    serial,
-                },
-            )
-        })
-        .collect();
-
-    let identity = identities
-        .into_iter()
-        .find(|id| &id.ssh_identity.credential == public_credential);
-
-    let Some(identity) = identity else {
-        tracing::debug!("no matching OpenPGP identity for requested public key");
-        return Ok(SignResult {
-            discovered: Some(discovered),
-            outcome: SignOutcome::NotFound,
-        });
-    };
-
-    let outcome = match sign_slot(
-        session,
-        identity.slot,
-        identity.attrs,
-        serial,
-        data,
-        rsa_sig_hash,
-        pinentry,
-        pin_cache,
-    )? {
-        Some(signature) => SignOutcome::Signed(signature),
-        None => SignOutcome::UserCancelled,
-    };
-
-    Ok(SignResult {
-        discovered: Some(discovered),
-        outcome,
-    })
-}
-
-#[expect(clippy::too_many_arguments)]
-fn sign_slot(
-    session: &mut impl OpenPgpSigner,
-    slot: KeyCrt,
-    attrs: AlgorithmAttributes,
-    serial: Option<u128>,
-    data: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
-    pinentry: &impl Pinentry,
-    pin_cache: Option<&PinCache>,
-) -> Result<Option<Signature>, crate::Error> {
-    let prepared = prepare_sign_input(attrs, data, rsa_sig_hash)?;
-    let Some(signature) = sign_with_pin(session, slot, &prepared, serial, pinentry, pin_cache)?
-    else {
-        return Ok(None);
-    };
-
-    let signature = encode_signature(attrs, &signature, rsa_sig_hash)?;
-    Ok(Some(signature))
-}
-
-fn list_identities(
-    session: &mut impl OpenPgpSlotSession,
-    status: &OpenPgpStatusView<'_>,
-) -> Result<Vec<OpenPgpIdentity>, crate::Error> {
-    let mut identities = Vec::new();
-    for slot in OPENPGP_SLOTS {
-        match slot_to_ssh_identity(session, status, slot) {
-            Ok(Some(identity)) => identities.push(identity),
+    slots: &[KeyCrt],
+) -> Result<Vec<OpenPgpKeyInfo>, crate::Error> {
+    let mut keys = Vec::new();
+    for &slot in slots {
+        match read_slot_key(session, status, slot) {
+            Ok(Some(key)) => keys.push(key),
             Ok(None) => {}
             Err(err) if err.is_transport_error() => return Err(err),
             Err(err) => {
-                tracing::warn!("failed to configure slot {slot:?} as OpenPGP identity: {err}");
+                tracing::warn!("failed to read OpenPGP slot {slot:?}: {err}");
             }
         }
     }
-    Ok(identities)
+    Ok(keys)
 }
 
-fn slot_to_ssh_identity(
+fn read_slot_key(
     session: &mut impl OpenPgpSlotSession,
     status: &OpenPgpStatusView<'_>,
     slot: KeyCrt,
-) -> Result<Option<OpenPgpIdentity>, crate::Error> {
-    let raw_attrs = match slot {
-        KeyCrt::Sign => status.sig_attrs,
-        KeyCrt::Auth => status.aut_attrs,
-        KeyCrt::Decrypt => return Ok(None),
+) -> Result<Option<OpenPgpKeyInfo>, crate::Error> {
+    let (raw_attrs, fingerprint) = match slot {
+        KeyCrt::Sign => (status.sig_attrs, status.fingerprint_sig),
+        KeyCrt::Decrypt => (status.dec_attrs, status.fingerprint_dec),
+        KeyCrt::Auth => (status.aut_attrs, status.fingerprint_aut),
     };
 
     if raw_attrs.is_empty() {
@@ -457,185 +369,30 @@ fn slot_to_ssh_identity(
         Err(err) => return Err(err.into()),
     };
 
-    let Some(credential) = ssh_public_credentials(attrs, public_key)? else {
-        return Ok(None);
-    };
-
-    let comment = match status.serial {
-        Some(serial) => format!("OpenPGP {serial}:{slot:?}"),
-        None => format!("OpenPGP {slot:?}"),
-    };
-
-    Ok(Some(OpenPgpIdentity {
+    Ok(Some(OpenPgpKeyInfo {
         slot,
         attrs,
-        ssh_identity: Identity {
-            credential,
-            comment,
-        },
+        public_key,
+        fingerprint,
+        aid: status.aid.to_vec(),
+        serial: status.serial,
+        full_serial: status.full_serial,
     }))
 }
 
-fn ssh_public_credentials(
-    attrs: AlgorithmAttributes,
-    public_key: PublicKey,
-) -> Result<Option<PublicCredential>, crate::Error> {
-    let key_data = match (attrs, public_key) {
-        (AlgorithmAttributes::Rsa(_), PublicKey::Rsa { modulus, exponent }) => {
-            KeyData::Rsa(RsaPublicKey {
-                n: Mpint::from_positive_bytes(&modulus)?,
-                e: Mpint::from_positive_bytes(&exponent)?,
-            })
-        }
-        (
-            AlgorithmAttributes::Ecc {
-                kind: EccKind::EdDsa,
-                curve: Curve::Ed25519,
-                ..
-            },
-            PublicKey::Ecc { point },
-        ) => KeyData::Ed25519(Ed25519PublicKey::try_from(point.as_slice())?),
-        (
-            AlgorithmAttributes::Ecc {
-                kind: EccKind::Ecdsa,
-                curve: Curve::NistP256,
-                ..
-            },
-            PublicKey::Ecc { point },
-        ) => KeyData::Ecdsa(EcdsaPublicKey::NistP256(EncodedPoint::from_bytes(&point)?)),
-        (
-            AlgorithmAttributes::Ecc {
-                kind: EccKind::Ecdsa,
-                curve: Curve::NistP384,
-                ..
-            },
-            PublicKey::Ecc { point },
-        ) => KeyData::Ecdsa(EcdsaPublicKey::NistP384(EncodedPoint::from_bytes(&point)?)),
-        (
-            AlgorithmAttributes::Ecc {
-                kind: EccKind::Ecdsa,
-                curve: Curve::NistP521,
-                ..
-            },
-            PublicKey::Ecc { point },
-        ) => KeyData::Ecdsa(EcdsaPublicKey::NistP521(EncodedPoint::from_bytes(&point)?)),
-        _ => return Ok(None),
-    };
-
-    Ok(Some(PublicCredential::Key(key_data)))
-}
-
-fn prepare_sign_input(
-    attrs: AlgorithmAttributes,
-    data: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
-) -> Result<Vec<u8>, crate::Error> {
-    match attrs {
-        AlgorithmAttributes::Rsa(_) => match rsa_sig_hash {
-            Some(HashAlg::Sha256) => {
-                let mut digest_info = Vec::with_capacity(SHA256_DIGEST_INFO_PREFIX.len() + 32);
-                digest_info.extend_from_slice(SHA256_DIGEST_INFO_PREFIX);
-                digest_info.extend_from_slice(&sha2::Sha256::digest(data));
-                Ok(digest_info)
-            }
-            Some(HashAlg::Sha512) => {
-                let mut digest_info = Vec::with_capacity(SHA512_DIGEST_INFO_PREFIX.len() + 64);
-                digest_info.extend_from_slice(SHA512_DIGEST_INFO_PREFIX);
-                digest_info.extend_from_slice(&sha2::Sha512::digest(data));
-                Ok(digest_info)
-            }
-            Some(other) => Err(crate::Error::Other(
-                format!("Unsupported RSA hash algorithm {other}").into(),
-            )),
-            None => Err(crate::Error::Other(
-                "Legacy SHA-1 RSA signatures are not supported".into(),
-            )),
-        },
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::EdDsa,
-            curve: Curve::Ed25519,
-            ..
-        } => Ok(data.to_vec()),
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP256,
-            ..
-        } => Ok(sha2::Sha256::digest(data).to_vec()),
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP384,
-            ..
-        } => Ok(sha2::Sha384::digest(data).to_vec()),
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP521,
-            ..
-        } => Ok(sha2::Sha512::digest(data).to_vec()),
-        AlgorithmAttributes::Ecc { kind, curve, .. } => Err(crate::Error::Other(
-            format!("Unsupported OpenPGP signature algorithm: {kind:?} {curve:?}").into(),
-        )),
-    }
-}
-
-fn encode_signature(
-    attrs: AlgorithmAttributes,
-    signature: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
-) -> Result<Signature, crate::Error> {
-    match attrs {
-        AlgorithmAttributes::Rsa(_) => Ok(Signature::new(
-            Algorithm::Rsa { hash: rsa_sig_hash },
-            signature.to_vec(),
-        )?),
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::EdDsa,
-            curve: Curve::Ed25519,
-            ..
-        } => Ok(Signature::new(Algorithm::Ed25519, signature.to_vec())?),
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP256,
-            ..
-        } => {
-            let sig = ecdsa::Signature::<p256::NistP256>::from_slice(signature)
-                .or_else(|_| ecdsa::Signature::<p256::NistP256>::from_der(signature))?;
-            Ok(Signature::try_from(sig)?)
-        }
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP384,
-            ..
-        } => {
-            let sig = ecdsa::Signature::<p384::NistP384>::from_slice(signature)
-                .or_else(|_| ecdsa::Signature::<p384::NistP384>::from_der(signature))?;
-            Ok(Signature::try_from(sig)?)
-        }
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP521,
-            ..
-        } => {
-            let sig = ecdsa::Signature::<p521::NistP521>::from_slice(signature)
-                .or_else(|_| ecdsa::Signature::<p521::NistP521>::from_der(signature))?;
-            Ok(Signature::try_from(sig)?)
-        }
-        AlgorithmAttributes::Ecc { kind, curve, .. } => Err(crate::Error::Other(
-            format!("Unsupported OpenPGP signature algorithm: {kind:?} {curve:?}").into(),
-        )),
-    }
-}
-
-trait OpenPgpSigner {
+trait OpenPgpOps {
     fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError>;
     fn sign(&mut self, digest_info: &[u8]) -> Result<Vec<u8>, TransportError>;
     fn internal_authenticate(&mut self, auth_input: &[u8]) -> Result<Vec<u8>, TransportError>;
+    fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError>;
+    fn decrypt_ecdh(&mut self, ephemeral_point: &[u8]) -> Result<Vec<u8>, TransportError>;
 }
 
-trait OpenPgpSlotSession: OpenPgpSigner {
+trait OpenPgpSlotSession: OpenPgpOps {
     fn read_public_key(&mut self, crt: KeyCrt) -> Result<PublicKey, TransportError>;
 }
 
-impl OpenPgpSigner for OpenPgpSession {
+impl OpenPgpOps for OpenPgpSession {
     fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
         Self::verify_pin(self, pw_ref, pin)
     }
@@ -647,23 +404,19 @@ impl OpenPgpSigner for OpenPgpSession {
     fn internal_authenticate(&mut self, auth_input: &[u8]) -> Result<Vec<u8>, TransportError> {
         Self::internal_authenticate(self, auth_input)
     }
+
+    fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
+        Self::decrypt(self, cryptogram)
+    }
+
+    fn decrypt_ecdh(&mut self, ephemeral_point: &[u8]) -> Result<Vec<u8>, TransportError> {
+        Self::decrypt_ecdh(self, ephemeral_point)
+    }
 }
 
 impl OpenPgpSlotSession for OpenPgpSession {
     fn read_public_key(&mut self, crt: KeyCrt) -> Result<PublicKey, TransportError> {
         Self::read_public_key(self, crt)
-    }
-}
-
-fn attempt_sign(
-    signer: &mut impl OpenPgpSigner,
-    slot: KeyCrt,
-    prepared: &[u8],
-) -> Result<Vec<u8>, TransportError> {
-    match slot {
-        KeyCrt::Sign => signer.sign(prepared),
-        KeyCrt::Auth => signer.internal_authenticate(prepared),
-        KeyCrt::Decrypt => unreachable!(),
     }
 }
 
@@ -680,26 +433,19 @@ fn is_openpgp_wrong_pin(err: &TransportError) -> bool {
     )
 }
 
-fn sign_with_pin(
-    signer: &mut impl OpenPgpSigner,
-    slot: KeyCrt,
-    prepared: &[u8],
+#[expect(clippy::too_many_arguments)]
+fn execute_with_pin<S: OpenPgpOps>(
+    ops: &mut S,
+    pw_ref: u8,
     serial: Option<u128>,
     pinentry: &impl Pinentry,
     pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+    mut op: impl FnMut(&mut S) -> Result<Vec<u8>, TransportError>,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
-    let pw_ref = match slot {
-        KeyCrt::Sign => PW1_SIGN,
-        KeyCrt::Auth => PW1_OTHER,
-        KeyCrt::Decrypt => {
-            return Err(crate::Error::Other(
-                "OpenPGP decrypt slot cannot be used for signing".into(),
-            ));
-        }
-    };
-
-    match attempt_sign(signer, slot, prepared) {
-        Ok(sig) => Ok(Some(sig)),
+    match op(ops) {
+        Ok(out) => Ok(Some(out)),
         Err(TransportError::Apdu {
             sw1: 0x69,
             sw2: 0x82,
@@ -711,51 +457,186 @@ fn sign_with_pin(
                 true,
                 pin_cache,
                 pinentry,
-                |pin| signer.verify_pin(pw_ref, pin),
+                prompt_desc,
+                prompt_env,
+                |pin| ops.verify_pin(pw_ref, pin),
                 is_openpgp_wrong_pin,
             )? {
                 return Ok(None);
             }
-            Ok(Some(attempt_sign(signer, slot, prepared)?))
+            Ok(Some(op(ops)?))
         }
         Err(err) => Err(err.into()),
     }
 }
 
+#[expect(clippy::too_many_arguments)]
+fn execute_checked<S: OpenPgpOps>(
+    ops: &mut S,
+    pw_ref: u8,
+    current_serial: Option<u128>,
+    expected_serial: Option<u128>,
+    pinentry: &impl Pinentry,
+    pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+    op: impl FnMut(&mut S) -> Result<Vec<u8>, TransportError>,
+) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+    if let Some(expected) = expected_serial
+        && current_serial != Some(expected)
+    {
+        tracing::debug!(
+            expected_serial = expected,
+            ?current_serial,
+            "OpenPGP card serial changed"
+        );
+        return Ok(CardOperationOutcome::NotFound);
+    }
+
+    match execute_with_pin(
+        ops,
+        pw_ref,
+        current_serial,
+        pinentry,
+        pin_cache,
+        prompt_desc,
+        prompt_env,
+        op,
+    ) {
+        Ok(Some(output)) => Ok(CardOperationOutcome::Completed(output)),
+        Ok(None) => Ok(CardOperationOutcome::UserCancelled),
+        Err(err) if is_openpgp_stale_apdu_error(&err) => {
+            tracing::debug!("OpenPGP card operation failed with stale APDU error: {err}");
+            Ok(CardOperationOutcome::NotFound)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn sign_raw_in_session(
+    ops: &mut impl OpenPgpOps,
+    slot: KeyCrt,
+    current_serial: Option<u128>,
+    expected_serial: Option<u128>,
+    data: &[u8],
+    pinentry: &impl Pinentry,
+    pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+    let pw_ref = match slot {
+        KeyCrt::Sign => PW1_SIGN,
+        KeyCrt::Auth => PW1_OTHER,
+        KeyCrt::Decrypt => {
+            return Err(crate::Error::Other(
+                "OpenPGP decrypt slot cannot be used for signing".into(),
+            ));
+        }
+    };
+
+    execute_checked(
+        ops,
+        pw_ref,
+        current_serial,
+        expected_serial,
+        pinentry,
+        pin_cache,
+        prompt_desc,
+        prompt_env,
+        |s| match slot {
+            KeyCrt::Sign => s.sign(data),
+            KeyCrt::Auth => s.internal_authenticate(data),
+            KeyCrt::Decrypt => unreachable!(),
+        },
+    )
+}
+
+#[allow(dead_code)]
+#[expect(clippy::too_many_arguments)]
+fn decrypt_rsa_in_session(
+    ops: &mut impl OpenPgpOps,
+    current_serial: Option<u128>,
+    expected_serial: Option<u128>,
+    cryptogram: &[u8],
+    pinentry: &impl Pinentry,
+    pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+    execute_checked(
+        ops,
+        PW1_OTHER,
+        current_serial,
+        expected_serial,
+        pinentry,
+        pin_cache,
+        prompt_desc,
+        prompt_env,
+        |s| s.decrypt(cryptogram),
+    )
+}
+
+#[allow(dead_code)]
+#[expect(clippy::too_many_arguments)]
+fn decrypt_ecdh_in_session(
+    ops: &mut impl OpenPgpOps,
+    current_serial: Option<u128>,
+    expected_serial: Option<u128>,
+    ephemeral_point: &[u8],
+    pinentry: &impl Pinentry,
+    pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+    execute_checked(
+        ops,
+        PW1_OTHER,
+        current_serial,
+        expected_serial,
+        pinentry,
+        pin_cache,
+        prompt_desc,
+        prompt_env,
+        |s| s.decrypt_ecdh(ephemeral_point),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenPgpSigner, encode_signature, prepare_sign_input, sign_with_pin, ssh_public_credentials,
+        CardOperationOutcome, OpenPgpOps, OpenPgpSlotSession, OpenPgpStatusView,
+        decrypt_ecdh_in_session, decrypt_rsa_in_session, execute_with_pin, list_keys_in_session,
+        sign_raw_in_session,
     };
     use crate::{
         pin_cache::PinCache,
-        pinentry::{Applet, PinPromptOptions, Pinentry},
+        pinentry::{Applet, PinPromptOptions, Pinentry, PinentryEnv},
     };
     use keyroost_openpgp::{
-        AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey, RsaAttributes,
-        RsaImportFormat,
+        AlgorithmAttributes, Curve, EccKind, KeyCrt, PW1_OTHER, PW1_SIGN, PublicKey,
     };
     use keyroost_transport::TransportError;
-    use ssh_agent_lib::{
-        proto::PublicCredential,
-        secrecy::{ExposeSecret, SecretBox},
-        ssh_key::{Algorithm, HashAlg},
-    };
-    use std::{
-        cell::{Cell, RefCell},
-        collections::VecDeque,
-        time::Duration,
-    };
+    use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
+    use std::{cell::RefCell, collections::VecDeque, time::Duration};
 
     fn secret(pin: &str) -> SecretBox<str> {
         SecretBox::from(Box::<str>::from(pin))
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PromptCall {
+        allow_external_cache: bool,
+        error: Option<String>,
+        description: Option<String>,
+        env: Option<PinentryEnv>,
     }
 
     struct MockPinentry {
         default_pin: Option<&'static str>,
         responses: RefCell<VecDeque<Option<&'static str>>>,
         external_cache: bool,
-        calls: RefCell<Vec<(bool, Option<String>)>>,
+        calls: RefCell<Vec<PromptCall>>,
     }
 
     impl MockPinentry {
@@ -782,6 +663,14 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<(bool, Option<String>)> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|c| (c.allow_external_cache, c.error.clone()))
+                .collect()
+        }
+
+        fn full_calls(&self) -> Vec<PromptCall> {
             self.calls.borrow().clone()
         }
     }
@@ -793,10 +682,12 @@ mod tests {
             _serial: Option<u128>,
             options: PinPromptOptions<'_>,
         ) -> Result<Option<SecretBox<str>>, crate::Error> {
-            self.calls.borrow_mut().push((
-                options.allow_external_cache,
-                options.error.map(ToOwned::to_owned),
-            ));
+            self.calls.borrow_mut().push(PromptCall {
+                allow_external_cache: options.allow_external_cache,
+                error: options.error.map(ToOwned::to_owned),
+                description: options.description.map(ToOwned::to_owned),
+                env: options.env.cloned(),
+            });
             let pin = self
                 .responses
                 .borrow_mut()
@@ -812,18 +703,21 @@ mod tests {
 
     type VerifyHandler = fn(&[u8]) -> Result<(), TransportError>;
 
-    struct MockSigner {
+    struct MockOps {
         verified: bool,
         verified_refs: Vec<u8>,
         verified_pins: Vec<Vec<u8>>,
         signs: usize,
         authenticates: usize,
+        rsa_decrypts: usize,
+        ecdh_decrypts: usize,
+        last_input: Vec<u8>,
         result: Vec<u8>,
         error: Option<fn() -> TransportError>,
         verify_handler: VerifyHandler,
     }
 
-    impl MockSigner {
+    impl MockOps {
         fn new(verified: bool, result: Vec<u8>) -> Self {
             Self {
                 verified,
@@ -831,6 +725,9 @@ mod tests {
                 verified_pins: Vec::new(),
                 signs: 0,
                 authenticates: 0,
+                rsa_decrypts: 0,
+                ecdh_decrypts: 0,
+                last_input: Vec::new(),
                 result,
                 error: None,
                 verify_handler: |pin| {
@@ -846,7 +743,7 @@ mod tests {
         }
     }
 
-    impl OpenPgpSigner for MockSigner {
+    impl OpenPgpOps for MockOps {
         fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
             self.verified_refs.push(pw_ref);
             self.verified_pins.push(pin.to_vec());
@@ -855,8 +752,9 @@ mod tests {
             Ok(())
         }
 
-        fn sign(&mut self, _digest_info: &[u8]) -> Result<Vec<u8>, TransportError> {
+        fn sign(&mut self, digest_info: &[u8]) -> Result<Vec<u8>, TransportError> {
             self.signs += 1;
+            self.last_input = digest_info.to_vec();
             if let Some(err) = self.error {
                 return Err(err());
             }
@@ -870,8 +768,9 @@ mod tests {
             Ok(self.result.clone())
         }
 
-        fn internal_authenticate(&mut self, _auth_input: &[u8]) -> Result<Vec<u8>, TransportError> {
+        fn internal_authenticate(&mut self, auth_input: &[u8]) -> Result<Vec<u8>, TransportError> {
             self.authenticates += 1;
+            self.last_input = auth_input.to_vec();
             if let Some(err) = self.error {
                 return Err(err());
             }
@@ -884,13 +783,78 @@ mod tests {
             }
             Ok(self.result.clone())
         }
+
+        fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.rsa_decrypts += 1;
+            self.last_input = cryptogram.to_vec();
+            if let Some(err) = self.error {
+                return Err(err());
+            }
+            if !self.verified {
+                return Err(TransportError::Apdu {
+                    label: "PSO:DECIPHER",
+                    sw1: 0x69,
+                    sw2: 0x82,
+                });
+            }
+            Ok(self.result.clone())
+        }
+
+        fn decrypt_ecdh(&mut self, ephemeral_point: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.ecdh_decrypts += 1;
+            self.last_input = ephemeral_point.to_vec();
+            if let Some(err) = self.error {
+                return Err(err());
+            }
+            if !self.verified {
+                return Err(TransportError::Apdu {
+                    label: "PSO:DECIPHER",
+                    sw1: 0x69,
+                    sw2: 0x82,
+                });
+            }
+            Ok(self.result.clone())
+        }
+    }
+
+    fn sign_with_pin_helper(
+        ops: &mut impl OpenPgpOps,
+        slot: KeyCrt,
+        prepared: &[u8],
+        serial: Option<u128>,
+        pinentry: &impl Pinentry,
+        pin_cache: Option<&PinCache>,
+    ) -> Result<Option<Vec<u8>>, crate::Error> {
+        let pw_ref = match slot {
+            KeyCrt::Sign => PW1_SIGN,
+            KeyCrt::Auth => PW1_OTHER,
+            KeyCrt::Decrypt => {
+                return Err(crate::Error::Other(
+                    "OpenPGP decrypt slot cannot be used for signing".into(),
+                ));
+            }
+        };
+        execute_with_pin(
+            ops,
+            pw_ref,
+            serial,
+            pinentry,
+            pin_cache,
+            None,
+            None,
+            |s| match slot {
+                KeyCrt::Sign => s.sign(prepared),
+                KeyCrt::Auth => s.internal_authenticate(prepared),
+                KeyCrt::Decrypt => unreachable!(),
+            },
+        )
     }
 
     #[test]
     fn already_verified_card_signs_without_prompting() {
-        let mut signer = MockSigner::new(true, vec![1, 2, 3]);
+        let mut signer = MockOps::new(true, vec![1, 2, 3]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Sign,
             b"digest",
@@ -906,9 +870,9 @@ mod tests {
         assert_eq!(signer.signs, 1);
         assert_eq!(signer.authenticates, 0);
 
-        let mut auth_signer = MockSigner::new(true, vec![4, 5, 6]);
+        let mut auth_signer = MockOps::new(true, vec![4, 5, 6]);
         let auth_pinentry = MockPinentry::new(Some("123456"));
-        let auth_res = sign_with_pin(
+        let auth_res = sign_with_pin_helper(
             &mut auth_signer,
             KeyCrt::Auth,
             b"digest",
@@ -927,9 +891,9 @@ mod tests {
 
     #[test]
     fn sign_slot_verifies_pw1_sign_and_retries_pso_sign() {
-        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+        let mut signer = MockOps::new(false, vec![1, 2, 3]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Sign,
             b"digest",
@@ -948,9 +912,9 @@ mod tests {
 
     #[test]
     fn auth_slot_verifies_pw1_other_and_retries_internal_authenticate() {
-        let mut signer = MockSigner::new(false, vec![4, 5, 6]);
+        let mut signer = MockOps::new(false, vec![4, 5, 6]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Auth,
             b"digest",
@@ -969,9 +933,9 @@ mod tests {
 
     #[test]
     fn cancelled_pin_returns_none_without_verifying() {
-        let mut signer = MockSigner::new(false, vec![7, 8, 9]);
+        let mut signer = MockOps::new(false, vec![7, 8, 9]);
         let pinentry = MockPinentry::new(None);
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Auth,
             b"digest",
@@ -990,7 +954,7 @@ mod tests {
 
     #[test]
     fn non_security_error_propagates_without_prompting() {
-        let mut signer = MockSigner::new(false, vec![]);
+        let mut signer = MockOps::new(false, vec![]);
         signer.error = Some(|| TransportError::Apdu {
             label: "INTERNAL AUTHENTICATE",
             sw1: 0x6A,
@@ -998,7 +962,7 @@ mod tests {
         });
         let pinentry = MockPinentry::new(Some("123456"));
 
-        let err = sign_with_pin(
+        let err = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Auth,
             b"digest",
@@ -1020,8 +984,8 @@ mod tests {
         let cache = PinCache::new(Duration::from_secs(60), None);
         let pinentry = MockPinentry::new(Some("123456"));
 
-        let mut signer1 = MockSigner::new(false, vec![1, 2, 3]);
-        let res1 = sign_with_pin(
+        let mut signer1 = MockOps::new(false, vec![1, 2, 3]);
+        let res1 = sign_with_pin_helper(
             &mut signer1,
             KeyCrt::Sign,
             b"digest",
@@ -1045,9 +1009,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(2));
 
-        // Second sign on Auth slot reuses the same cached PW1 PIN with 0 prompts.
-        let mut signer2 = MockSigner::new(false, vec![4, 5, 6]);
-        let res2 = sign_with_pin(
+        let mut signer2 = MockOps::new(false, vec![4, 5, 6]);
+        let res2 = sign_with_pin_helper(
             &mut signer2,
             KeyCrt::Auth,
             b"digest",
@@ -1069,11 +1032,11 @@ mod tests {
     fn fresh_prompt_verify_failure_does_not_cache_wrong_pin() {
         let cache = PinCache::new(Duration::from_secs(60), None);
         let pinentry = MockPinentry::new(Some("000000"));
-        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
+        let mut signer = MockOps::new(false, vec![1, 2, 3]);
 
-        let err = sign_with_pin(
+        let err = sign_with_pin_helper(
             &mut signer,
-            KeyCrt::Auth,
+            KeyCrt::Sign,
             b"digest",
             Some(1234),
             &pinentry,
@@ -1083,7 +1046,7 @@ mod tests {
 
         assert!(matches!(err, crate::Error::Other(_)));
         assert_eq!(pinentry.prompts(), 1);
-        assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
+        assert_eq!(signer.verified_refs, vec![PW1_SIGN]);
         assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
     }
 
@@ -1117,10 +1080,10 @@ mod tests {
             cache.insert(Applet::OpenPgp, Some(1234), secret("stale1"));
 
             let pinentry = MockPinentry::new(Some("123456"));
-            let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+            let mut signer = MockOps::new(false, vec![9, 8, 7]);
             signer.verify_handler = handler;
 
-            let res = sign_with_pin(
+            let res = sign_with_pin_helper(
                 &mut signer,
                 KeyCrt::Auth,
                 b"digest",
@@ -1153,11 +1116,11 @@ mod tests {
         cache.insert(Applet::OpenPgp, Some(1234), secret("stale1"));
 
         let pinentry = MockPinentry::new(None);
-        let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+        let mut signer = MockOps::new(false, vec![9, 8, 7]);
 
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
-            KeyCrt::Sign,
+            KeyCrt::Auth,
             b"digest",
             Some(1234),
             &pinentry,
@@ -1167,7 +1130,7 @@ mod tests {
 
         assert_eq!(res, None);
         assert_eq!(pinentry.prompts(), 1);
-        assert_eq!(signer.verified_refs, vec![PW1_SIGN]);
+        assert_eq!(signer.verified_refs, vec![PW1_OTHER]);
         assert!(cache.get(Applet::OpenPgp, Some(1234)).is_none());
     }
 
@@ -1206,10 +1169,10 @@ mod tests {
             cache.insert(Applet::OpenPgp, Some(1234), secret("123456"));
 
             let pinentry = MockPinentry::new(Some("123456"));
-            let mut signer = MockSigner::new(false, vec![9, 8, 7]);
+            let mut signer = MockOps::new(false, vec![9, 8, 7]);
             signer.verify_handler = handler;
 
-            let err = sign_with_pin(
+            let err = sign_with_pin_helper(
                 &mut signer,
                 KeyCrt::Auth,
                 b"digest",
@@ -1229,9 +1192,9 @@ mod tests {
     #[test]
     fn external_cache_wrong_pin_retries_once_without_external_cache_and_with_error() {
         let pinentry = MockPinentry::with_external_cache([Some("stale1"), Some("123456")]);
-        let mut signer = MockSigner::new(false, vec![4, 5, 6]);
+        let mut signer = MockOps::new(false, vec![4, 5, 6]);
 
-        let res = sign_with_pin(
+        let res = sign_with_pin_helper(
             &mut signer,
             KeyCrt::Auth,
             b"digest",
@@ -1251,120 +1214,6 @@ mod tests {
             signer.verified_pins,
             vec![b"stale1".to_vec(), b"123456".to_vec()]
         );
-    }
-
-    #[test]
-    fn ed25519_credential_and_signature_roundtrip() {
-        let attrs = AlgorithmAttributes::Ecc {
-            kind: EccKind::EdDsa,
-            curve: Curve::Ed25519,
-            import_with_public_key: false,
-        };
-        let cred = ssh_public_credentials(
-            attrs,
-            PublicKey::Ecc {
-                point: vec![0x11; 32],
-            },
-        )
-        .unwrap();
-        assert!(matches!(cred, Some(PublicCredential::Key(_))));
-
-        let prepared = prepare_sign_input(attrs, b"hello", None).unwrap();
-        assert_eq!(prepared, b"hello");
-
-        let sig = encode_signature(attrs, &[0x22; 64], None).unwrap();
-        assert_eq!(sig.algorithm(), Algorithm::Ed25519);
-    }
-
-    #[test]
-    fn rsa_digest_info_and_signature_encoding() {
-        let attrs = AlgorithmAttributes::Rsa(RsaAttributes {
-            n_bits: 2048,
-            e_bits: 32,
-            format: RsaImportFormat::Standard,
-        });
-
-        let sha256_input = prepare_sign_input(attrs, b"hello", Some(HashAlg::Sha256)).unwrap();
-        assert_eq!(sha256_input.len(), 19 + 32);
-
-        let sha512_input = prepare_sign_input(attrs, b"hello", Some(HashAlg::Sha512)).unwrap();
-        assert_eq!(sha512_input.len(), 19 + 64);
-
-        assert!(prepare_sign_input(attrs, b"hello", None).is_err());
-
-        let sig = encode_signature(attrs, &[0xAA; 256], Some(HashAlg::Sha256)).unwrap();
-        assert_eq!(
-            sig.algorithm(),
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256)
-            }
-        );
-    }
-
-    #[test]
-    fn ecdsa_raw_rs_signature_is_encoded() {
-        let attrs = AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdsa,
-            curve: Curve::NistP256,
-            import_with_public_key: false,
-        };
-
-        let prepared = prepare_sign_input(attrs, b"hello", None).unwrap();
-        assert_eq!(prepared.len(), 32);
-
-        let mut raw_rs = vec![0x01; 32];
-        raw_rs.extend_from_slice(&[0x02; 32]);
-        let sig = encode_signature(attrs, &raw_rs, None).unwrap();
-        assert_eq!(
-            sig.algorithm(),
-            Algorithm::Ecdsa {
-                curve: ssh_agent_lib::ssh_key::EcdsaCurve::NistP256
-            }
-        );
-    }
-
-    #[test]
-    fn ecdh_and_unsupported_curves_are_skipped() {
-        let ecdh = AlgorithmAttributes::Ecc {
-            kind: EccKind::Ecdh,
-            curve: Curve::X25519,
-            import_with_public_key: false,
-        };
-        let res = ssh_public_credentials(
-            ecdh,
-            PublicKey::Ecc {
-                point: vec![0x33; 32],
-            },
-        )
-        .unwrap();
-        assert!(res.is_none());
-    }
-
-    #[test]
-    fn rsa_public_key_with_msb_set_encodes_as_positive_mpint() {
-        let attrs = AlgorithmAttributes::Rsa(RsaAttributes {
-            n_bits: 2048,
-            e_bits: 32,
-            format: RsaImportFormat::Standard,
-        });
-        let mut modulus = vec![0xC3; 256];
-        modulus[255] = 0x01;
-        let cred = ssh_public_credentials(
-            attrs,
-            PublicKey::Rsa {
-                modulus: modulus.clone(),
-                exponent: vec![0x00, 0x01, 0x00, 0x01],
-            },
-        )
-        .unwrap()
-        .expect("expected RSA credential");
-
-        let PublicCredential::Key(super::KeyData::Rsa(rsa)) = cred else {
-            panic!("expected RSA key data");
-        };
-        assert_eq!(rsa.n.as_bytes()[0], 0x00);
-        assert_eq!(rsa.n.as_positive_bytes(), Some(modulus.as_slice()));
-        assert_eq!(rsa.e.as_positive_bytes(), Some([0x01, 0x00, 0x01].as_slice()));
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1499,14 +1348,15 @@ mod tests {
             Ok(2)
         );
         assert_eq!(opens, 2);
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
     fn persistent_slot_disconnect_and_clone_share_state() {
-        let slot1 = super::PersistentSlot::<MockSession, usize>::new();
-        let slot2 = slot1.clone();
+        let slot_a = super::PersistentSlot::<MockSession, usize>::new();
+        let slot_b = slot_a.clone();
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let opens = Cell::new(0usize);
+        let opens = std::cell::Cell::new(0usize);
 
         let open_fn = || {
             let next = opens.get() + 1;
@@ -1522,64 +1372,74 @@ mod tests {
         };
 
         assert_eq!(
-            slot1.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            slot_a.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
             Ok(1)
         );
         assert_eq!(
-            slot2.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            slot_b.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
             Ok(1)
         );
         assert_eq!(opens.get(), 1);
 
-        slot2.disconnect();
+        slot_b.disconnect();
         assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         assert_eq!(
-            slot1.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
+            slot_a.with_session(open_fn, MockErr::is_transport, |s, _| Ok(s.id)),
             Ok(2)
         );
         assert_eq!(opens.get(), 2);
     }
 
-    struct MockOpenPgpSlotSession {
-        signer: MockSigner,
+    struct MockSlotSession {
+        ops: MockOps,
         pubkey_reads: Vec<KeyCrt>,
-        auth_key: Option<PublicKey>,
         sign_key: Option<PublicKey>,
+        decrypt_key: Option<PublicKey>,
+        auth_key: Option<PublicKey>,
     }
 
-    impl MockOpenPgpSlotSession {
+    impl MockSlotSession {
         fn new(verified: bool, result: Vec<u8>) -> Self {
             Self {
-                signer: MockSigner::new(verified, result),
+                ops: MockOps::new(verified, result),
                 pubkey_reads: Vec::new(),
-                auth_key: None,
                 sign_key: None,
+                decrypt_key: None,
+                auth_key: None,
             }
         }
     }
 
-    impl OpenPgpSigner for MockOpenPgpSlotSession {
+    impl OpenPgpOps for MockSlotSession {
         fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
-            self.signer.verify_pin(pw_ref, pin)
+            self.ops.verify_pin(pw_ref, pin)
         }
 
         fn sign(&mut self, digest_info: &[u8]) -> Result<Vec<u8>, TransportError> {
-            self.signer.sign(digest_info)
+            self.ops.sign(digest_info)
         }
 
         fn internal_authenticate(&mut self, auth_input: &[u8]) -> Result<Vec<u8>, TransportError> {
-            self.signer.internal_authenticate(auth_input)
+            self.ops.internal_authenticate(auth_input)
+        }
+
+        fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.ops.decrypt(cryptogram)
+        }
+
+        fn decrypt_ecdh(&mut self, ephemeral_point: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.ops.decrypt_ecdh(ephemeral_point)
         }
     }
 
-    impl super::OpenPgpSlotSession for MockOpenPgpSlotSession {
+    impl OpenPgpSlotSession for MockSlotSession {
         fn read_public_key(&mut self, crt: KeyCrt) -> Result<PublicKey, TransportError> {
             self.pubkey_reads.push(crt);
             let key = match crt {
-                KeyCrt::Auth => self.auth_key.clone(),
                 KeyCrt::Sign => self.sign_key.clone(),
-                KeyCrt::Decrypt => None,
+                KeyCrt::Decrypt => self.decrypt_key.clone(),
+                KeyCrt::Auth => self.auth_key.clone(),
             };
             key.ok_or(TransportError::Apdu {
                 label: "GET PUBLIC KEY",
@@ -1589,186 +1449,291 @@ mod tests {
         }
     }
 
-    fn ed25519_attrs() -> AlgorithmAttributes {
-        AlgorithmAttributes::Ecc {
-            kind: EccKind::EdDsa,
-            curve: Curve::Ed25519,
-            import_with_public_key: false,
-        }
-    }
-
-    fn ed25519_status(serial: Option<u128>, raw_attrs: &[u8]) -> super::OpenPgpStatusView<'_> {
-        super::OpenPgpStatusView {
-            sig_attrs: raw_attrs,
-            aut_attrs: raw_attrs,
-            serial: serial.and_then(|s| u32::try_from(s).ok()),
-            full_serial: serial,
-        }
-    }
-
-    fn ed25519_cred(byte: u8) -> PublicCredential {
-        PublicCredential::Key(ssh_agent_lib::ssh_key::public::KeyData::Ed25519(
-            ssh_agent_lib::ssh_key::public::Ed25519PublicKey([byte; 32]),
-        ))
-    }
-
     #[test]
-    fn sign_cached_signs_directly_without_reading_public_keys() {
-        let mut session = MockOpenPgpSlotSession::new(true, vec![0xBB; 64]);
-        let pinentry = MockPinentry::new(Some("123456"));
-        let cached = crate::identity_cache::OpenPgpCachedIdentity {
-            slot: KeyCrt::Auth,
-            attrs: ed25519_attrs(),
-            serial: Some(77),
-        };
-        let status = ed25519_status(Some(77), &[]);
+    fn list_keys_discovers_all_three_slots_including_decrypt() {
+        // EdDSA (0x16) + Ed25519 OID (1.3.6.1.4.1.11591.15.1)
+        let ed25519_raw = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+        // ECDH (0x12) + X25519 OID (1.3.6.1.4.1.3029.1.5.1)
+        let x25519_raw = [0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
 
-        let result = super::sign_in_session(
+        let aid = [
+            0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04,
+            0x00, 0x00,
+        ];
+        let status = OpenPgpStatusView {
+            aid: &aid,
+            sig_attrs: &ed25519_raw,
+            dec_attrs: &x25519_raw,
+            aut_attrs: &ed25519_raw,
+            fingerprint_sig: [0x11; 20],
+            fingerprint_dec: [0x22; 20],
+            fingerprint_aut: [0x33; 20],
+            serial: Some(0x0102_0304),
+            full_serial: Some(0x0102_0304),
+        };
+
+        let mut session = MockSlotSession::new(true, vec![]);
+        session.sign_key = Some(PublicKey::Ecc {
+            point: vec![0xA1; 32],
+        });
+        session.decrypt_key = Some(PublicKey::Ecc {
+            point: vec![0xB2; 32],
+        });
+        session.auth_key = Some(PublicKey::Ecc {
+            point: vec![0xC3; 32],
+        });
+
+        let keys = list_keys_in_session(
             &mut session,
             &status,
-            &ed25519_cred(0x11),
-            Some(cached),
-            b"challenge",
-            None,
-            &pinentry,
-            None,
+            &[KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth],
         )
         .unwrap();
 
-        assert!(result.discovered.is_none());
-        assert!(matches!(
-            result.outcome,
-            crate::identity_cache::SignOutcome::Signed(_)
-        ));
-        assert_eq!(session.pubkey_reads, [] as [KeyCrt; 0]);
-        assert_eq!(session.signer.authenticates, 1);
+        assert_eq!(
+            session.pubkey_reads,
+            vec![KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth]
+        );
+        assert_eq!(keys.len(), 3);
+
+        assert_eq!(keys[0].slot, KeyCrt::Sign);
+        assert_eq!(keys[0].fingerprint, [0x11; 20]);
+        assert_eq!(keys[0].aid, aid);
+        assert_eq!(keys[0].serial, Some(0x0102_0304));
+        assert_eq!(keys[0].full_serial, Some(0x0102_0304));
+        assert_eq!(
+            keys[0].attrs,
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::EdDsa,
+                curve: Curve::Ed25519,
+                import_with_public_key: false,
+            }
+        );
+
+        assert_eq!(keys[1].slot, KeyCrt::Decrypt);
+        assert_eq!(keys[1].fingerprint, [0x22; 20]);
+        assert_eq!(
+            keys[1].attrs,
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdh,
+                curve: Curve::X25519,
+                import_with_public_key: false,
+            }
+        );
+
+        assert_eq!(keys[2].slot, KeyCrt::Auth);
+        assert_eq!(keys[2].fingerprint, [0x33; 20]);
     }
 
     #[test]
-    fn sign_cached_rescans_on_serial_mismatch_or_missing_key_and_stops_on_cancel() {
-        let ed25519_raw_attrs = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+    fn sign_raw_handles_serial_mismatch_stale_apdu_and_cancel() {
         let pinentry = MockPinentry::new(Some("123456"));
-        let cached = crate::identity_cache::OpenPgpCachedIdentity {
-            slot: KeyCrt::Auth,
-            attrs: ed25519_attrs(),
-            serial: Some(77),
-        };
+        let mut ops = MockOps::new(true, vec![0xBB; 64]);
 
-        // Serial mismatch triggers in-session re-scan and signs the moved key on the new card.
-        let mut session = MockOpenPgpSlotSession::new(true, vec![0xBB; 64]);
-        session.sign_key = Some(PublicKey::Ecc {
-            point: vec![0x11; 32],
-        });
-        let status_swapped = ed25519_status(Some(88), &ed25519_raw_attrs);
-        let swapped = super::sign_in_session(
-            &mut session,
-            &status_swapped,
-            &ed25519_cred(0x11),
-            Some(cached),
+        // Serial mismatch -> NotFound without signing
+        let mismatch = sign_raw_in_session(
+            &mut ops,
+            KeyCrt::Auth,
+            Some(88),
+            Some(77),
             b"challenge",
-            None,
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
-        assert_eq!(session.pubkey_reads, vec![KeyCrt::Auth, KeyCrt::Sign]);
-        assert_eq!(swapped.discovered.as_ref().map(Vec::len), Some(1));
-        assert!(matches!(
-            swapped.outcome,
-            crate::identity_cache::SignOutcome::Signed(_)
-        ));
-        assert_eq!(session.signer.authenticates, 0);
-        assert_eq!(session.signer.signs, 1);
+        assert_eq!(mismatch, CardOperationOutcome::NotFound);
+        assert_eq!(ops.authenticates, 0);
 
-        // Missing slot APDU (6A88) falls back to re-scan.
-        let mut missing_session = MockOpenPgpSlotSession::new(true, vec![]);
-        missing_session.signer.error = Some(|| TransportError::Apdu {
+        // Stale APDU (6A88) -> NotFound
+        let mut stale_ops = MockOps::new(true, vec![]);
+        stale_ops.error = Some(|| TransportError::Apdu {
             label: "INTERNAL AUTHENTICATE",
             sw1: 0x6A,
             sw2: 0x88,
         });
-        let status_same = ed25519_status(Some(77), &ed25519_raw_attrs);
-        let missing = super::sign_in_session(
-            &mut missing_session,
-            &status_same,
-            &ed25519_cred(0x11),
-            Some(cached),
+        let stale = sign_raw_in_session(
+            &mut stale_ops,
+            KeyCrt::Auth,
+            Some(77),
+            Some(77),
             b"challenge",
-            None,
             &pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
-        assert_eq!(missing.discovered, Some(vec![]));
-        assert!(matches!(
-            missing.outcome,
-            crate::identity_cache::SignOutcome::NotFound
-        ));
-        assert_eq!(
-            missing_session.pubkey_reads,
-            vec![KeyCrt::Auth, KeyCrt::Sign]
-        );
+        assert_eq!(stale, CardOperationOutcome::NotFound);
 
-        // User cancelling PIN does not trigger a re-scan.
-        let mut cancel_session = MockOpenPgpSlotSession::new(false, vec![0xBB; 64]);
+        // User cancel -> UserCancelled
+        let mut cancel_ops = MockOps::new(false, vec![0xBB; 64]);
         let cancel_pinentry = MockPinentry::new(None);
-        let cancelled = super::sign_in_session(
-            &mut cancel_session,
-            &status_same,
-            &ed25519_cred(0x11),
-            Some(cached),
+        let cancelled = sign_raw_in_session(
+            &mut cancel_ops,
+            KeyCrt::Auth,
+            Some(77),
+            Some(77),
             b"challenge",
-            None,
             &cancel_pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
-        assert!(cancelled.discovered.is_none());
-        assert!(matches!(
-            cancelled.outcome,
-            crate::identity_cache::SignOutcome::UserCancelled
-        ));
-        assert_eq!(cancel_session.pubkey_reads, [] as [KeyCrt; 0]);
+        assert_eq!(cancelled, CardOperationOutcome::UserCancelled);
         assert_eq!(cancel_pinentry.prompts(), 1);
     }
 
     #[test]
-    fn sign_in_session_rescans_slots_and_returns_discovered_cache_entries() {
-        let mut session = MockOpenPgpSlotSession::new(true, vec![0xCC; 64]);
-        session.auth_key = Some(PublicKey::Ecc {
-            point: vec![0x11; 32],
-        });
-        session.sign_key = Some(PublicKey::Ecc {
-            point: vec![0x22; 32],
-        });
-
-        // OpenPGP EdDSA (0x16) + Ed25519 OID (1.3.6.1.4.1.11591.15.1).
-        let ed25519_raw_attrs = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
-        let status = ed25519_status(Some(77), &ed25519_raw_attrs);
+    fn decrypt_rsa_verifies_pw1_other_forwards_prompt_context_and_returns_plaintext() {
+        let mut ops = MockOps::new(false, b"recovered-session-key".to_vec());
         let pinentry = MockPinentry::new(Some("123456"));
+        let env = PinentryEnv {
+            ttyname: Some("/dev/pts/1".to_owned()),
+            ..Default::default()
+        };
 
-        let result = super::sign_in_session(
-            &mut session,
-            &status,
-            &ed25519_cred(0x22),
-            None,
-            b"challenge",
-            None,
+        let outcome = decrypt_rsa_in_session(
+            &mut ops,
+            Some(42),
+            Some(42),
+            b"rsa-cryptogram",
             &pinentry,
+            None,
+            Some("Decrypt message"),
+            Some(&env),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            CardOperationOutcome::Completed(b"recovered-session-key".to_vec())
+        );
+        assert_eq!(ops.rsa_decrypts, 2);
+        assert_eq!(ops.ecdh_decrypts, 0);
+        assert_eq!(ops.last_input, b"rsa-cryptogram");
+        assert_eq!(ops.verified_refs, vec![PW1_OTHER]);
+        assert_eq!(
+            pinentry.full_calls(),
+            vec![PromptCall {
+                allow_external_cache: false,
+                error: None,
+                description: Some("Decrypt message".to_owned()),
+                env: Some(env),
+            }]
+        );
+    }
+
+    #[test]
+    fn decrypt_rsa_handles_serial_mismatch_stale_apdu_and_cancel() {
+        let pinentry = MockPinentry::new(Some("123456"));
+        let mut ops = MockOps::new(true, b"plain".to_vec());
+
+        assert_eq!(
+            decrypt_rsa_in_session(
+                &mut ops,
+                Some(99),
+                Some(42),
+                b"ct",
+                &pinentry,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            CardOperationOutcome::NotFound
+        );
+        assert_eq!(ops.rsa_decrypts, 0);
+
+        let mut stale_ops = MockOps::new(true, vec![]);
+        stale_ops.error = Some(|| TransportError::Apdu {
+            label: "PSO:DECIPHER",
+            sw1: 0x6A,
+            sw2: 0x88,
+        });
+        assert_eq!(
+            decrypt_rsa_in_session(
+                &mut stale_ops,
+                Some(42),
+                Some(42),
+                b"ct",
+                &pinentry,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            CardOperationOutcome::NotFound
+        );
+
+        let mut cancel_ops = MockOps::new(false, b"plain".to_vec());
+        let cancel_pinentry = MockPinentry::new(None);
+        assert_eq!(
+            decrypt_rsa_in_session(
+                &mut cancel_ops,
+                Some(42),
+                Some(42),
+                b"ct",
+                &cancel_pinentry,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            CardOperationOutcome::UserCancelled
+        );
+    }
+
+    #[test]
+    fn decrypt_ecdh_verifies_pw1_other_and_returns_shared_secret() {
+        let mut ops = MockOps::new(false, vec![0x55; 32]);
+        let pinentry = MockPinentry::new(Some("123456"));
+        let cache = PinCache::new(Duration::from_secs(60), None);
+
+        let outcome = decrypt_ecdh_in_session(
+            &mut ops,
+            Some(77),
+            Some(77),
+            &[0x40; 33],
+            &pinentry,
+            Some(&cache),
+            Some("Decrypt ECDH"),
             None,
         )
         .unwrap();
 
-        assert_eq!(session.pubkey_reads, vec![KeyCrt::Auth, KeyCrt::Sign]);
-        let discovered = result.discovered.unwrap();
-        assert_eq!(discovered.len(), 2);
-        assert_eq!(discovered[0].1.slot, KeyCrt::Auth);
-        assert_eq!(discovered[1].1.slot, KeyCrt::Sign);
-        assert!(matches!(
-            result.outcome,
-            crate::identity_cache::SignOutcome::Signed(_)
-        ));
-        assert_eq!(session.signer.signs, 1);
-        assert_eq!(session.signer.authenticates, 0);
+        assert_eq!(outcome, CardOperationOutcome::Completed(vec![0x55; 32]));
+        assert_eq!(ops.ecdh_decrypts, 2);
+        assert_eq!(ops.rsa_decrypts, 0);
+        assert_eq!(ops.last_input, vec![0x40; 33]);
+        assert_eq!(ops.verified_refs, vec![PW1_OTHER]);
+        assert_eq!(
+            pinentry.full_calls(),
+            vec![PromptCall {
+                allow_external_cache: false,
+                error: None,
+                description: Some("Decrypt ECDH".to_owned()),
+                env: None,
+            }]
+        );
+
+        // Second call hits PIN cache without re-prompting.
+        let mut ops2 = MockOps::new(false, vec![0x66; 32]);
+        let outcome2 = decrypt_ecdh_in_session(
+            &mut ops2,
+            Some(77),
+            Some(77),
+            &[0x41; 33],
+            &pinentry,
+            Some(&cache),
+            Some("Decrypt ECDH"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome2, CardOperationOutcome::Completed(vec![0x66; 32]));
+        assert_eq!(pinentry.prompts(), 1);
+        assert_eq!(ops2.verified_refs, vec![PW1_OTHER]);
     }
 }

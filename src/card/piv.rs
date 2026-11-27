@@ -1,33 +1,22 @@
 use std::sync::{Arc, Mutex, mpsc};
 
-use tokio::sync::oneshot;
-
-use keyroost_piv::{
-    KeyAlg, PinPolicy, PublicKey, Slot,
-    x509::{SigHash, X509Error},
-};
+use keyroost_piv::{KeyAlg, PinPolicy, PublicKey, Slot};
 use keyroost_transport::{PivSession, PivSessionState, TransportError};
-use sha2::Digest;
-use ssh_agent_lib::{
-    proto::{Identity, PublicCredential},
-    ssh_key::{
-        Algorithm, HashAlg, Mpint, Signature,
-        public::{EcdsaPublicKey, Ed25519PublicKey, KeyData, RsaPublicKey},
-        sec1::EncodedPoint,
-    },
-};
+use tokio::sync::oneshot;
 
 use crate::{
     ConnectionMode,
-    identity_cache::{PivCachedIdentity, SignOutcome, SignResult},
+    card::CardOperationOutcome,
     pin_cache::{PinCache, verify_pin_with_cache},
-    pinentry::{Applet, Pinentry, SystemPinentry},
+    pinentry::{Applet, Pinentry, PinentryEnv, SystemPinentry},
 };
 
-struct PivIdentity {
-    slot: Slot,
-    key_alg: KeyAlg,
-    ssh_identity: Identity,
+#[derive(Clone, Debug)]
+pub(crate) struct PivKeyInfo {
+    pub(crate) slot: Slot,
+    pub(crate) key_alg: KeyAlg,
+    pub(crate) public_key: PublicKey,
+    pub(crate) serial: Option<u128>,
 }
 
 #[derive(Clone)]
@@ -38,18 +27,22 @@ struct PivConfig {
 }
 
 enum PivRequest {
-    ListIdentities,
-    Sign {
-        credential: Box<PublicCredential>,
-        cached: Option<PivCachedIdentity>,
-        data: Vec<u8>,
-        rsa_sig_hash: Option<HashAlg>,
+    ListKeys {
+        refresh: bool,
+    },
+    SignRaw {
+        slot: Slot,
+        key_alg: KeyAlg,
+        expected_serial: Option<u128>,
+        prepared: Vec<u8>,
+        prompt_desc: Option<String>,
+        prompt_env: Option<Box<PinentryEnv>>,
     },
 }
 
 enum PivResponse {
-    Identities(Vec<(Identity, PivCachedIdentity)>),
-    Signature(SignResult<PivCachedIdentity>),
+    Keys(Vec<PivKeyInfo>),
+    Signed(CardOperationOutcome<Vec<u8>>),
 }
 
 enum WorkerMessage<Req, Res, E> {
@@ -212,7 +205,7 @@ enum PivBackend {
 }
 
 #[derive(Clone)]
-pub(super) struct PivSshAgent {
+pub(crate) struct PivCard {
     reader: String,
     config: PivConfig,
     backend: PivBackend,
@@ -333,8 +326,8 @@ pub(crate) fn parse_slot(s: &str) -> Result<Slot, String> {
     ))
 }
 
-impl PivSshAgent {
-    pub(super) fn new(
+impl PivCard {
+    pub(crate) fn new(
         reader: String,
         slots: Option<Vec<Slot>>,
         pinentry: SystemPinentry,
@@ -363,42 +356,61 @@ impl PivSshAgent {
         }
     }
 
-    pub(super) async fn disconnect(&self) {
+    pub(crate) async fn disconnect(&self) {
         if let PivBackend::Persistent(worker) = &self.backend {
             worker.disconnect().await;
         }
     }
 
-    pub(super) fn probe_identities(
+    pub(crate) fn list_keys_ephemeral(
         reader: &str,
         slots: Option<Vec<Slot>>,
-    ) -> Result<bool, crate::Error> {
+    ) -> Result<Vec<PivKeyInfo>, crate::Error> {
         let slots = match slots {
             Some(slots) => dedup_slots(slots),
             None => default_slots(),
         };
         PivSession::with_transaction(reader, |session| {
             let serial = session.status().ok().and_then(|status| status.serial);
-            list_ssh_identities(&slots, session, serial).map(|ids| !ids.is_empty())
+            list_keys_in_session(&slots, session, serial)
         })
     }
 
-    pub(super) async fn request_identities_with_metadata(
-        &self,
-    ) -> Result<Vec<(Identity, PivCachedIdentity)>, crate::Error> {
+    #[allow(dead_code)]
+    pub(crate) fn probe_identities(
+        reader: &str,
+        slots: Option<Vec<Slot>>,
+    ) -> Result<bool, crate::Error> {
+        Self::list_keys_ephemeral(reader, slots).map(|keys| !keys.is_empty())
+    }
+
+    pub(crate) async fn list_keys(&self) -> Result<Vec<PivKeyInfo>, crate::Error> {
+        self.list_keys_with_refresh(false).await
+    }
+
+    pub(crate) async fn refresh_and_list_keys(&self) -> Result<Vec<PivKeyInfo>, crate::Error> {
+        self.list_keys_with_refresh(true).await
+    }
+
+    async fn list_keys_with_refresh(&self, refresh: bool) -> Result<Vec<PivKeyInfo>, crate::Error> {
         match &self.backend {
             PivBackend::Ephemeral => {
                 tracing::debug!(
                     connection_mode = ?ConnectionMode::Ephemeral,
-                    "requesting PIV identities"
+                    refresh,
+                    "requesting PIV keys"
                 );
                 let reader = self.reader.clone();
                 let slots = self.config.slots.clone();
                 let session_state = Arc::clone(&self.session_state);
                 tokio::task::spawn_blocking(move || {
                     with_piv_transaction(&reader, &session_state, |session| {
-                        let serial = session.status().ok().and_then(|status| status.serial);
-                        list_ssh_identities(&slots, session, serial)
+                        let serial = if refresh {
+                            PivSlotSession::refresh(session)?
+                        } else {
+                            session.status().ok().and_then(|status| status.serial)
+                        };
+                        list_keys_in_session(&slots, session, serial)
                     })
                 })
                 .await
@@ -407,14 +419,15 @@ impl PivSshAgent {
             PivBackend::Persistent(worker) => {
                 tracing::debug!(
                     connection_mode = ?ConnectionMode::Persistent,
-                    "requesting PIV identities"
+                    refresh,
+                    "requesting PIV keys"
                 );
                 let response = self
-                    .send_persistent(worker, PivRequest::ListIdentities)
+                    .send_persistent(worker, PivRequest::ListKeys { refresh })
                     .await?;
                 match response {
-                    PivResponse::Identities(identities) => Ok(identities),
-                    PivResponse::Signature(_) => {
+                    PivResponse::Keys(keys) => Ok(keys),
+                    PivResponse::Signed(_) => {
                         Err(crate::Error::Other("unexpected PIV worker response".into()))
                     }
                 }
@@ -422,55 +435,37 @@ impl PivSshAgent {
         }
     }
 
-    pub(super) async fn sign(
+    pub(crate) async fn sign_raw(
         &self,
-        public_credential: &PublicCredential,
-        cached: Option<PivCachedIdentity>,
-        data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<SignResult<PivCachedIdentity>, crate::Error> {
-        match self
-            .sign_once(public_credential, cached, data, rsa_sig_hash)
-            .await
-        {
-            Err(err) if cached.is_some() && err.is_transport_error() => {
-                tracing::debug!(
-                    "cached PIV sign hit transport error, retrying with fresh scan: {err}"
-                );
-                self.sign_once(public_credential, None, data, rsa_sig_hash)
-                    .await
-            }
-            other => other,
-        }
-    }
-
-    async fn sign_once(
-        &self,
-        public_credential: &PublicCredential,
-        cached: Option<PivCachedIdentity>,
-        data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<SignResult<PivCachedIdentity>, crate::Error> {
+        slot: Slot,
+        key_alg: KeyAlg,
+        expected_serial: Option<u128>,
+        prepared: &[u8],
+        prompt_desc: Option<&str>,
+        prompt_env: Option<&PinentryEnv>,
+    ) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
         match &self.backend {
             PivBackend::Ephemeral => {
                 let reader = self.reader.clone();
                 let config = self.config.clone();
                 let session_state = Arc::clone(&self.session_state);
-                let public_credential = public_credential.clone();
-                let data = data.to_vec();
+                let prepared = prepared.to_vec();
+                let prompt_desc = prompt_desc.map(ToOwned::to_owned);
+                let prompt_env = prompt_env.cloned();
                 tokio::task::spawn_blocking(move || {
                     with_piv_transaction(&reader, &session_state, |session| {
-                        let mut serial = session.status().ok().and_then(|status| status.serial);
-                        sign_in_session(
-                            &config.slots,
+                        let serial = session.status().ok().and_then(|status| status.serial);
+                        sign_raw_in_session(
                             session,
-                            &mut serial,
-                            &public_credential,
-                            cached,
-                            &data,
-                            rsa_sig_hash,
+                            slot,
+                            key_alg,
+                            serial,
+                            expected_serial,
+                            &prepared,
                             &config.pinentry,
                             config.pin_cache.as_ref(),
+                            prompt_desc.as_deref(),
+                            prompt_env.as_ref(),
                         )
                     })
                 })
@@ -481,17 +476,19 @@ impl PivSshAgent {
                 let response = self
                     .send_persistent(
                         worker,
-                        PivRequest::Sign {
-                            credential: Box::new(public_credential.clone()),
-                            cached,
-                            data: data.to_vec(),
-                            rsa_sig_hash,
+                        PivRequest::SignRaw {
+                            slot,
+                            key_alg,
+                            expected_serial,
+                            prepared: prepared.to_vec(),
+                            prompt_desc: prompt_desc.map(ToOwned::to_owned),
+                            prompt_env: prompt_env.cloned().map(Box::new),
                         },
                     )
                     .await?;
                 match response {
-                    PivResponse::Signature(result) => Ok(result),
-                    PivResponse::Identities(_) => {
+                    PivResponse::Signed(outcome) => Ok(outcome),
+                    PivResponse::Keys(_) => {
                         Err(crate::Error::Other("unexpected PIV worker response".into()))
                     }
                 }
@@ -526,27 +523,33 @@ impl PivSshAgent {
                                     first_reply,
                                     rx,
                                     |req| match req {
-                                        PivRequest::ListIdentities => {
-                                            list_ssh_identities(&config.slots, session, serial)
-                                                .map(PivResponse::Identities)
+                                        PivRequest::ListKeys { refresh } => {
+                                            if refresh {
+                                                serial = PivSlotSession::refresh(session)?;
+                                            }
+                                            list_keys_in_session(&config.slots, session, serial)
+                                                .map(PivResponse::Keys)
                                         }
-                                        PivRequest::Sign {
-                                            credential,
-                                            cached,
-                                            data,
-                                            rsa_sig_hash,
-                                        } => sign_in_session(
-                                            &config.slots,
+                                        PivRequest::SignRaw {
+                                            slot,
+                                            key_alg,
+                                            expected_serial,
+                                            prepared,
+                                            prompt_desc,
+                                            prompt_env,
+                                        } => sign_raw_in_session(
                                             session,
-                                            &mut serial,
-                                            &credential,
-                                            cached,
-                                            &data,
-                                            rsa_sig_hash,
+                                            slot,
+                                            key_alg,
+                                            serial,
+                                            expected_serial,
+                                            &prepared,
                                             &config.pinentry,
                                             config.pin_cache.as_ref(),
+                                            prompt_desc.as_deref(),
+                                            prompt_env.as_deref(),
                                         )
-                                        .map(PivResponse::Signature),
+                                        .map(PivResponse::Signed),
                                     },
                                     crate::Error::is_transport_error,
                                 ))
@@ -567,43 +570,42 @@ impl PivSshAgent {
     }
 }
 
-fn list_identities(
+fn list_keys_in_session(
     slots: &[Slot],
     session: &mut impl PivSlotSession,
     serial: Option<u128>,
-) -> Result<Vec<PivIdentity>, crate::Error> {
-    let mut identities = Vec::new();
+) -> Result<Vec<PivKeyInfo>, crate::Error> {
+    let mut keys = Vec::new();
     for &slot in slots {
-        match slot_to_ssh_identity(session, slot, serial) {
-            Ok(Some(identity)) => identities.push(identity),
+        match read_slot_key(session, slot, serial) {
+            Ok(Some(key)) => keys.push(key),
             Ok(None) => {}
             Err(err) if err.is_transport_error() => return Err(err),
             Err(err) => {
-                tracing::warn!("failed to configure slot {slot:?} as PIV identity: {err}");
+                tracing::warn!("failed to read PIV slot {slot:?}: {err}");
             }
         }
     }
-    Ok(identities)
+    Ok(keys)
 }
 
-fn list_ssh_identities(
-    slots: &[Slot],
+fn read_slot_key(
     session: &mut impl PivSlotSession,
+    slot: Slot,
     serial: Option<u128>,
-) -> Result<Vec<(Identity, PivCachedIdentity)>, crate::Error> {
-    let identities = list_identities(slots, session, serial)?;
-    Ok(identities
-        .into_iter()
-        .inspect(|id| tracing::info!("found usable identity on slot {:?}", id.slot))
-        .map(|id| {
-            let meta = PivCachedIdentity {
-                slot: id.slot,
-                key_alg: id.key_alg,
-                serial,
-            };
-            (id.ssh_identity, meta)
-        })
-        .collect())
+) -> Result<Option<PivKeyInfo>, crate::Error> {
+    let Some(cert) = session.read_certificate(slot)? else {
+        return Ok(None);
+    };
+
+    let (key_alg, public_key) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)?;
+
+    Ok(Some(PivKeyInfo {
+        slot,
+        key_alg,
+        public_key,
+        serial,
+    }))
 }
 
 fn is_piv_stale_apdu_error(err: &crate::Error) -> bool {
@@ -627,237 +629,55 @@ fn is_piv_stale_apdu_error(err: &crate::Error) -> bool {
 }
 
 #[expect(clippy::too_many_arguments)]
-fn sign_in_session(
-    slots: &[Slot],
-    session: &mut impl PivSlotSession,
-    serial: &mut Option<u128>,
-    public_credential: &PublicCredential,
-    cached: Option<PivCachedIdentity>,
-    data: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
-    pinentry: &impl Pinentry,
-    pin_cache: Option<&PinCache>,
-) -> Result<SignResult<PivCachedIdentity>, crate::Error> {
-    if let Some(cached) = cached {
-        if *serial == cached.serial {
-            match sign_slot(
-                session,
-                cached.slot,
-                cached.key_alg,
-                *serial,
-                data,
-                rsa_sig_hash,
-                pinentry,
-                pin_cache,
-            ) {
-                Ok(Some(signature)) => {
-                    return Ok(SignResult {
-                        discovered: None,
-                        outcome: SignOutcome::Signed(signature),
-                    });
-                }
-                Ok(None) => {
-                    return Ok(SignResult {
-                        discovered: None,
-                        outcome: SignOutcome::UserCancelled,
-                    });
-                }
-                Err(err) if is_piv_stale_apdu_error(&err) => {
-                    tracing::debug!(
-                        slot = ?cached.slot,
-                        "cached PIV slot sign failed with stale APDU error, re-scanning: {err}"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
-        } else {
-            tracing::debug!(
-                cached_serial = ?cached.serial,
-                current_serial = ?*serial,
-                "PIV card serial changed; re-scanning slots"
-            );
-        }
-    }
-
-    *serial = session.refresh()?;
-    let identities = list_identities(slots, session, *serial)?;
-    let discovered: Vec<(PublicCredential, PivCachedIdentity)> = identities
-        .iter()
-        .map(|id| {
-            (
-                id.ssh_identity.credential.clone(),
-                PivCachedIdentity {
-                    slot: id.slot,
-                    key_alg: id.key_alg,
-                    serial: *serial,
-                },
-            )
-        })
-        .collect();
-
-    let piv_identity = identities
-        .into_iter()
-        .find(|id| &id.ssh_identity.credential == public_credential);
-
-    let Some(piv_identity) = piv_identity else {
-        tracing::debug!("not matching PIV identity for requested public key");
-        return Ok(SignResult {
-            discovered: Some(discovered),
-            outcome: SignOutcome::NotFound,
-        });
-    };
-
-    let outcome = match sign_slot(
-        session,
-        piv_identity.slot,
-        piv_identity.key_alg,
-        *serial,
-        data,
-        rsa_sig_hash,
-        pinentry,
-        pin_cache,
-    )? {
-        Some(signature) => SignOutcome::Signed(signature),
-        None => SignOutcome::UserCancelled,
-    };
-
-    Ok(SignResult {
-        discovered: Some(discovered),
-        outcome,
-    })
-}
-
-#[expect(clippy::too_many_arguments)]
-fn sign_slot(
+fn sign_raw_in_session(
     session: &mut impl PivSlotSession,
     slot: Slot,
     key_alg: KeyAlg,
-    serial: Option<u128>,
-    data: &[u8],
-    rsa_sig_hash: Option<HashAlg>,
+    current_serial: Option<u128>,
+    expected_serial: Option<u128>,
+    prepared: &[u8],
     pinentry: &impl Pinentry,
     pin_cache: Option<&PinCache>,
-) -> Result<Option<Signature>, crate::Error> {
-    let sig_hash = match keyroost_piv::x509::signature_hash(key_alg) {
-        Ok(sig_hash) => sig_hash,
-        Err(X509Error::UnsupportedAlgorithm) => return Ok(None),
-        Err(other) => return Err(crate::Error::Other(Box::new(other))),
-    };
-
-    let prepared = match sig_hash {
-        SigHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-        SigHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-        SigHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-        SigHash::None => data.to_vec(),
-    };
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
+) -> Result<CardOperationOutcome<Vec<u8>>, crate::Error> {
+    if let Some(expected) = expected_serial
+        && current_serial != Some(expected)
+    {
+        tracing::debug!(
+            expected_serial = expected,
+            ?current_serial,
+            "PIV card serial changed"
+        );
+        return Ok(CardOperationOutcome::NotFound);
+    }
 
     let pin_policy = session.slot_policy(slot).map(|(pin, _touch)| pin);
     tracing::debug!("slot {:?} PIN policy: {:?}", slot, pin_policy);
 
-    let Some(signature) = sign_with_policy(
-        session, slot, key_alg, &prepared, pin_policy, serial, pinentry, pin_cache,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    let signature = match key_alg {
-        KeyAlg::EccP256 => {
-            Signature::try_from(ecdsa::Signature::<p256::NistP256>::from_der(&signature)?)?
-        }
-        KeyAlg::EccP384 => {
-            Signature::try_from(ecdsa::Signature::<p384::NistP384>::from_der(&signature)?)?
-        }
-        KeyAlg::EccP521 => {
-            Signature::try_from(ecdsa::Signature::<p521::NistP521>::from_der(&signature)?)?
-        }
-
-        KeyAlg::Ed25519 => {
-            Signature::new(ssh_agent_lib::ssh_key::Algorithm::Ed25519, signature)?
-        }
-        KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-            let signature = match rsa_sig_hash {
-                Some(HashAlg::Sha256) => sha2::Sha256::digest(signature).to_vec(),
-                Some(HashAlg::Sha512) => sha2::Sha512::digest(signature).to_vec(),
-                None => signature,
-                Some(other) => {
-                    return Err(crate::Error::Other(
-                        format!("Unsupported RSA hash algorithm {other}").into(),
-                    ));
-                }
-            };
-            Signature::new(Algorithm::Rsa { hash: rsa_sig_hash }, signature)?
-        }
-        KeyAlg::X25519 => {
-            return Err(crate::Error::Other(
-                "Unsupported signature algorithm X25519".into(),
-            ));
-        }
-    };
-
-    Ok(Some(signature))
-}
-
-fn slot_to_ssh_identity(
-    session: &mut impl PivSlotSession,
-    slot: Slot,
-    serial: Option<u128>,
-) -> Result<Option<PivIdentity>, crate::Error> {
-    let Some(cert) = session.read_certificate(slot)? else {
-        return Ok(None);
-    };
-
-    let (key_alg, public_key) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)?;
-
-    let comment = if let Some(serial) = serial {
-        format!("PIV {serial}:{slot:?}")
-    } else {
-        format!("PIV {slot:?}")
-    };
-    Ok(Some(PivIdentity {
+    match sign_with_policy(
+        session,
         slot,
         key_alg,
-        ssh_identity: Identity {
-            credential: ssh_public_credentials(key_alg, public_key)?,
-            comment,
-        },
-    }))
-}
-
-fn ssh_public_credentials(
-    key_alg: KeyAlg,
-    public_key: PublicKey,
-) -> Result<PublicCredential, crate::Error> {
-    let key_data = match public_key {
-        PublicKey::Rsa { modulus, exponent } => KeyData::Rsa(RsaPublicKey {
-            n: Mpint::from_positive_bytes(&modulus)?,
-            e: Mpint::from_positive_bytes(&exponent)?,
-        }),
-        PublicKey::Ecc { point } => match key_alg {
-            KeyAlg::EccP256 => {
-                KeyData::Ecdsa(EcdsaPublicKey::NistP256(EncodedPoint::from_bytes(&point)?))
-            }
-            KeyAlg::EccP384 => {
-                KeyData::Ecdsa(EcdsaPublicKey::NistP384(EncodedPoint::from_bytes(&point)?))
-            }
-            KeyAlg::EccP521 => {
-                KeyData::Ecdsa(EcdsaPublicKey::NistP521(EncodedPoint::from_bytes(&point)?))
-            }
-            KeyAlg::Ed25519 => KeyData::Ed25519(Ed25519PublicKey::try_from(point.as_slice())?),
-            KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-                return Err(crate::Error::Other(
-                    format!("Invalid KeyAlg {key_alg:?} and for PublicKey::Ecc").into(),
-                ));
-            }
-            KeyAlg::X25519 => {
-                // NOTE: this is technically unreachable because keyroost_piv::x509::signature_hash will already have returned "not supported"
-                return Err(crate::Error::SshKey(
-                    ssh_agent_lib::ssh_key::Error::AlgorithmUnknown,
-                ));
-            }
-        },
-    };
-    Ok(PublicCredential::Key(key_data))
+        prepared,
+        pin_policy,
+        current_serial,
+        pinentry,
+        pin_cache,
+        prompt_desc,
+        prompt_env,
+    ) {
+        Ok(Some(signature)) => Ok(CardOperationOutcome::Completed(signature)),
+        Ok(None) => Ok(CardOperationOutcome::UserCancelled),
+        Err(err) if is_piv_stale_apdu_error(&err) => {
+            tracing::debug!(
+                slot = ?slot,
+                "PIV slot sign failed with stale APDU error: {err}"
+            );
+            Ok(CardOperationOutcome::NotFound)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 trait PivSigner {
@@ -921,6 +741,8 @@ fn sign_with_policy(
     serial: Option<u128>,
     pinentry: &impl Pinentry,
     pin_cache: Option<&PinCache>,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     match pin_policy {
         Some(PinPolicy::Never) => Ok(Some(signer.sign(slot, alg, prepared)?)),
@@ -931,6 +753,8 @@ fn sign_with_policy(
                 false,
                 pin_cache,
                 pinentry,
+                prompt_desc,
+                prompt_env,
                 |pin| signer.verify_pin(pin),
                 is_piv_wrong_pin,
             )? {
@@ -948,6 +772,8 @@ fn sign_with_policy(
                     true,
                     pin_cache,
                     pinentry,
+                    prompt_desc,
+                    prompt_env,
                     |pin| signer.verify_pin(pin),
                     is_piv_wrong_pin,
                 )? {
@@ -962,7 +788,10 @@ fn sign_with_policy(
 
 #[cfg(test)]
 mod tests {
-    use super::{PivSigner, PivSshAgent, default_slots, parse_slot, sign_with_policy};
+    use super::{
+        CardOperationOutcome, PivCard, PivSigner, PivSlotSession, default_slots, parse_slot,
+        sign_raw_in_session, sign_with_policy,
+    };
     use crate::{
         ConnectionMode,
         pin_cache::PinCache,
@@ -1034,19 +863,19 @@ mod tests {
     }
 
     #[test]
-    fn piv_agent_new_defaults_and_deduplicates_explicit_slots() {
-        let default_agent = PivSshAgent::new(
+    fn piv_card_new_defaults_and_deduplicates_explicit_slots() {
+        let default_card = PivCard::new(
             "reader".to_owned(),
             None,
             SystemPinentry::default(),
             ConnectionMode::Ephemeral,
             None,
         );
-        assert_eq!(default_agent.config.slots, default_slots());
-        assert!(!default_agent.config.slots.contains(&Slot::KeyManagement));
-        assert_eq!(default_agent.config.slots.len(), 23);
+        assert_eq!(default_card.config.slots, default_slots());
+        assert!(!default_card.config.slots.contains(&Slot::KeyManagement));
+        assert_eq!(default_card.config.slots.len(), 23);
 
-        let custom_agent = PivSshAgent::new(
+        let custom_card = PivCard::new(
             "reader".to_owned(),
             Some(vec![
                 Slot::Signature,
@@ -1060,7 +889,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            custom_agent.config.slots,
+            custom_card.config.slots,
             vec![Slot::Signature, Slot::KeyManagement, Slot::Authentication]
         );
     }
@@ -1190,7 +1019,7 @@ mod tests {
 
     #[test]
     fn never_policy_signs_without_prompting_or_verifying() {
-        let mut signer = MockSigner::new(true, vec![1, 2, 3]);
+        let mut signer = MockSigner::new(false, vec![1, 2, 3]);
         let pinentry = MockPinentry::new(Some("123456"));
 
         let res = sign_with_policy(
@@ -1202,13 +1031,33 @@ mod tests {
             Some(1234),
             &pinentry,
             None,
+            None,
+            None,
         )
-        .unwrap();
-
-        assert_eq!(res, Some(vec![1, 2, 3]));
+        .unwrap_err();
+        assert!(matches!(res, crate::Error::Other(_)));
         assert_eq!(pinentry.prompts(), 0);
         assert_eq!(signer.verifies, 0);
         assert_eq!(signer.signs, 1);
+
+        let mut verified_signer = MockSigner::new(true, vec![1, 2, 3]);
+        let res = sign_with_policy(
+            &mut verified_signer,
+            Slot::CardAuthentication,
+            KeyAlg::EccP256,
+            b"msg",
+            Some(PinPolicy::Never),
+            Some(1234),
+            &pinentry,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res, Some(vec![1, 2, 3]));
+        assert_eq!(pinentry.prompts(), 0);
+        assert_eq!(verified_signer.verifies, 0);
+        assert_eq!(verified_signer.signs, 1);
     }
 
     #[test]
@@ -1224,6 +1073,8 @@ mod tests {
             Some(PinPolicy::Always),
             Some(1234),
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -1248,6 +1099,8 @@ mod tests {
             Some(1234),
             &pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1269,6 +1122,8 @@ mod tests {
             Some(PinPolicy::Once),
             Some(1234),
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -1293,6 +1148,8 @@ mod tests {
             Some(1234),
             &pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1315,6 +1172,8 @@ mod tests {
             Some(PinPolicy::Once),
             Some(1234),
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -1339,6 +1198,8 @@ mod tests {
                 Some(1234),
                 &pinentry,
                 None,
+                None,
+                None,
             )
             .unwrap();
             assert_eq!(res, Some(vec![42]));
@@ -1356,6 +1217,8 @@ mod tests {
                 policy,
                 Some(1234),
                 &pinentry_cached,
+                None,
+                None,
                 None,
             )
             .unwrap();
@@ -1381,6 +1244,8 @@ mod tests {
             Some(1234),
             &pinentry,
             None,
+            None,
+            None,
         )
         .unwrap_err();
 
@@ -1404,6 +1269,8 @@ mod tests {
             Some(1234),
             &pinentry,
             Some(&cache),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1431,6 +1298,8 @@ mod tests {
             Some(1234),
             &pinentry,
             Some(&cache),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1457,6 +1326,8 @@ mod tests {
             Some(1234),
             &pinentry,
             Some(&cache),
+            None,
+            None,
         )
         .unwrap_err();
 
@@ -1504,6 +1375,8 @@ mod tests {
                 Some(1234),
                 &pinentry,
                 Some(&cache),
+                None,
+                None,
             )
             .unwrap();
 
@@ -1541,6 +1414,8 @@ mod tests {
             Some(1234),
             &pinentry,
             Some(&cache),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1583,6 +1458,8 @@ mod tests {
                 Some(1234),
                 &pinentry,
                 Some(&cache),
+                None,
+                None,
             )
             .unwrap_err();
 
@@ -1609,6 +1486,8 @@ mod tests {
             Some(1234),
             &pinentry,
             Some(&empty_cache),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1632,6 +1511,8 @@ mod tests {
             Some(1234),
             &pinentry2,
             Some(&populated_cache),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1661,6 +1542,8 @@ mod tests {
             Some(1234),
             &pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1686,6 +1569,8 @@ mod tests {
             Some(1234),
             &pinentry2,
             None,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, crate::Error::Other(_)));
@@ -1709,6 +1594,8 @@ mod tests {
             Some(PinPolicy::Always),
             Some(1234),
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap_err();
@@ -1872,6 +1759,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1879,17 +1767,16 @@ mod tests {
         let counters = MockCounters::new();
         let worker = super::PersistentWorker::new();
 
-        // Disconnect before any request is a no-op and does not open a session.
-        worker.disconnect().await;
-        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
-
         assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         worker.disconnect().await;
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        // Next request lazily opens a new transaction.
+        // Disconnecting while already disconnected is a no-op.
+        worker.disconnect().await;
+        assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+
         assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(2));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1898,32 +1785,31 @@ mod tests {
     #[tokio::test]
     async fn persistent_worker_clone_shares_active_transaction() {
         let counters = MockCounters::new();
-        let worker1 = super::PersistentWorker::new();
-        let worker2 = worker1.clone();
+        let worker_a = super::PersistentWorker::new();
+        let worker_b = worker_a.clone();
 
-        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping).await, Ok(1));
-        assert_eq!(send_mock(&worker2, &counters, MockReq::Ping).await, Ok(1));
+        assert_eq!(send_mock(&worker_a, &counters, MockReq::Ping).await, Ok(1));
+        assert_eq!(send_mock(&worker_b, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        worker2.disconnect().await;
+        worker_b.disconnect().await;
         assert_eq!(counters.active.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(send_mock(&worker1, &counters, MockReq::Ping).await, Ok(2));
+        assert_eq!(send_mock(&worker_a, &counters, MockReq::Ping).await, Ok(2));
     }
 
     #[tokio::test]
     async fn persistent_worker_propagates_open_failure_and_retries_next_request() {
         let counters = MockCounters::new();
+        let worker = super::PersistentWorker::new();
         counters
             .fail_next_open
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let worker = super::PersistentWorker::new();
 
         assert_eq!(
             send_mock(&worker, &counters, MockReq::Ping).await,
             Err(MockErr::Transport)
         );
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
-
         assert_eq!(send_mock(&worker, &counters, MockReq::Ping).await, Ok(1));
         assert_eq!(counters.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1931,8 +1817,8 @@ mod tests {
     struct MockSlotSession {
         signer: MockSigner,
         refreshes: usize,
-        refreshed_serial: Option<u128>,
         cert_reads: usize,
+        refreshed_serial: Option<u128>,
         policy: Option<(PinPolicy, keyroost_piv::TouchPolicy)>,
     }
 
@@ -1941,8 +1827,8 @@ mod tests {
             Self {
                 signer: MockSigner::new(verified, sign_result),
                 refreshes: 0,
-                refreshed_serial: Some(42),
                 cert_reads: 0,
+                refreshed_serial: Some(42),
                 policy: Some((PinPolicy::Once, keyroost_piv::TouchPolicy::Never)),
             }
         }
@@ -1963,7 +1849,7 @@ mod tests {
         }
     }
 
-    impl super::PivSlotSession for MockSlotSession {
+    impl PivSlotSession for MockSlotSession {
         fn refresh(&mut self) -> Result<Option<u128>, TransportError> {
             self.refreshes += 1;
             Ok(self.refreshed_serial)
@@ -1979,86 +1865,57 @@ mod tests {
         }
     }
 
-    fn dummy_ed25519_cred() -> ssh_agent_lib::proto::PublicCredential {
-        ssh_agent_lib::proto::PublicCredential::Key(
-            ssh_agent_lib::ssh_key::public::KeyData::Ed25519(
-                ssh_agent_lib::ssh_key::public::Ed25519PublicKey([0x11; 32]),
-            ),
-        )
-    }
-
     #[test]
-    fn sign_cached_signs_directly_without_reading_certificates() {
+    fn sign_raw_signs_directly_when_serial_matches() {
         let mut session = MockSlotSession::new(true, vec![0xAA; 64]);
         let pinentry = MockPinentry::new(Some("123456"));
-        let cached = crate::identity_cache::PivCachedIdentity {
-            slot: Slot::Authentication,
-            key_alg: KeyAlg::Ed25519,
-            serial: Some(42),
-        };
-        let mut serial = Some(42);
 
-        let result = super::sign_in_session(
-            &[Slot::Authentication, Slot::Signature],
+        let outcome = sign_raw_in_session(
             &mut session,
-            &mut serial,
-            &dummy_ed25519_cred(),
-            Some(cached),
+            Slot::Authentication,
+            KeyAlg::Ed25519,
+            Some(42),
+            Some(42),
             b"challenge",
-            None,
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
 
-        assert!(result.discovered.is_none());
-        assert!(matches!(
-            result.outcome,
-            crate::identity_cache::SignOutcome::Signed(_)
-        ));
+        assert_eq!(outcome, CardOperationOutcome::Completed(vec![0xAA; 64]));
         assert_eq!(session.refreshes, 0);
         assert_eq!(session.cert_reads, 0);
         assert_eq!(session.signer.signs, 1);
     }
 
     #[test]
-    fn sign_cached_rescans_in_session_on_serial_mismatch_without_signing_cached_slot() {
+    fn sign_raw_returns_not_found_on_serial_mismatch_without_signing() {
         let mut session = MockSlotSession::new(true, vec![0xAA; 64]);
-        session.refreshed_serial = Some(99);
         let pinentry = MockPinentry::new(Some("123456"));
-        let cached = crate::identity_cache::PivCachedIdentity {
-            slot: Slot::Authentication,
-            key_alg: KeyAlg::Ed25519,
-            serial: Some(42),
-        };
-        let mut serial = Some(99);
 
-        let result = super::sign_in_session(
-            &[Slot::Authentication, Slot::Signature],
+        let outcome = sign_raw_in_session(
             &mut session,
-            &mut serial,
-            &dummy_ed25519_cred(),
-            Some(cached),
+            Slot::Authentication,
+            KeyAlg::Ed25519,
+            Some(99),
+            Some(42),
             b"challenge",
-            None,
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
 
-        assert_eq!(result.discovered, Some(vec![]));
-        assert!(matches!(
-            result.outcome,
-            crate::identity_cache::SignOutcome::NotFound
-        ));
-        assert_eq!(session.refreshes, 1);
-        assert_eq!(session.cert_reads, 2);
+        assert_eq!(outcome, CardOperationOutcome::NotFound);
         assert_eq!(session.signer.signs, 0);
         assert_eq!(pinentry.prompts(), 0);
     }
 
     #[test]
-    fn sign_cached_rescans_on_missing_slot_apdu_and_stops_on_user_cancel() {
+    fn sign_raw_returns_not_found_on_stale_apdu_and_user_cancelled_on_cancel() {
         let mut stale_session = MockSlotSession::new(true, vec![]);
         stale_session.signer.sign_error = Some(|| TransportError::Apdu {
             label: "GENERAL AUTHENTICATE",
@@ -2066,75 +1923,38 @@ mod tests {
             sw2: 0x88,
         });
         let pinentry = MockPinentry::new(Some("123456"));
-        let cached = crate::identity_cache::PivCachedIdentity {
-            slot: Slot::Authentication,
-            key_alg: KeyAlg::Ed25519,
-            serial: Some(42),
-        };
-        let mut serial = Some(42);
 
-        let result = super::sign_in_session(
-            &[Slot::Authentication],
+        let outcome = sign_raw_in_session(
             &mut stale_session,
-            &mut serial,
-            &dummy_ed25519_cred(),
-            Some(cached),
+            Slot::Authentication,
+            KeyAlg::Ed25519,
+            Some(42),
+            Some(42),
             b"challenge",
-            None,
             &pinentry,
+            None,
+            None,
             None,
         )
         .unwrap();
-        assert_eq!(result.discovered, Some(vec![]));
-        assert!(matches!(
-            result.outcome,
-            crate::identity_cache::SignOutcome::NotFound
-        ));
-        assert_eq!(stale_session.refreshes, 1);
-        assert_eq!(stale_session.cert_reads, 1);
+        assert_eq!(outcome, CardOperationOutcome::NotFound);
 
         let mut cancel_session = MockSlotSession::new(false, vec![0xAA; 64]);
         let cancel_pinentry = MockPinentry::new(None);
-        let cancel_result = super::sign_in_session(
-            &[Slot::Authentication],
+        let cancel_outcome = sign_raw_in_session(
             &mut cancel_session,
-            &mut serial,
-            &dummy_ed25519_cred(),
-            Some(cached),
+            Slot::Authentication,
+            KeyAlg::Ed25519,
+            Some(42),
+            Some(42),
             b"challenge",
-            None,
             &cancel_pinentry,
             None,
+            None,
+            None,
         )
         .unwrap();
-        assert!(cancel_result.discovered.is_none());
-        assert!(matches!(
-            cancel_result.outcome,
-            crate::identity_cache::SignOutcome::UserCancelled
-        ));
-        assert_eq!(cancel_session.refreshes, 0);
-        assert_eq!(cancel_session.cert_reads, 0);
+        assert_eq!(cancel_outcome, CardOperationOutcome::UserCancelled);
         assert_eq!(cancel_pinentry.prompts(), 1);
-    }
-
-    #[test]
-    fn rsa_public_key_with_msb_set_encodes_as_positive_mpint() {
-        let mut modulus = vec![0x80; 256];
-        modulus[255] = 0x01;
-        let cred = super::ssh_public_credentials(
-            KeyAlg::Rsa2048,
-            keyroost_piv::PublicKey::Rsa {
-                modulus: modulus.clone(),
-                exponent: vec![0x00, 0x01, 0x00, 0x01],
-            },
-        )
-        .unwrap();
-
-        let super::PublicCredential::Key(super::KeyData::Rsa(rsa)) = cred else {
-            panic!("expected RSA key data");
-        };
-        assert_eq!(rsa.n.as_bytes()[0], 0x00);
-        assert_eq!(rsa.n.as_positive_bytes(), Some(modulus.as_slice()));
-        assert_eq!(rsa.e.as_positive_bytes(), Some([0x01, 0x00, 0x01].as_slice()));
     }
 }

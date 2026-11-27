@@ -7,7 +7,7 @@ use std::{
 use keyroost_transport::TransportError;
 use ssh_agent_lib::secrecy::{ExposeSecret, SecretBox};
 
-use crate::pinentry::{Applet, PinPromptOptions, Pinentry};
+use crate::pinentry::{Applet, PinPromptOptions, Pinentry, PinentryEnv};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PinCacheKey {
@@ -144,12 +144,15 @@ impl PinCache {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn verify_pin_with_cache(
     applet: Applet,
     serial: Option<u128>,
     allow_cache: bool,
     pin_cache: Option<&PinCache>,
     pinentry: &impl Pinentry,
+    prompt_desc: Option<&str>,
+    prompt_env: Option<&PinentryEnv>,
     mut verify: impl FnMut(&[u8]) -> Result<(), TransportError>,
     is_wrong_pin: impl Fn(&TransportError) -> bool,
 ) -> Result<bool, crate::Error> {
@@ -184,7 +187,8 @@ pub(crate) fn verify_pin_with_cache(
         PinPromptOptions {
             allow_external_cache: use_external_cache,
             error: None,
-            ..Default::default()
+            description: prompt_desc,
+            env: prompt_env,
         },
     )?
     else {
@@ -210,7 +214,8 @@ pub(crate) fn verify_pin_with_cache(
                 PinPromptOptions {
                     allow_external_cache: false,
                     error: Some("Incorrect PIN"),
-                    ..Default::default()
+                    description: prompt_desc,
+                    env: prompt_env,
                 },
             )?
             else {

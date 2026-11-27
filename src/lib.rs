@@ -1,24 +1,24 @@
-use ssh_agent_lib::{
-    error::AgentError,
-    proto::{Extension, Identity, ProtoError, PublicCredential, SignRequest},
-    ssh_key::{HashAlg, Signature},
-};
 use std::path::Path;
 use std::time::Duration;
 use tokio::net::UnixListener;
-use tracing::{debug, trace};
+use tracing::debug;
 
 mod assuan;
+mod card;
 mod error;
-mod identity_cache;
 mod idle;
-mod openpgp;
 mod pin_cache;
 mod pinentry;
-mod piv;
+mod protocol;
 
 pub(crate) use crate::error::Error;
-use crate::idle::{AbortOnDrop, IdleTracker, run_idle_disconnect_loop, run_with_idle_exit};
+use crate::{
+    card::{openpgp::OpenPgpCard, piv::PivCard},
+    idle::{AbortOnDrop, IdleTracker, run_idle_disconnect_loop, run_with_idle_exit},
+    protocol::ssh::{
+        SshAgent, openpgp::OpenPgpSshFrontend, piv::PivSshFrontend, serve as serve_ssh,
+    },
+};
 pub use keyroost_piv::Slot as PivSlot;
 
 /// Configuration options for the PIV smart-card applet.
@@ -81,7 +81,7 @@ impl OpenPgpOptions {
 ///
 /// Returns an error message if `s` is not a recognized PIV slot identifier.
 pub fn parse_piv_slot(s: &str) -> Result<PivSlot, String> {
-    piv::parse_slot(s)
+    card::piv::parse_slot(s)
 }
 
 /// Strategy for managing PC/SC connections to a smart-card applet.
@@ -193,7 +193,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 ///
 /// Returns an error if communicating with the PIV applet fails.
 pub fn probe_piv_identities(options: &PivOptions) -> Result<bool, std::io::Error> {
-    piv::PivSshAgent::probe_identities(&options.reader, options.slots.clone())
+    PivSshFrontend::probe_identities(&options.reader, options.slots.clone())
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
@@ -203,235 +203,8 @@ pub fn probe_piv_identities(options: &PivOptions) -> Result<bool, std::io::Error
 ///
 /// Returns an error if communicating with the `OpenPGP` applet fails.
 pub fn probe_openpgp_identities(options: &OpenPgpOptions) -> Result<bool, std::io::Error> {
-    openpgp::OpenPgpSshAgent::probe_identities(&options.reader)
+    OpenPgpSshFrontend::probe_identities(&options.reader)
         .map_err(|err| std::io::Error::other(err.to_string()))
-}
-
-#[derive(Clone)]
-struct KeyroostAgent {
-    piv: Option<piv::PivSshAgent>,
-    openpgp: Option<openpgp::OpenPgpSshAgent>,
-    idle_tracker: IdleTracker,
-    pin_cache: Option<pin_cache::PinCache>,
-    identity_cache: identity_cache::IdentityCache,
-}
-
-impl KeyroostAgent {
-    async fn disconnect(&self) {
-        if let Some(piv) = &self.piv {
-            piv.disconnect().await;
-        }
-        if let Some(openpgp) = &self.openpgp {
-            openpgp.disconnect().await;
-        }
-    }
-
-    fn clear_pin_cache(&self) {
-        if let Some(pin_cache) = &self.pin_cache {
-            pin_cache.clear();
-        }
-    }
-
-    fn clear_identity_cache(&self) {
-        self.identity_cache.clear();
-    }
-
-    async fn sign_piv(
-        &self,
-        credential: &PublicCredential,
-        cached: Option<identity_cache::PivCachedIdentity>,
-        data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<Option<identity_cache::SignOutcome>, AgentError> {
-        let Some(piv) = &self.piv else {
-            return Ok(None);
-        };
-        let result = piv.sign(credential, cached, data, rsa_sig_hash).await?;
-        if let Some(discovered) = result.discovered {
-            self.identity_cache.replace_piv(discovered);
-        }
-        Ok(Some(result.outcome))
-    }
-
-    async fn sign_openpgp(
-        &self,
-        credential: &PublicCredential,
-        cached: Option<identity_cache::OpenPgpCachedIdentity>,
-        data: &[u8],
-        rsa_sig_hash: Option<HashAlg>,
-    ) -> Result<Option<identity_cache::SignOutcome>, AgentError> {
-        let Some(openpgp) = &self.openpgp else {
-            return Ok(None);
-        };
-        let result = openpgp.sign(credential, cached, data, rsa_sig_hash).await?;
-        if let Some(discovered) = result.discovered {
-            self.identity_cache.replace_openpgp(discovered);
-        }
-        Ok(Some(result.outcome))
-    }
-}
-
-#[ssh_agent_lib::async_trait]
-impl ssh_agent_lib::agent::Session for KeyroostAgent {
-    async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        debug!("request_identities");
-        self.idle_tracker.record_activity();
-        let mut identities = Vec::new();
-        if let Some(piv) = &self.piv {
-            let discovered = piv.request_identities_with_metadata().await?;
-            self.identity_cache.replace_piv(
-                discovered
-                    .iter()
-                    .map(|(id, meta)| (id.credential.clone(), *meta)),
-            );
-            identities.extend(discovered.into_iter().map(|(id, _)| id));
-        }
-        if let Some(openpgp) = &self.openpgp {
-            let discovered = openpgp.request_identities_with_metadata().await?;
-            self.identity_cache.replace_openpgp(
-                discovered
-                    .iter()
-                    .map(|(id, meta)| (id.credential.clone(), *meta)),
-            );
-            identities.extend(discovered.into_iter().map(|(id, _)| id));
-        }
-        self.idle_tracker.record_activity();
-        Ok(identities)
-    }
-
-    async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        debug!("sign({})", format_credential(&request.credential));
-        self.idle_tracker.record_activity();
-
-        let rsa_sig_hash = if request.flags & 0x02 != 0 {
-            Some(HashAlg::Sha256)
-        } else if request.flags & 0x04 != 0 {
-            Some(HashAlg::Sha512)
-        } else {
-            None
-        };
-
-        let mut skip_piv = false;
-        let mut skip_openpgp = false;
-
-        if let Some(cached) = self.identity_cache.get(&request.credential) {
-            let outcome = match cached {
-                identity_cache::CachedIdentity::Piv(piv_cached) => {
-                    skip_piv = true;
-                    self.sign_piv(
-                        &request.credential,
-                        Some(piv_cached),
-                        &request.data,
-                        rsa_sig_hash,
-                    )
-                    .await?
-                }
-                identity_cache::CachedIdentity::OpenPgp(pgp_cached) => {
-                    skip_openpgp = true;
-                    self.sign_openpgp(
-                        &request.credential,
-                        Some(pgp_cached),
-                        &request.data,
-                        rsa_sig_hash,
-                    )
-                    .await?
-                }
-            };
-
-            match outcome {
-                Some(identity_cache::SignOutcome::Signed(signature)) => {
-                    self.idle_tracker.record_activity();
-                    return Ok(signature);
-                }
-                Some(identity_cache::SignOutcome::UserCancelled) => {
-                    self.idle_tracker.record_activity();
-                    return Err(AgentError::Failure);
-                }
-                Some(identity_cache::SignOutcome::NotFound) => {}
-                None => self.identity_cache.evict(&request.credential),
-            }
-        }
-
-        if !skip_piv
-            && let Some(outcome) = self
-                .sign_piv(&request.credential, None, &request.data, rsa_sig_hash)
-                .await?
-        {
-            match outcome {
-                identity_cache::SignOutcome::Signed(signature) => {
-                    self.idle_tracker.record_activity();
-                    return Ok(signature);
-                }
-                identity_cache::SignOutcome::UserCancelled => {
-                    self.idle_tracker.record_activity();
-                    return Err(AgentError::Failure);
-                }
-                identity_cache::SignOutcome::NotFound => {}
-            }
-        }
-
-        if !skip_openpgp
-            && let Some(outcome) = self
-                .sign_openpgp(&request.credential, None, &request.data, rsa_sig_hash)
-                .await?
-        {
-            match outcome {
-                identity_cache::SignOutcome::Signed(signature) => {
-                    self.idle_tracker.record_activity();
-                    return Ok(signature);
-                }
-                identity_cache::SignOutcome::UserCancelled => {
-                    self.idle_tracker.record_activity();
-                    return Err(AgentError::Failure);
-                }
-                identity_cache::SignOutcome::NotFound => {}
-            }
-        }
-
-        self.idle_tracker.record_activity();
-        Err(AgentError::Failure)
-    }
-
-    async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
-        debug!("remove_all_identities");
-        self.disconnect().await;
-        self.clear_pin_cache();
-        self.clear_identity_cache();
-        Ok(())
-    }
-
-    async fn lock(&mut self, _key: String) -> Result<(), AgentError> {
-        debug!("lock");
-        self.disconnect().await;
-        self.clear_pin_cache();
-        self.clear_identity_cache();
-        Ok(())
-    }
-
-    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
-        let details = extension.details.as_ref();
-        debug!(
-            name = %extension.name,
-            details_len = details.len(),
-            "extension"
-        );
-        trace!(
-            name = %extension.name,
-            ?details,
-            "extension details"
-        );
-        Err(AgentError::from(ProtoError::UnsupportedCommand {
-            command: 27,
-        }))
-    }
-}
-
-fn map_listen_result(result: Result<(), AgentError>) -> Result<(), std::io::Error> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(AgentError::IO(e)) => Err(e),
-        Err(other) => Err(std::io::Error::other(other.to_string())),
-    }
 }
 
 /// Launch an SSH agent and bind it to the specified socket path.
@@ -471,23 +244,27 @@ pub async fn run_with_listener(
     };
     let pinentry = pinentry::SystemPinentry::new(pinentry_binary, external_pin_cache);
     let idle_tracker = IdleTracker::new();
-    let agent = KeyroostAgent {
-        piv: piv.map(|opts| {
-            piv::PivSshAgent::new(
+    let agent = SshAgent::new(
+        piv.map(|opts| {
+            PivSshFrontend::new(PivCard::new(
                 opts.reader,
                 opts.slots,
                 pinentry.clone(),
                 connection_mode,
                 pin_cache.clone(),
-            )
+            ))
         }),
-        openpgp: openpgp.map(|opts| {
-            openpgp::OpenPgpSshAgent::new(opts.reader, pinentry, connection_mode, pin_cache.clone())
+        openpgp.map(|opts| {
+            OpenPgpSshFrontend::new(OpenPgpCard::new(
+                opts.reader,
+                pinentry,
+                connection_mode,
+                pin_cache.clone(),
+            ))
         }),
-        idle_tracker: idle_tracker.clone(),
+        idle_tracker.clone(),
         pin_cache,
-        identity_cache: identity_cache::IdentityCache::new(),
-    };
+    );
 
     let active_timeout = if connection_mode == ConnectionMode::Persistent {
         idle_timeout.filter(|timeout| !timeout.is_zero())
@@ -497,9 +274,7 @@ pub async fn run_with_listener(
 
     if let Some(timeout) = active_timeout {
         if exit_on_idle {
-            let server = async {
-                map_listen_result(ssh_agent_lib::agent::listen(listener, agent.clone()).await)
-            };
+            let server = serve_ssh(listener, agent.clone());
             let disconnect_agent = agent.clone();
             return run_with_idle_exit(server, &idle_tracker, timeout, move || async move {
                 disconnect_agent.disconnect().await;
@@ -523,36 +298,17 @@ pub async fn run_with_listener(
             },
         )));
 
-        let result = map_listen_result(ssh_agent_lib::agent::listen(listener, agent.clone()).await);
+        let result = serve_ssh(listener, agent.clone()).await;
         agent.disconnect().await;
         return result;
     }
 
-    map_listen_result(ssh_agent_lib::agent::listen(listener, agent).await)
-}
-
-fn format_credential(credential: &PublicCredential) -> String {
-    let key = credential.key_data();
-    format!("{} {}", key.algorithm(), key.fingerprint(HashAlg::Sha256))
+    serve_ssh(listener, agent).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConnectionMode, IdleTracker, KeyroostAgent, KeyroostAgentOptions, format_credential,
-        openpgp, parse_duration, pinentry, piv, run_with_listener,
-    };
-    use crate::{
-        identity_cache::{CachedIdentity, IdentityCache, PivCachedIdentity},
-        pin_cache::PinCache,
-        pinentry::Applet,
-    };
-    use ssh_agent_lib::{
-        agent::Session,
-        proto::PublicCredential,
-        secrecy::SecretBox,
-        ssh_key::public::{Ed25519PublicKey, KeyData},
-    };
+    use super::{ConnectionMode, KeyroostAgentOptions, parse_duration, run_with_listener};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::net::{UnixListener, UnixStream};
@@ -563,13 +319,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
-    }
-
-    #[test]
-    fn format_credential_shows_algorithm_and_fingerprint() {
-        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x11; 32])));
-        let formatted = format_credential(&cred);
-        assert!(formatted.starts_with("ssh-ed25519 SHA256:"));
     }
 
     #[test]
@@ -613,31 +362,6 @@ mod tests {
                 "expected '{invalid}' to fail parsing"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn remove_all_identities_and_lock_disconnect_cleanly() {
-        let mut agent = KeyroostAgent {
-            piv: Some(piv::PivSshAgent::new(
-                "mock-reader".to_owned(),
-                None,
-                pinentry::SystemPinentry::default(),
-                ConnectionMode::Persistent,
-                None,
-            )),
-            openpgp: Some(openpgp::OpenPgpSshAgent::new(
-                "mock-reader".to_owned(),
-                pinentry::SystemPinentry::default(),
-                ConnectionMode::Persistent,
-                None,
-            )),
-            idle_tracker: IdleTracker::new(),
-            pin_cache: None,
-            identity_cache: IdentityCache::new(),
-        };
-
-        agent.remove_all_identities().await.unwrap();
-        agent.lock("passphrase".to_owned()).await.unwrap();
     }
 
     #[tokio::test]
@@ -685,112 +409,5 @@ mod tests {
             "expected SSH agent request at 40ms to reset 80ms idle timer, elapsed: {:?}",
             start.elapsed()
         );
-    }
-
-    #[tokio::test]
-    async fn remove_all_identities_clears_pin_cache() {
-        let cache = PinCache::new(Duration::from_secs(60), None);
-        cache.insert(
-            Applet::Piv,
-            Some(1),
-            SecretBox::from(Box::<str>::from("123456")),
-        );
-        cache.insert(
-            Applet::OpenPgp,
-            Some(2),
-            SecretBox::from(Box::<str>::from("654321")),
-        );
-
-        let identity_cache = IdentityCache::new();
-        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x42; 32])));
-        identity_cache.replace_piv([(
-            cred.clone(),
-            PivCachedIdentity {
-                slot: keyroost_piv::Slot::Authentication,
-                key_alg: keyroost_piv::KeyAlg::Ed25519,
-                serial: Some(1),
-            },
-        )]);
-
-        let mut agent = KeyroostAgent {
-            piv: None,
-            openpgp: None,
-            idle_tracker: IdleTracker::new(),
-            pin_cache: Some(cache.clone()),
-            identity_cache: identity_cache.clone(),
-        };
-        let cloned_agent = agent.clone();
-        assert_eq!(
-            cloned_agent.identity_cache.get(&cred),
-            Some(CachedIdentity::Piv(PivCachedIdentity {
-                slot: keyroost_piv::Slot::Authentication,
-                key_alg: keyroost_piv::KeyAlg::Ed25519,
-                serial: Some(1),
-            }))
-        );
-
-        agent.remove_all_identities().await.unwrap();
-
-        assert!(cache.get(Applet::Piv, Some(1)).is_none());
-        assert!(cache.get(Applet::OpenPgp, Some(2)).is_none());
-        assert!(identity_cache.get(&cred).is_none());
-        assert!(cloned_agent.identity_cache.get(&cred).is_none());
-    }
-
-    #[tokio::test]
-    async fn lock_clears_pin_cache() {
-        let cache = PinCache::new(Duration::from_secs(60), None);
-        cache.insert(
-            Applet::Piv,
-            Some(1),
-            SecretBox::from(Box::<str>::from("123456")),
-        );
-        let identity_cache = IdentityCache::new();
-        let cred = PublicCredential::Key(KeyData::Ed25519(Ed25519PublicKey([0x24; 32])));
-        identity_cache.replace_piv([(
-            cred.clone(),
-            PivCachedIdentity {
-                slot: keyroost_piv::Slot::Signature,
-                key_alg: keyroost_piv::KeyAlg::Ed25519,
-                serial: Some(1),
-            },
-        )]);
-
-        let mut agent = KeyroostAgent {
-            piv: None,
-            openpgp: None,
-            idle_tracker: IdleTracker::new(),
-            pin_cache: Some(cache.clone()),
-            identity_cache: identity_cache.clone(),
-        };
-
-        agent.lock("passphrase".to_owned()).await.unwrap();
-
-        assert!(cache.get(Applet::Piv, Some(1)).is_none());
-        assert!(identity_cache.get(&cred).is_none());
-    }
-
-    #[tokio::test]
-    async fn extension_returns_unsupported_command() {
-        let mut agent = KeyroostAgent {
-            piv: None,
-            openpgp: None,
-            idle_tracker: IdleTracker::new(),
-            pin_cache: None,
-            identity_cache: IdentityCache::new(),
-        };
-
-        let err = agent
-            .extension(super::Extension {
-                name: "query".to_owned(),
-                details: vec![1, 2, 3].into(),
-            })
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            super::AgentError::Proto(super::ProtoError::UnsupportedCommand { command: 27 })
-        ));
     }
 }
