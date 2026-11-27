@@ -1,27 +1,19 @@
 /// Maximum Assuan protocol line length (including trailing LF) per libassuan.
-#[allow(dead_code)]
 pub(crate) const MAX_LINE_LEN: usize = 1000;
 
 pub(crate) const GPG_ERR_CODE_MASK: u32 = 0xFFFF;
 pub(crate) const GPG_ERR_SOURCE_MASK: u32 = 0x7F;
 pub(crate) const GPG_ERR_SOURCE_SHIFT: u32 = 24;
 
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_SOURCE_GPGAGENT: u32 = 4;
 pub(crate) const GPG_ERR_SOURCE_PINENTRY: u32 = 5;
 
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_NO_SECKEY: u32 = 17;
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_NO_DATA: u32 = 58;
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_NOT_IMPLEMENTED: u32 = 69;
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_INV_DATA: u32 = 79;
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_BAD_PIN: u32 = 87;
 pub(crate) const GPG_ERR_CANCELED: u32 = 99;
-#[allow(dead_code)]
 pub(crate) const GPG_ERR_UNKNOWN_COMMAND: u32 = 175;
 
 pub(crate) const GPG_ERR_CANCELED_PINENTRY: u32 =
