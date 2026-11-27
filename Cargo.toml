@@ -2,7 +2,7 @@
 name = "keyroost-agent"
 version = "0.1.0"
 edition = "2024"
-description = "Implementation of the ssh agent protocol on top of keyroost APIs"
+description = "Pure-Rust SSH and GPG (gpg-agent) agent backed by smart-card PIV and OpenPGP applets via keyroost APIs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

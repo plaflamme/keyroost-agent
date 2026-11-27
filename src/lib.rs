@@ -1,3 +1,11 @@
+//! Pure-Rust SSH (`ssh-agent`) and GPG (`gpg-agent`) agent library backed by smart-card
+//! PIV and `OpenPGP` applets via `keyroost` APIs.
+//!
+//! Use [`run_protocols`] to bind Unix-domain sockets for SSH, GPG, or both protocols
+//! concurrently, or [`run_with_listeners`] to serve pre-bound listeners (for example from
+//! systemd socket activation). When both protocols are active, they share the same
+//! `OpenPGP` card session, PIN cache, pinentry integration, and idle timer.
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -133,12 +141,12 @@ pub enum PinCacheStrategy {
     Pinentry,
 }
 
-/// Configuration options for running the `keyroost-agent` SSH agent.
+/// Configuration options for running `keyroost-agent` (SSH, GPG, or both protocols).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyroostAgentOptions {
-    /// Optional PIV smart-card applet configuration.
+    /// Optional PIV smart-card applet configuration (used by the SSH protocol).
     pub piv: Option<PivOptions>,
-    /// Optional `OpenPGP` smart-card applet configuration.
+    /// Optional `OpenPGP` smart-card applet configuration (used by SSH and/or GPG protocols).
     pub openpgp: Option<OpenPgpOptions>,
     /// Optional path or name of the `pinentry` binary to invoke for PIN prompts.
     pub pinentry_binary: Option<String>,
@@ -279,11 +287,14 @@ async fn serve_protocols(
     }
 }
 
-/// Launch an SSH agent and bind it to the specified socket path.
+/// Launch an SSH-only agent and bind it to the specified socket path.
+///
+/// For GPG or dual-protocol (SSH + GPG) operation, use [`run_protocols`].
 ///
 /// # Errors
 ///
-/// Will return `Err` if an error occurs while binding to the socket or if the ssh agent raises an error while listening for connections.
+/// Returns an error if binding the socket fails or if the SSH agent raises an I/O error
+/// while serving connections.
 pub async fn run(socket_path: &Path, options: KeyroostAgentOptions) -> Result<(), std::io::Error> {
     run_protocols(
         ProtocolSockets {
@@ -295,11 +306,13 @@ pub async fn run(socket_path: &Path, options: KeyroostAgentOptions) -> Result<()
     .await
 }
 
-/// Launch an SSH agent on an already-bound Unix-domain socket listener.
+/// Launch an SSH-only agent on an already-bound Unix-domain socket listener.
+///
+/// For GPG or dual-protocol (SSH + GPG) operation, use [`run_with_listeners`].
 ///
 /// # Errors
 ///
-/// Will return `Err` if the ssh agent raises an error while listening for connections.
+/// Returns an error if the SSH agent raises an I/O error while serving connections.
 pub async fn run_with_listener(
     listener: UnixListener,
     options: KeyroostAgentOptions,
@@ -316,6 +329,9 @@ pub async fn run_with_listener(
 }
 
 /// Bind the requested protocol sockets (SSH, GPG, or both) and serve them concurrently.
+///
+/// Each bound socket is created with mode `0o600`. All active protocols share the same
+/// `OpenPGP` card session, PIN cache, pinentry integration, and idle timer.
 ///
 /// # Errors
 ///
@@ -405,8 +421,10 @@ async fn run_with_idle_management(
 
 /// Serve the requested pre-bound protocol listeners (SSH, GPG, or both) concurrently.
 ///
-/// All active protocols share the same `OpenPgpCard` session, `PinCache`, `SystemPinentry`, and
-/// `IdleTracker`.
+/// All active protocols share the same `OpenPGP` card session, PIN cache, pinentry
+/// integration, and idle timer. When `listeners.gpg_socket_name` is `None`, the GPG
+/// `GETINFO socket_name` response falls back to the listener's local socket path if
+/// available.
 ///
 /// # Errors
 ///
