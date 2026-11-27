@@ -54,9 +54,16 @@ pub(crate) const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decode an Assuan data payload into `out`.
+/// Percent-decode an Assuan data payload string into `out`.
 pub(crate) fn percent_decode(input: &str, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    let bytes = input.as_bytes();
+    percent_decode_bytes(input.as_bytes(), out)
+}
+
+/// Percent-decode raw Assuan data payload bytes into `out`.
+///
+/// Per the Assuan protocol, `D ` data lines may contain arbitrary non-UTF-8
+/// binary bytes; only `%`, `\r`, `\n`, and `\0` are percent-encoded.
+pub(crate) fn percent_decode_bytes(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -81,7 +88,7 @@ mod tests {
         GPG_ERR_BAD_PIN, GPG_ERR_CANCELED, GPG_ERR_CANCELED_PINENTRY, GPG_ERR_INV_DATA,
         GPG_ERR_NO_DATA, GPG_ERR_NO_SECKEY, GPG_ERR_NOT_IMPLEMENTED, GPG_ERR_SOURCE_GPGAGENT,
         GPG_ERR_SOURCE_PINENTRY, GPG_ERR_UNKNOWN_COMMAND, MAX_LINE_LEN, gpg_err_make, hex_value,
-        is_cancelled_err, percent_decode, percent_encode,
+        is_cancelled_err, percent_decode, percent_decode_bytes, percent_encode,
     };
 
     #[test]
@@ -100,6 +107,13 @@ mod tests {
         let mut out = Vec::new();
         percent_decode("%2a%2B%0a%0D", &mut out).unwrap();
         assert_eq!(out, b"*+\n\r");
+    }
+
+    #[test]
+    fn percent_decode_bytes_preserves_raw_non_utf8_bytes() {
+        let mut out = Vec::new();
+        percent_decode_bytes(b"\xff\x80%25%0A\xfe", &mut out).unwrap();
+        assert_eq!(out, b"\xff\x80%\n\xfe");
     }
 
     #[test]

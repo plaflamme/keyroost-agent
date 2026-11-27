@@ -10,7 +10,7 @@ use crate::{
     assuan::{
         GPG_ERR_BAD_PIN, GPG_ERR_CANCELED, GPG_ERR_INV_DATA, GPG_ERR_NO_DATA, GPG_ERR_NO_SECKEY,
         GPG_ERR_NOT_IMPLEMENTED, GPG_ERR_SOURCE_GPGAGENT, GPG_ERR_UNKNOWN_COMMAND, MAX_LINE_LEN,
-        gpg_err_make, hex_value, percent_decode,
+        gpg_err_make, hex_value, percent_decode, percent_decode_bytes,
     },
     card::CardOperationOutcome,
     idle::IdleTracker,
@@ -1026,12 +1026,21 @@ async fn run_decrypt_op<C: GpgCardBackend>(
             EncVal::Ecdh { e },
             AlgorithmAttributes::Ecc {
                 kind: EccKind::Ecdh,
+                curve,
                 ..
             },
-        ) => card
-            .decrypt_ecdh(expected_serial, e, prompt_desc, prompt_env)
-            .await
-            .map_err(DecryptOpError::Card),
+        ) => {
+            // GnuPG encodes Curve25519 ephemeral points with a leading 0x40 prefix
+            // (33 bytes); OpenPGP Card PSO:DECIPHER expects the raw 32-byte coordinate.
+            let point = if curve == Curve::X25519 && e.len() == 33 && e[0] == 0x40 {
+                &e[1..]
+            } else {
+                e.as_slice()
+            };
+            card.decrypt_ecdh(expected_serial, point, prompt_desc, prompt_env)
+                .await
+                .map_err(DecryptOpError::Card)
+        }
         _ => Err(DecryptOpError::InvalidData(
             "Ciphertext algorithm does not match selected key",
         )),
@@ -1103,27 +1112,23 @@ async fn inquire_data<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             LineRead::Line(bytes) => bytes,
         };
 
-        let Ok(line) = std::str::from_utf8(&raw_line) else {
-            return Ok(InquireOutcome::Error(
-                GPG_ERR_INV_DATA,
-                "Invalid UTF-8 in inquiry data",
-            ));
-        };
-
-        if line.is_empty() || line.starts_with('#') {
+        if raw_line.is_empty() || raw_line.starts_with(b"#") {
             continue;
         }
 
-        if line.eq_ignore_ascii_case("END") {
+        if raw_line.eq_ignore_ascii_case(b"END") {
             return Ok(InquireOutcome::Data(collected));
         }
 
-        if line.eq_ignore_ascii_case("CAN") {
+        if raw_line.eq_ignore_ascii_case(b"CAN") {
             return Ok(InquireOutcome::Canceled);
         }
 
-        if let Some(payload) = line.strip_prefix("D ").or_else(|| line.strip_prefix("d ")) {
-            if let Err(msg) = percent_decode(payload, &mut collected) {
+        if let Some(payload) = raw_line
+            .strip_prefix(b"D ")
+            .or_else(|| raw_line.strip_prefix(b"d "))
+        {
+            if let Err(msg) = percent_decode_bytes(payload, &mut collected) {
                 return Ok(InquireOutcome::Error(GPG_ERR_INV_DATA, msg));
             }
         } else {
@@ -1953,6 +1958,51 @@ mod tests {
 
         assert_eq!(card.rsa_decrypt_calls()[0].input, b"ABCD");
         assert_eq!(card.ecdh_decrypt_calls()[0].input, b"WXYZ");
+
+        client.command("BYE").await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pkdecrypt_handles_binary_inquire_and_strips_x25519_prefix() {
+        let (x25519_info, x25519_kg) = x25519_key_info(KeyCrt::Decrypt, 7);
+        let card = MockCard::new(vec![x25519_info]);
+        card.push_ecdh_decrypt(Ok(CardOperationOutcome::Completed(vec![0xAB; 32])));
+
+        let (mut client, handle) = spawn_server(
+            Some(card.clone()),
+            IdleTracker::new(),
+            None,
+            GpgKeyCache::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(client.command(&format!("SETKEY {x25519_kg}")).await.2, "OK");
+        let (_, _, term) = client.command("PKDECRYPT").await;
+        assert_eq!(term, "INQUIRE CIPHERTEXT");
+
+        // Build a 33-byte Cv25519 ephemeral point with 0x40 prefix and non-UTF-8 bytes.
+        let mut raw_u = [0u8; 32];
+        for (i, b) in raw_u.iter_mut().enumerate() {
+            *b = 0x80u8.wrapping_add(u8::try_from(i).unwrap());
+        }
+        let mut line = Vec::from(&b"D (7:enc-val(4:ecdh(1:e33:\x40"[..]);
+        line.extend_from_slice(&raw_u);
+        line.extend_from_slice(b")))\n");
+        client.writer.write_all(&line).await.unwrap();
+        client.writer.flush().await.unwrap();
+        client.send_line("END").await;
+
+        let (status, data, term) = client.read_until_terminal().await;
+        assert_eq!(term, "OK");
+        assert_eq!(status, vec!["S PADDING 0"]);
+        let mut expected_shared = vec![0x40];
+        expected_shared.extend_from_slice(&[0xAB; 32]);
+        assert_eq!(data, encode_decrypt_value(&expected_shared));
+
+        // Card must receive the raw 32-byte coordinate without the 0x40 prefix.
+        assert_eq!(card.ecdh_decrypt_calls()[0].input, raw_u);
 
         client.command("BYE").await;
         handle.await.unwrap();

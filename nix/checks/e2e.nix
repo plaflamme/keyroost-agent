@@ -86,6 +86,7 @@ let
     "piv"
     "openpgp"
     "dual"
+    "gpg"
   ];
 
   mkCheck = name: path: {
@@ -133,6 +134,7 @@ let
             };
 
             environment.systemPackages = [
+              pkgs.gnupg
               pkgs.openssl
               pkgs.openssh
               pkgs.yubico-piv-tool
