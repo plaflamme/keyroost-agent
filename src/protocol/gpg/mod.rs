@@ -1,5 +1,6 @@
 pub(crate) mod cache;
 pub(crate) mod keygrip;
+pub(crate) mod scd;
 pub(crate) mod server;
 pub(crate) mod sexp;
 
@@ -12,7 +13,7 @@ use tracing::{debug, warn};
 use crate::{
     card::{
         CardOperationOutcome,
-        openpgp::{OpenPgpCard, OpenPgpKeyInfo},
+        openpgp::{OpenPgpCard, OpenPgpCardStatus, OpenPgpKeyInfo},
     },
     idle::IdleTracker,
     pin_cache::PinCache,
@@ -23,6 +24,10 @@ use crate::{
 /// Internal card backend abstraction allowing the Assuan server loop to be
 /// unit-tested with a mock card.
 pub(crate) trait GpgCardBackend: Clone + Send + Sync + 'static {
+    fn card_status(
+        &self,
+    ) -> impl Future<Output = Result<OpenPgpCardStatus, crate::Error>> + Send;
+
     fn list_keys(
         &self,
         slots: &[KeyCrt],
@@ -57,6 +62,12 @@ pub(crate) trait GpgCardBackend: Clone + Send + Sync + 'static {
 }
 
 impl GpgCardBackend for OpenPgpCard {
+    fn card_status(
+        &self,
+    ) -> impl Future<Output = Result<OpenPgpCardStatus, crate::Error>> + Send {
+        OpenPgpCard::card_status(self)
+    }
+
     fn list_keys(
         &self,
         slots: &[KeyCrt],

@@ -20,6 +20,7 @@ use crate::{
         GpgCardBackend,
         cache::{GpgCachedKey, GpgKeyCache},
         keygrip::{Keygrip, compute_keygrip},
+        scd,
         sexp::{
             EncVal, Sexp, encode_decrypt_value, encode_ecdsa_sig, encode_eddsa_sig, encode_rsa_sig,
             parse_enc_val,
@@ -30,7 +31,7 @@ use crate::{
 pub(crate) const GPG_OPENPGP_SLOTS: [KeyCrt; 3] = [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth];
 
 /// Reported `gpg-agent` version for `GETINFO version` (`GnuPG` parses `major.minor.micro`).
-const AGENT_VERSION: &str = "2.4.0";
+pub(super) const AGENT_VERSION: &str = "2.4.0";
 
 /// Maximum encoded bytes per `D ` line (`"D "` + payload + `"\n"` <= `MAX_LINE_LEN`).
 const MAX_DATA_LINE_PAYLOAD: usize = MAX_LINE_LEN - 4;
@@ -147,12 +148,12 @@ impl ConnectionState {
     }
 }
 
-struct ServerContext<C> {
-    card: Option<C>,
-    idle_tracker: IdleTracker,
-    pin_cache: Option<PinCache>,
-    key_cache: GpgKeyCache,
-    socket_name: Option<String>,
+pub(super) struct ServerContext<C> {
+    pub(super) card: Option<C>,
+    pub(super) idle_tracker: IdleTracker,
+    pub(super) pin_cache: Option<PinCache>,
+    pub(super) key_cache: GpgKeyCache,
+    pub(super) socket_name: Option<String>,
 }
 
 enum LineRead {
@@ -294,6 +295,9 @@ where
         }
         "PKDECRYPT" => {
             return handle_pkdecrypt(ctx, state, reader, writer).await;
+        }
+        "SCD" => {
+            scd::handle_scd(args, ctx, writer).await?;
         }
         _ => {
             send_err(writer, GPG_ERR_UNKNOWN_COMMAND, "Unknown command").await?;
@@ -1181,7 +1185,7 @@ async fn drain_until_lf<R: AsyncRead + Unpin>(
     }
 }
 
-fn split_command(line: &str) -> (&str, &str) {
+pub(super) fn split_command(line: &str) -> (&str, &str) {
     match line.find([' ', '\t']) {
         Some(idx) => (&line[..idx], line[idx..].trim_start_matches([' ', '\t'])),
         None => (line, ""),
@@ -1203,7 +1207,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-async fn write_line<W: AsyncWrite + Unpin>(
+pub(super) async fn write_line<W: AsyncWrite + Unpin>(
     writer: &mut W,
     line: &str,
 ) -> Result<(), std::io::Error> {
@@ -1212,7 +1216,7 @@ async fn write_line<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-async fn send_err<W: AsyncWrite + Unpin>(
+pub(super) async fn send_err<W: AsyncWrite + Unpin>(
     writer: &mut W,
     code: u32,
     description: &str,
@@ -1231,7 +1235,7 @@ async fn send_err<W: AsyncWrite + Unpin>(
     write_line(writer, &format!("{prefix}{clean}")).await
 }
 
-async fn send_data_bytes<W: AsyncWrite + Unpin>(
+pub(super) async fn send_data_bytes<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), std::io::Error> {
@@ -1264,7 +1268,7 @@ async fn send_data_bytes<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn map_card_error(err: &crate::Error) -> (u32, String) {
+pub(super) fn map_card_error(err: &crate::Error) -> (u32, String) {
     if let crate::Error::Other(inner) = err
         && let Some(transport_err) = inner.downcast_ref::<TransportError>()
     {
@@ -1287,7 +1291,7 @@ fn map_card_error(err: &crate::Error) -> (u32, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::card::openpgp::OpenPgpKeyInfo;
+    use crate::card::openpgp::{OpenPgpCardStatus, OpenPgpKeyInfo};
     use crate::pinentry::Applet;
     use keyroost_openpgp::{PublicKey, RsaAttributes, RsaImportFormat};
     use ssh_agent_lib::secrecy::SecretBox;
@@ -1389,6 +1393,41 @@ mod tests {
     }
 
     impl GpgCardBackend for MockCard {
+        fn card_status(
+            &self,
+        ) -> impl std::future::Future<Output = Result<OpenPgpCardStatus, crate::Error>> + Send
+        {
+            let st = self.state.lock().unwrap();
+            let aid = st
+                .keys
+                .first()
+                .map_or_else(test_aid, |k| k.aid.clone());
+            let mut status = OpenPgpCardStatus {
+                reader: "Mock Reader 00 00".to_owned(),
+                aid,
+                sig_attrs: Vec::new(),
+                dec_attrs: Vec::new(),
+                aut_attrs: Vec::new(),
+                fingerprint_sig: [0u8; 20],
+                fingerprint_dec: [0u8; 20],
+                fingerprint_aut: [0u8; 20],
+                tries_pw1: 3,
+                tries_rc: 0,
+                tries_pw3: 3,
+                signature_count: Some(0),
+                serial: None,
+                full_serial: None,
+            };
+            for key in &st.keys {
+                match key.slot {
+                    KeyCrt::Sign => status.fingerprint_sig = key.fingerprint,
+                    KeyCrt::Decrypt => status.fingerprint_dec = key.fingerprint,
+                    KeyCrt::Auth => status.fingerprint_aut = key.fingerprint,
+                }
+            }
+            std::future::ready(Ok(status))
+        }
+
         fn list_keys(
             &self,
             _slots: &[KeyCrt],

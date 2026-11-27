@@ -372,6 +372,38 @@ pub(crate) fn encode_decrypt_value(value: &[u8]) -> Vec<u8> {
     Sexp::List(vec![Sexp::atom(b"value"), Sexp::atom(value)]).to_canonical()
 }
 
+/// Encode an RSA public key as canonical `(public-key (rsa (n <n>)(e <e>)))`.
+#[must_use]
+pub(crate) fn encode_rsa_public_key(n: &[u8], e: &[u8]) -> Vec<u8> {
+    Sexp::List(vec![
+        Sexp::atom(b"public-key"),
+        Sexp::List(vec![
+            Sexp::atom(b"rsa"),
+            Sexp::List(vec![Sexp::atom(b"n"), Sexp::atom(n)]),
+            Sexp::List(vec![Sexp::atom(b"e"), Sexp::atom(e)]),
+        ]),
+    ])
+    .to_canonical()
+}
+
+/// Encode an ECC public key as canonical `(public-key (ecc (curve <name>)[(flags <flag>)](q <q>)))`.
+#[must_use]
+pub(crate) fn encode_ecc_public_key(curve: &str, flags: Option<&str>, q: &[u8]) -> Vec<u8> {
+    let mut ecc_items = vec![
+        Sexp::atom(b"ecc"),
+        Sexp::List(vec![Sexp::atom(b"curve"), Sexp::atom(curve.as_bytes())]),
+    ];
+    if let Some(flag) = flags {
+        ecc_items.push(Sexp::List(vec![
+            Sexp::atom(b"flags"),
+            Sexp::atom(flag.as_bytes()),
+        ]));
+    }
+    ecc_items.push(Sexp::List(vec![Sexp::atom(b"q"), Sexp::atom(q)]));
+
+    Sexp::List(vec![Sexp::atom(b"public-key"), Sexp::List(ecc_items)]).to_canonical()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

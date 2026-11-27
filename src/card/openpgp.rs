@@ -22,6 +22,48 @@ pub(crate) struct OpenPgpKeyInfo {
     pub(crate) full_serial: Option<u128>,
 }
 
+/// Read-only snapshot of an `OpenPGP` card's status metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenPgpCardStatus {
+    pub(crate) reader: String,
+    pub(crate) aid: Vec<u8>,
+    pub(crate) sig_attrs: Vec<u8>,
+    pub(crate) dec_attrs: Vec<u8>,
+    pub(crate) aut_attrs: Vec<u8>,
+    pub(crate) fingerprint_sig: [u8; 20],
+    pub(crate) fingerprint_dec: [u8; 20],
+    pub(crate) fingerprint_aut: [u8; 20],
+    pub(crate) tries_pw1: u8,
+    pub(crate) tries_rc: u8,
+    pub(crate) tries_pw3: u8,
+    pub(crate) signature_count: Option<u32>,
+    #[allow(dead_code)]
+    pub(crate) serial: Option<u32>,
+    #[allow(dead_code)]
+    pub(crate) full_serial: Option<u128>,
+}
+
+impl OpenPgpCardStatus {
+    fn from_status(reader: String, status: &OpenPgpStatus) -> Self {
+        Self {
+            reader,
+            aid: status.aid.clone(),
+            sig_attrs: status.sig_attrs.clone(),
+            dec_attrs: status.dec_attrs.clone(),
+            aut_attrs: status.aut_attrs.clone(),
+            fingerprint_sig: status.fingerprint_sig,
+            fingerprint_dec: status.fingerprint_dec,
+            fingerprint_aut: status.fingerprint_aut,
+            tries_pw1: status.tries_pw1,
+            tries_rc: status.tries_rc,
+            tries_pw3: status.tries_pw3,
+            signature_count: status.signature_count,
+            serial: status.serial(),
+            full_serial: status.full_serial(),
+        }
+    }
+}
+
 struct OpenPgpStatusView<'a> {
     aid: &'a [u8],
     sig_attrs: &'a [u8],
@@ -185,6 +227,17 @@ impl OpenPgpCard {
                 f,
             ),
         }
+    }
+
+    pub(crate) async fn card_status(&self) -> Result<OpenPgpCardStatus, crate::Error> {
+        let card = self.clone();
+        tokio::task::spawn_blocking(move || {
+            card.with_session(|_session, status| {
+                Ok(OpenPgpCardStatus::from_status(card.reader.clone(), status))
+            })
+        })
+        .await
+        .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
     pub(crate) async fn list_keys(
