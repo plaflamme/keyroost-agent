@@ -106,8 +106,9 @@ impl GpgCardBackend for OpenPgpCard {
     }
 }
 
+pub(crate) use server::GPG_OPENPGP_SLOTS;
+
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct GpgAgent {
     openpgp: Option<OpenPgpCard>,
     idle_tracker: IdleTracker,
@@ -116,7 +117,6 @@ pub(crate) struct GpgAgent {
     socket_name: Option<String>,
 }
 
-#[allow(dead_code)]
 impl GpgAgent {
     pub(crate) fn new(
         openpgp: Option<OpenPgpCard>,
@@ -150,7 +150,6 @@ impl GpgAgent {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) async fn serve(listener: UnixListener, agent: GpgAgent) -> Result<(), std::io::Error> {
     loop {
         let (stream, _addr) = listener.accept().await?;

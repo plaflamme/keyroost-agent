@@ -52,13 +52,13 @@ impl SshAgent {
         }
     }
 
-    fn clear_pin_cache(&self) {
+    pub(crate) fn clear_pin_cache(&self) {
         if let Some(pin_cache) = &self.pin_cache {
             pin_cache.clear();
         }
     }
 
-    fn clear_identity_cache(&self) {
+    pub(crate) fn clear_identity_cache(&self) {
         self.identity_cache.clear();
     }
 

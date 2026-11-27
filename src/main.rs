@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use keyroost_agent::{
     ConnectionMode, KeyroostAgentOptions, OpenPgpOptions, PinCacheStrategy, PivOptions, PivSlot,
+    ProtocolListeners, ProtocolSockets,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -74,17 +75,29 @@ struct ResolvedConfig {
     connection_mode: ConnectionMode,
 }
 
-#[expect(clippy::fn_params_excessive_bools)]
+#[expect(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn resolve_config(
     applet: AppletSelection,
     connection: ConnectionSelection,
+    enable_ssh: bool,
+    enable_gpg: bool,
     has_piv: bool,
     has_openpgp: bool,
     piv_has_identities: bool,
     openpgp_has_identities: bool,
 ) -> Result<ResolvedConfig, String> {
+    if !enable_ssh && !enable_gpg {
+        return Err("At least one protocol (SSH or GPG) must be enabled.".to_owned());
+    }
+
     let (use_piv, use_openpgp) = match applet {
         AppletSelection::Piv => {
+            if enable_gpg {
+                return Err(
+                    "GPG protocol requires the OpenPGP applet and cannot be used with --applet=piv."
+                        .to_owned(),
+                );
+            }
             if !has_piv {
                 return Err(
                     "PIV applet requested (--applet=piv), but no PIV applet was found on the reader."
@@ -124,17 +137,28 @@ fn resolve_config(
             }
         },
         AppletSelection::Auto => {
-            if !has_piv && !has_openpgp {
-                return Err("No PIV or OpenPGP applet found on the reader.".to_owned());
-            }
-            match (
-                has_piv && piv_has_identities,
-                has_openpgp && openpgp_has_identities,
-            ) {
-                (true, false) => (true, false),
-                (false, true) => (false, true),
-                (true, true) => (true, true),
-                (false, false) => (has_piv, has_openpgp),
+            if enable_gpg {
+                if !has_openpgp {
+                    return Err(
+                        "GPG protocol requires an OpenPGP applet, but no OpenPGP applet was found on the reader."
+                            .to_owned(),
+                    );
+                }
+                let use_piv = enable_ssh && has_piv && piv_has_identities;
+                (use_piv, true)
+            } else {
+                if !has_piv && !has_openpgp {
+                    return Err("No PIV or OpenPGP applet found on the reader.".to_owned());
+                }
+                match (
+                    has_piv && piv_has_identities,
+                    has_openpgp && openpgp_has_identities,
+                ) {
+                    (true, false) => (true, false),
+                    (false, true) => (false, true),
+                    (true, true) => (true, true),
+                    (false, false) => (has_piv, has_openpgp),
+                }
             }
         }
     };
@@ -191,9 +215,13 @@ struct Cli {
     #[command(flatten)]
     verbosity: clap_verbosity_flag::Verbosity,
 
-    /// Bind the agent to the specified Unix-domain socket.
-    #[arg(short = 's', long)]
-    socket: Option<PathBuf>,
+    /// Bind the SSH agent to the specified Unix-domain socket.
+    #[arg(short = 's', long = "ssh-socket", alias = "socket", value_name = "PATH")]
+    ssh_socket: Option<PathBuf>,
+
+    /// Bind the GPG agent to the specified Unix-domain socket.
+    #[arg(long = "gpg-socket", value_name = "PATH")]
+    gpg_socket: Option<PathBuf>,
 
     /// Smart-card reader whose name contains this text (case-insensitive)
     #[arg(short = 'r', long)]
@@ -242,7 +270,84 @@ struct Cli {
     pin_cache_max_ttl: Duration,
 }
 
-fn systemd_listener() -> Result<Option<tokio::net::UnixListener>, Box<dyn std::error::Error>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemdProtocol {
+    Ssh,
+    Gpg,
+}
+
+fn parse_systemd_fd_names(
+    fds: usize,
+    fd_names: Option<&str>,
+) -> Result<Vec<SystemdProtocol>, String> {
+    if fds == 0 {
+        return Ok(Vec::new());
+    }
+    if fds > 2 {
+        return Err(format!(
+            "Expected at most 2 systemd socket fds (ssh, gpg), got {fds}"
+        ));
+    }
+
+    if fds == 1 {
+        let Some(names) = fd_names.filter(|s| !s.is_empty()) else {
+            return Ok(vec![SystemdProtocol::Ssh]);
+        };
+        let parts: Vec<&str> = names.split(':').collect();
+        if parts.len() != 1 {
+            return Err(format!(
+                "LISTEN_FDNAMES has {} entries, but LISTEN_FDS={fds}",
+                parts.len()
+            ));
+        }
+        return if parts[0].eq_ignore_ascii_case("gpg") {
+            Ok(vec![SystemdProtocol::Gpg])
+        } else {
+            // Treat "ssh" and any legacy single-unit name (e.g. "keyroost-agent.socket") as SSH.
+            Ok(vec![SystemdProtocol::Ssh])
+        };
+    }
+
+    let Some(names) = fd_names.filter(|s| !s.is_empty()) else {
+        return Err(
+            "LISTEN_FDNAMES is required when LISTEN_FDS=2 (expected 'ssh' and 'gpg')".to_owned(),
+        );
+    };
+    let parts: Vec<&str> = names.split(':').collect();
+    if parts.len() != fds {
+        return Err(format!(
+            "LISTEN_FDNAMES has {} entries, but LISTEN_FDS={fds}",
+            parts.len()
+        ));
+    }
+
+    let mut protocols = Vec::with_capacity(fds);
+    for part in parts {
+        let proto = if part.eq_ignore_ascii_case("ssh") {
+            SystemdProtocol::Ssh
+        } else if part.eq_ignore_ascii_case("gpg") {
+            SystemdProtocol::Gpg
+        } else {
+            return Err(format!(
+                "Unrecognized systemd socket name '{part}' in LISTEN_FDNAMES (expected 'ssh' or 'gpg')"
+            ));
+        };
+        if protocols.contains(&proto) {
+            let name = match proto {
+                SystemdProtocol::Ssh => "ssh",
+                SystemdProtocol::Gpg => "gpg",
+            };
+            return Err(format!(
+                "Duplicate systemd socket protocol '{name}' in LISTEN_FDNAMES"
+            ));
+        }
+        protocols.push(proto);
+    }
+
+    Ok(protocols)
+}
+
+fn systemd_listeners() -> Result<Option<ProtocolListeners>, Box<dyn std::error::Error>> {
     let Ok(fds) = std::env::var("LISTEN_FDS") else {
         return Ok(None);
     };
@@ -256,14 +361,24 @@ fn systemd_listener() -> Result<Option<tokio::net::UnixListener>, Box<dyn std::e
             return Ok(None);
         }
     }
-    if fds > 1 {
-        return Err(format!("Expected 1 systemd socket fd, got {fds}").into());
+
+    let fd_names = std::env::var("LISTEN_FDNAMES").ok();
+    let protocols = parse_systemd_fd_names(fds, fd_names.as_deref())?;
+
+    let mut listeners = ProtocolListeners::default();
+    for (idx, proto) in protocols.into_iter().enumerate() {
+        let raw_fd = 3 + i32::try_from(idx)?;
+        // SAFETY: systemd passes socket-activated file descriptors starting at fd 3.
+        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw_fd) };
+        std_listener.set_nonblocking(true)?;
+        let listener = tokio::net::UnixListener::from_std(std_listener)?;
+        match proto {
+            SystemdProtocol::Ssh => listeners.ssh = Some(listener),
+            SystemdProtocol::Gpg => listeners.gpg = Some(listener),
+        }
     }
 
-    // SAFETY: systemd passes the first socket-activated file descriptor as fd 3.
-    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-    std_listener.set_nonblocking(true)?;
-    Ok(Some(tokio::net::UnixListener::from_std(std_listener)?))
+    Ok(Some(listeners))
 }
 
 fn select_reader(
@@ -284,6 +399,35 @@ fn select_reader(
     reader.ok_or_else(|| "No PC/SC reader found.".into())
 }
 
+enum SocketSource {
+    Cli(ProtocolSockets),
+    Systemd(ProtocolListeners),
+}
+
+fn resolve_socket_source(
+    ssh_socket: Option<PathBuf>,
+    gpg_socket: Option<PathBuf>,
+) -> Result<(SocketSource, bool, bool), Box<dyn std::error::Error>> {
+    if ssh_socket.is_some() || gpg_socket.is_some() {
+        let sockets = ProtocolSockets {
+            ssh: ssh_socket,
+            gpg: gpg_socket,
+        };
+        let enable_ssh = sockets.ssh.is_some();
+        let enable_gpg = sockets.gpg.is_some();
+        Ok((SocketSource::Cli(sockets), enable_ssh, enable_gpg))
+    } else if let Some(listeners) = systemd_listeners()? {
+        let enable_ssh = listeners.ssh.is_some();
+        let enable_gpg = listeners.gpg.is_some();
+        Ok((SocketSource::Systemd(listeners), enable_ssh, enable_gpg))
+    } else {
+        Err(
+            "Either --ssh-socket, --gpg-socket, or systemd socket activation (LISTEN_FDS) is required."
+                .into(),
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Cli::parse();
@@ -299,6 +443,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         harden_process_memory();
     }
 
+    let (source, enable_ssh, enable_gpg) = resolve_socket_source(opts.ssh_socket, opts.gpg_socket)?;
+
     let reader = select_reader(opts.reader.as_deref())?;
 
     let piv_options = PivOptions {
@@ -307,7 +453,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let openpgp_options = OpenPgpOptions::new(reader.reader_name.clone());
 
-    let piv_has_identities = reader.has_piv
+    let piv_has_identities = enable_ssh
+        && reader.has_piv
         && opts.applet != AppletSelection::OpenPgp
         && keyroost_agent::probe_piv_identities(&piv_options).unwrap_or_else(|err| {
             tracing::warn!("failed to probe PIV identities: {err}");
@@ -316,14 +463,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let openpgp_has_identities = reader.has_openpgp
         && opts.applet != AppletSelection::Piv
-        && keyroost_agent::probe_openpgp_identities(&openpgp_options).unwrap_or_else(|err| {
-            tracing::warn!("failed to probe OpenPGP identities: {err}");
+        && if enable_gpg {
+            keyroost_agent::probe_openpgp_gpg_keys(&openpgp_options)
+        } else {
+            keyroost_agent::probe_openpgp_identities(&openpgp_options)
+        }
+        .unwrap_or_else(|err| {
+            tracing::warn!("failed to probe OpenPGP keys: {err}");
             false
         });
 
     if opts.applet == AppletSelection::Auto && !piv_has_identities && !openpgp_has_identities {
         tracing::warn!(
-            "no usable SSH identities found on reader '{}'; keeping available applets",
+            "no usable keys found on reader '{}'; keeping available applets",
             reader.reader_name
         );
     }
@@ -331,6 +483,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolved = resolve_config(
         opts.applet,
         opts.connection,
+        enable_ssh,
+        enable_gpg,
         reader.has_piv,
         reader.has_openpgp,
         piv_has_identities,
@@ -339,6 +493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         reader = %reader.reader_name,
+        ssh = enable_ssh,
+        gpg = enable_gpg,
         piv = resolved.use_piv,
         piv_slots = ?piv_slots,
         openpgp = resolved.use_openpgp,
@@ -363,19 +519,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pin_cache: pin_cache_strategy,
     };
 
-    if let Some(socket) = opts.socket {
-        keyroost_agent::run(&socket, agent_options).await?;
-    } else if let Some(listener) = systemd_listener()? {
-        keyroost_agent::run_with_listener(
-            listener,
-            KeyroostAgentOptions {
-                exit_on_idle: true,
-                ..agent_options
-            },
-        )
-        .await?;
-    } else {
-        return Err("Either --socket or systemd socket activation (LISTEN_FDS) is required.".into());
+    match source {
+        SocketSource::Cli(sockets) => {
+            keyroost_agent::run_protocols(sockets, agent_options).await?;
+        }
+        SocketSource::Systemd(listeners) => {
+            keyroost_agent::run_with_listeners(
+                listeners,
+                KeyroostAgentOptions {
+                    exit_on_idle: true,
+                    ..agent_options
+                },
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -384,12 +541,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppletSelection, Cli, ConnectionSelection, PinCacheMode, ResolvedConfig, resolve_config,
-        resolve_pin_cache, resolve_piv_slots,
+        AppletSelection, Cli, ConnectionSelection, PinCacheMode, ResolvedConfig, SystemdProtocol,
+        parse_systemd_fd_names, resolve_config, resolve_pin_cache, resolve_piv_slots,
     };
     use clap::Parser;
     use keyroost_agent::{ConnectionMode, PinCacheStrategy, PivSlot};
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    #[expect(clippy::fn_params_excessive_bools)]
+    fn resolve_ssh_only(
+        applet: AppletSelection,
+        connection: ConnectionSelection,
+        has_piv: bool,
+        has_openpgp: bool,
+        piv_has_identities: bool,
+        openpgp_has_identities: bool,
+    ) -> Result<ResolvedConfig, String> {
+        resolve_config(
+            applet,
+            connection,
+            true,
+            false,
+            has_piv,
+            has_openpgp,
+            piv_has_identities,
+            openpgp_has_identities,
+        )
+    }
+
+    #[test]
+    fn cli_parses_ssh_and_gpg_socket_flags() {
+        let default_cli = Cli::try_parse_from(["keyroost-agent"]).unwrap();
+        assert_eq!(default_cli.ssh_socket, None);
+        assert_eq!(default_cli.gpg_socket, None);
+
+        let ssh_long =
+            Cli::try_parse_from(["keyroost-agent", "--ssh-socket", "/tmp/ssh.sock"]).unwrap();
+        assert_eq!(ssh_long.ssh_socket, Some(PathBuf::from("/tmp/ssh.sock")));
+        assert_eq!(ssh_long.gpg_socket, None);
+
+        let ssh_alias =
+            Cli::try_parse_from(["keyroost-agent", "--socket", "/tmp/legacy.sock"]).unwrap();
+        assert_eq!(
+            ssh_alias.ssh_socket,
+            Some(PathBuf::from("/tmp/legacy.sock"))
+        );
+        assert_eq!(ssh_alias.gpg_socket, None);
+
+        let ssh_short = Cli::try_parse_from(["keyroost-agent", "-s", "/tmp/short.sock"]).unwrap();
+        assert_eq!(ssh_short.ssh_socket, Some(PathBuf::from("/tmp/short.sock")));
+        assert_eq!(ssh_short.gpg_socket, None);
+
+        let gpg_only =
+            Cli::try_parse_from(["keyroost-agent", "--gpg-socket", "/tmp/gpg.sock"]).unwrap();
+        assert_eq!(gpg_only.ssh_socket, None);
+        assert_eq!(gpg_only.gpg_socket, Some(PathBuf::from("/tmp/gpg.sock")));
+
+        let both = Cli::try_parse_from([
+            "keyroost-agent",
+            "--ssh-socket",
+            "/tmp/ssh.sock",
+            "--gpg-socket",
+            "/tmp/gpg.sock",
+        ])
+        .unwrap();
+        assert_eq!(both.ssh_socket, Some(PathBuf::from("/tmp/ssh.sock")));
+        assert_eq!(both.gpg_socket, Some(PathBuf::from("/tmp/gpg.sock")));
+    }
+
+    #[test]
+    fn parse_systemd_fd_names_handles_single_dual_legacy_and_errors() {
+        assert_eq!(parse_systemd_fd_names(0, None), Ok(vec![]));
+
+        // Single FD: absent, empty, explicit ssh, or legacy single-unit name -> SSH.
+        assert_eq!(
+            parse_systemd_fd_names(1, None),
+            Ok(vec![SystemdProtocol::Ssh])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("")),
+            Ok(vec![SystemdProtocol::Ssh])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("ssh")),
+            Ok(vec![SystemdProtocol::Ssh])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("SSH")),
+            Ok(vec![SystemdProtocol::Ssh])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("keyroost-agent.socket")),
+            Ok(vec![SystemdProtocol::Ssh])
+        );
+
+        // Single FD: gpg -> GPG.
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("gpg")),
+            Ok(vec![SystemdProtocol::Gpg])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(1, Some("GPG")),
+            Ok(vec![SystemdProtocol::Gpg])
+        );
+
+        // Two FDs: both orders.
+        assert_eq!(
+            parse_systemd_fd_names(2, Some("ssh:gpg")),
+            Ok(vec![SystemdProtocol::Ssh, SystemdProtocol::Gpg])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(2, Some("gpg:ssh")),
+            Ok(vec![SystemdProtocol::Gpg, SystemdProtocol::Ssh])
+        );
+        assert_eq!(
+            parse_systemd_fd_names(2, Some("GPG:SSH")),
+            Ok(vec![SystemdProtocol::Gpg, SystemdProtocol::Ssh])
+        );
+
+        // Error cases.
+        assert!(parse_systemd_fd_names(3, Some("ssh:gpg:extra")).is_err());
+        assert!(parse_systemd_fd_names(2, None).is_err());
+        assert!(parse_systemd_fd_names(2, Some("")).is_err());
+        assert!(parse_systemd_fd_names(2, Some("ssh")).is_err());
+        assert!(parse_systemd_fd_names(1, Some("ssh:gpg")).is_err());
+        assert!(parse_systemd_fd_names(2, Some("ssh:ssh")).is_err());
+        assert!(parse_systemd_fd_names(2, Some("gpg:gpg")).is_err());
+        assert!(parse_systemd_fd_names(2, Some("ssh:other")).is_err());
+    }
 
     #[test]
     fn cli_parses_piv_slots_and_rejects_invalid() {
@@ -570,7 +850,7 @@ mod tests {
     #[test]
     fn explicit_piv_selection() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Piv,
                 ConnectionSelection::Auto,
                 true,
@@ -585,7 +865,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Piv,
                 ConnectionSelection::Persistent,
                 true,
@@ -600,7 +880,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Piv,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -615,7 +895,7 @@ mod tests {
             })
         );
 
-        let err = resolve_config(
+        let err = resolve_ssh_only(
             AppletSelection::Piv,
             ConnectionSelection::Auto,
             false,
@@ -630,7 +910,7 @@ mod tests {
     #[test]
     fn explicit_openpgp_selection() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::OpenPgp,
                 ConnectionSelection::Auto,
                 true,
@@ -645,7 +925,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::OpenPgp,
                 ConnectionSelection::Persistent,
                 false,
@@ -660,7 +940,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::OpenPgp,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -675,7 +955,7 @@ mod tests {
             })
         );
 
-        let err = resolve_config(
+        let err = resolve_ssh_only(
             AppletSelection::OpenPgp,
             ConnectionSelection::Auto,
             true,
@@ -690,7 +970,7 @@ mod tests {
     #[test]
     fn explicit_both_selection() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Both,
                 ConnectionSelection::Auto,
                 true,
@@ -705,7 +985,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Both,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -720,7 +1000,7 @@ mod tests {
             })
         );
 
-        let persistent_err = resolve_config(
+        let persistent_err = resolve_ssh_only(
             AppletSelection::Both,
             ConnectionSelection::Persistent,
             true,
@@ -735,7 +1015,7 @@ mod tests {
         assert!(persistent_err.contains("--connection=ephemeral"));
 
         for (has_piv, has_openpgp) in [(false, true), (true, false), (false, false)] {
-            let err = resolve_config(
+            let err = resolve_ssh_only(
                 AppletSelection::Both,
                 ConnectionSelection::Auto,
                 has_piv,
@@ -751,7 +1031,7 @@ mod tests {
     #[test]
     fn auto_applet_selects_only_piv_when_only_piv_has_identities() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Auto,
                 true,
@@ -766,7 +1046,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Persistent,
                 true,
@@ -781,7 +1061,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -800,7 +1080,7 @@ mod tests {
     #[test]
     fn auto_applet_selects_only_openpgp_when_only_openpgp_has_identities() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Auto,
                 true,
@@ -815,7 +1095,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Persistent,
                 true,
@@ -830,7 +1110,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -849,7 +1129,7 @@ mod tests {
     #[test]
     fn auto_applet_selects_both_when_both_have_identities() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Auto,
                 true,
@@ -864,7 +1144,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -879,7 +1159,7 @@ mod tests {
             })
         );
 
-        let err = resolve_config(
+        let err = resolve_ssh_only(
             AppletSelection::Auto,
             ConnectionSelection::Persistent,
             true,
@@ -895,7 +1175,7 @@ mod tests {
     #[test]
     fn auto_applet_keeps_both_when_neither_has_identities() {
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Auto,
                 true,
@@ -910,7 +1190,7 @@ mod tests {
             })
         );
         assert!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Persistent,
                 true,
@@ -921,7 +1201,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Ephemeral,
                 true,
@@ -946,7 +1226,7 @@ mod tests {
                 (ConnectionSelection::Ephemeral, ConnectionMode::Ephemeral),
             ] {
                 assert_eq!(
-                    resolve_config(
+                    resolve_ssh_only(
                         AppletSelection::Auto,
                         connection,
                         has_piv,
@@ -967,7 +1247,7 @@ mod tests {
     #[test]
     fn auto_applet_errors_when_no_applets_present() {
         assert!(
-            resolve_config(
+            resolve_ssh_only(
                 AppletSelection::Auto,
                 ConnectionSelection::Auto,
                 false,
@@ -976,6 +1256,198 @@ mod tests {
                 false,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_config_errors_when_no_protocol_enabled() {
+        let err = resolve_config(
+            AppletSelection::Auto,
+            ConnectionSelection::Auto,
+            false,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("SSH") && err.contains("GPG"));
+    }
+
+    #[test]
+    fn resolve_config_gpg_only_matrix() {
+        // GPG-only + --applet=piv is always rejected.
+        assert!(
+            resolve_config(
+                AppletSelection::Piv,
+                ConnectionSelection::Auto,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+
+        // GPG-only + Auto requires OpenPGP.
+        assert!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Auto,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+            )
+            .is_err()
+        );
+
+        // GPG-only + Auto enables only OpenPGP (never PIV, even if PIV has identities) -> Persistent.
+        assert_eq!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Auto,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            Ok(ResolvedConfig {
+                use_piv: false,
+                use_openpgp: true,
+                connection_mode: ConnectionMode::Persistent,
+            })
+        );
+
+        // GPG-only + OpenPGP -> Persistent.
+        assert_eq!(
+            resolve_config(
+                AppletSelection::OpenPgp,
+                ConnectionSelection::Auto,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Ok(ResolvedConfig {
+                use_piv: false,
+                use_openpgp: true,
+                connection_mode: ConnectionMode::Persistent,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_config_dual_protocol_matrix() {
+        // SSH + GPG + --applet=piv is rejected.
+        assert!(
+            resolve_config(
+                AppletSelection::Piv,
+                ConnectionSelection::Auto,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+
+        // SSH + GPG + Auto without OpenPGP is rejected.
+        assert!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Auto,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+            )
+            .is_err()
+        );
+
+        // SSH + GPG + Auto when PIV has no identities -> OpenPGP-only, Persistent!
+        assert_eq!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Auto,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+            ),
+            Ok(ResolvedConfig {
+                use_piv: false,
+                use_openpgp: true,
+                connection_mode: ConnectionMode::Persistent,
+            })
+        );
+
+        // SSH + GPG + Auto when PIV has identities -> both PIV and OpenPGP, Ephemeral!
+        assert_eq!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Auto,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            Ok(ResolvedConfig {
+                use_piv: true,
+                use_openpgp: true,
+                connection_mode: ConnectionMode::Ephemeral,
+            })
+        );
+
+        // SSH + GPG + Auto with PIV identities + Persistent -> error.
+        assert!(
+            resolve_config(
+                AppletSelection::Auto,
+                ConnectionSelection::Persistent,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+
+        // SSH + GPG + OpenPGP -> OpenPGP-only, Persistent!
+        assert_eq!(
+            resolve_config(
+                AppletSelection::OpenPgp,
+                ConnectionSelection::Auto,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            Ok(ResolvedConfig {
+                use_piv: false,
+                use_openpgp: true,
+                connection_mode: ConnectionMode::Persistent,
+            })
         );
     }
 }

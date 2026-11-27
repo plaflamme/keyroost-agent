@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-const GPG_OPENPGP_SLOTS: [KeyCrt; 3] = [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth];
+pub(crate) const GPG_OPENPGP_SLOTS: [KeyCrt; 3] = [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth];
 
 /// Reported `gpg-agent` version for `GETINFO version` (`GnuPG` parses `major.minor.micro`).
 const AGENT_VERSION: &str = "2.4.0";

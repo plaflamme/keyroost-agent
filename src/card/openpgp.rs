@@ -17,7 +17,6 @@ pub(crate) struct OpenPgpKeyInfo {
     pub(crate) public_key: PublicKey,
     #[allow(dead_code)]
     pub(crate) fingerprint: [u8; 20],
-    #[allow(dead_code)]
     pub(crate) aid: Vec<u8>,
     pub(crate) serial: Option<u32>,
     pub(crate) full_serial: Option<u128>,
@@ -160,7 +159,6 @@ impl OpenPgpCard {
         list_keys_in_session(&mut session, &status_view, slots)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn probe_keys(reader: &str, slots: &[KeyCrt]) -> Result<bool, crate::Error> {
         Self::list_keys_ephemeral(reader, slots).map(|keys| !keys.is_empty())
     }
@@ -241,7 +239,6 @@ impl OpenPgpCard {
         .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn decrypt_rsa(
         &self,
         expected_serial: Option<u128>,
@@ -271,7 +268,6 @@ impl OpenPgpCard {
         .map_err(|err| crate::Error::Other(Box::new(err)))?
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn decrypt_ecdh(
         &self,
         expected_serial: Option<u128>,
@@ -552,7 +548,6 @@ fn sign_raw_in_session(
     )
 }
 
-#[allow(dead_code)]
 #[expect(clippy::too_many_arguments)]
 fn decrypt_rsa_in_session(
     ops: &mut impl OpenPgpOps,
@@ -577,7 +572,6 @@ fn decrypt_rsa_in_session(
     )
 }
 
-#[allow(dead_code)]
 #[expect(clippy::too_many_arguments)]
 fn decrypt_ecdh_in_session(
     ops: &mut impl OpenPgpOps,
