@@ -94,7 +94,7 @@ in
     in
     ''
       host.wait_for_unit("sshd.service")
-      host.wait_for_unit("keyroost-agent.socket", "testuser")
+      host.wait_for_unit("keyroost-agent-ssh.socket", "testuser")
 
       socket = "/run/user/1000/keyroost-agent/ssh.socket"
       host.wait_for_file(socket)

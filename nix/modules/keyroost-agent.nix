@@ -6,8 +6,18 @@
 }:
 let
   cfg = config.services.keyroost-agent;
+  enabledSockets =
+    lib.optional cfg.ssh.enable "keyroost-agent-ssh.socket"
+    ++ lib.optional cfg.gpg.enable "keyroost-agent-gpg.socket";
 in
 {
+  imports = [
+    (lib.mkRenamedOptionModule
+      [ "services" "keyroost-agent" "socket" ]
+      [ "services" "keyroost-agent" "ssh" "socket" ]
+    )
+  ];
+
   options.services.keyroost-agent = {
     enable = lib.mkEnableOption "the socket-activated keyroost-agent systemd user service";
 
@@ -16,14 +26,46 @@ in
       description = "The keyroost-agent package to use.";
     };
 
-    socket = lib.mkOption {
-      type = lib.types.str;
-      default = "keyroost-agent/ssh.socket";
-      example = "keyroost-agent/my.socket";
-      description = ''
-        The SSH agent's socket; interpreted as a suffix to {env}`$XDG_RUNTIME_DIR`
-        on Linux.
-      '';
+    ssh = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether to enable the SSH agent protocol socket
+          (`keyroost-agent-ssh.socket`).
+        '';
+      };
+
+      socket = lib.mkOption {
+        type = lib.types.str;
+        default = "keyroost-agent/ssh.socket";
+        example = "keyroost-agent/my.socket";
+        description = ''
+          The SSH agent's socket; interpreted as a suffix to {env}`$XDG_RUNTIME_DIR`
+          on Linux.
+        '';
+      };
+    };
+
+    gpg = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether to enable the GPG agent (Assuan) protocol socket
+          (`keyroost-agent-gpg.socket`).
+        '';
+      };
+
+      socket = lib.mkOption {
+        type = lib.types.str;
+        default = "gnupg/S.gpg-agent";
+        example = "keyroost-agent/gpg.socket";
+        description = ''
+          The GPG agent's socket; interpreted as a suffix to {env}`$XDG_RUNTIME_DIR`
+          on Linux.
+        '';
+      };
     };
 
     reader = lib.mkOption {
@@ -164,6 +206,17 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.ssh.enable || cfg.gpg.enable;
+        message = "services.keyroost-agent: at least one of `ssh.enable` or `gpg.enable` must be true.";
+      }
+      {
+        assertion = !(cfg.gpg.enable && cfg.applets == "piv");
+        message = "services.keyroost-agent: `gpg.enable` cannot be used with `applets = \"piv\"` because GPG agent support requires an OpenPGP applet.";
+      }
+    ];
+
     # Grab the default binary name and fallback to expected value if `meta.mainProgram` not set
     services.keyroost-agent.pinentry.program = lib.mkOptionDefault (
       cfg.pinentry.package.meta.mainProgram or "pinentry"
@@ -171,33 +224,53 @@ in
 
     home.packages = [ cfg.package ];
 
-    sshAuthSock = {
+    sshAuthSock = lib.mkIf cfg.ssh.enable {
       enable = true;
       initialization =
         let
-          socketPath = "\${XDG_RUNTIME_DIR}/${cfg.socket}";
+          socketPath = "\${XDG_RUNTIME_DIR}/${cfg.ssh.socket}";
         in
         {
           bash = ''export SSH_AUTH_SOCK="${socketPath}"'';
           fish = ''set -x SSH_AUTH_SOCK "${socketPath}"'';
-          nushell = "$env.SSH_AUTH_SOCK = $env.XDG_RUNTIME_DIR/${cfg.socket}";
+          nushell = "$env.SSH_AUTH_SOCK = $env.XDG_RUNTIME_DIR/${cfg.ssh.socket}";
         };
       systemd.socketProviderUnit = "keyroost-agent.service";
     };
 
     systemd.user = {
-      sockets."keyroost-agent" = {
-        Unit.Description = "keyroost-agent socket activation";
-        # systemd specifier syntax; %t is the user runtime directory ($XDG_RUNTIME_DIR)
-        Socket.ListenStream = [ "%t/${cfg.socket}" ];
-        Install.WantedBy = [ "sockets.target" ];
+      sockets = {
+        "keyroost-agent-ssh" = lib.mkIf cfg.ssh.enable {
+          Unit.Description = "keyroost-agent SSH socket activation";
+          # systemd specifier syntax; %t is the user runtime directory ($XDG_RUNTIME_DIR)
+          Socket = {
+            Service = "keyroost-agent.service";
+            ListenStream = [ "%t/${cfg.ssh.socket}" ];
+            FileDescriptorName = "ssh";
+            SocketMode = "0600";
+          };
+          Install.WantedBy = [ "sockets.target" ];
+        };
+
+        "keyroost-agent-gpg" = lib.mkIf cfg.gpg.enable {
+          Unit.Description = "keyroost-agent GPG socket activation";
+          # systemd specifier syntax; %t is the user runtime directory ($XDG_RUNTIME_DIR)
+          Socket = {
+            Service = "keyroost-agent.service";
+            ListenStream = [ "%t/${cfg.gpg.socket}" ];
+            FileDescriptorName = "gpg";
+            SocketMode = "0600";
+            DirectoryMode = "0700";
+          };
+          Install.WantedBy = [ "sockets.target" ];
+        };
       };
 
       services."keyroost-agent" = {
         Unit = {
           Description = "keyroost-agent service";
-          Requires = "keyroost-agent.socket";
-          After = "keyroost-agent.socket";
+          Requires = enabledSockets;
+          After = enabledSockets;
           RefuseManualStart = true;
         };
         Service = {
