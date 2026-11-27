@@ -1,6 +1,6 @@
 use ssh_agent_lib::{
     error::AgentError,
-    proto::{Identity, PublicCredential, SignRequest},
+    proto::{Extension, Identity, ProtoError, PublicCredential, SignRequest},
     ssh_key::{HashAlg, Signature},
 };
 use std::future::Future;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 mod error;
 mod identity_cache;
@@ -491,6 +491,23 @@ impl ssh_agent_lib::agent::Session for KeyroostAgent {
         self.clear_identity_cache();
         Ok(())
     }
+
+    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
+        let details = extension.details.as_ref();
+        debug!(
+            name = %extension.name,
+            details_len = details.len(),
+            "extension"
+        );
+        trace!(
+            name = %extension.name,
+            ?details,
+            "extension details"
+        );
+        Err(AgentError::from(ProtoError::UnsupportedCommand {
+            command: 27,
+        }))
+    }
 }
 
 fn map_listen_result(result: Result<(), AgentError>) -> Result<(), std::io::Error> {
@@ -914,5 +931,29 @@ mod tests {
 
         assert!(cache.get(Applet::Piv, Some(1)).is_none());
         assert!(identity_cache.get(&cred).is_none());
+    }
+
+    #[tokio::test]
+    async fn extension_returns_unsupported_command() {
+        let mut agent = KeyroostAgent {
+            piv: None,
+            openpgp: None,
+            idle_tracker: IdleTracker::new(),
+            pin_cache: None,
+            identity_cache: IdentityCache::new(),
+        };
+
+        let err = agent
+            .extension(super::Extension {
+                name: "query".to_owned(),
+                details: vec![1, 2, 3].into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            super::AgentError::Proto(super::ProtoError::UnsupportedCommand { command: 27 })
+        ));
     }
 }
