@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::Display,
     io::{BufRead, BufReader, ErrorKind, Write},
     process::{Command, Stdio},
@@ -7,9 +8,7 @@ use std::{
 use ssh_agent_lib::secrecy::SecretBox;
 use zeroize::{Zeroize, Zeroizing};
 
-const GPG_ERR_CANCELED_PINENTRY: u32 = 83_886_179;
-const GPG_ERR_CANCELED_CODE: u32 = 99;
-const GPG_ERR_CODE_MASK: u32 = 0xFFFF;
+use crate::assuan::{is_cancelled_err, percent_decode, percent_encode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Applet {
@@ -35,10 +34,22 @@ impl Display for Applet {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PinentryEnv {
+    pub(crate) ttyname: Option<String>,
+    pub(crate) ttytype: Option<String>,
+    pub(crate) display: Option<String>,
+    pub(crate) xauthority: Option<String>,
+    pub(crate) lc_ctype: Option<String>,
+    pub(crate) lc_messages: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PinPromptOptions<'a> {
     pub(crate) allow_external_cache: bool,
     pub(crate) error: Option<&'a str>,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) env: Option<&'a PinentryEnv>,
 }
 
 pub(crate) trait Pinentry {
@@ -110,7 +121,7 @@ impl Pinentry for SystemPinentry {
             applet,
             serial,
             use_external_cache,
-            options.error,
+            options,
         );
 
         drop(stdin);
@@ -159,57 +170,6 @@ enum AssuanResponse {
     Err { code: u32, message: String },
 }
 
-fn is_cancelled_err(code: u32) -> bool {
-    code == GPG_ERR_CANCELED_PINENTRY || (code & GPG_ERR_CODE_MASK) == GPG_ERR_CANCELED_CODE
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '%' => encoded.push_str("%25"),
-            '\r' => encoded.push_str("%0D"),
-            '\n' => encoded.push_str("%0A"),
-            '\0' => encoded.push_str("%00"),
-            other => encoded.push(other),
-        }
-    }
-    encoded
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_decode(input: &str, out: &mut Vec<u8>) -> Result<(), AssuanError> {
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err(AssuanError::Protocol(
-                    "truncated percent-escape in data line",
-                ));
-            }
-            let hi = hex_value(bytes[i + 1])
-                .ok_or(AssuanError::Protocol("invalid percent-escape in data line"))?;
-            let lo = hex_value(bytes[i + 2])
-                .ok_or(AssuanError::Protocol("invalid percent-escape in data line"))?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    Ok(())
-}
-
 fn read_response(reader: &mut impl BufRead) -> Result<AssuanResponse, AssuanError> {
     let mut data = Zeroizing::new(Vec::new());
     let mut line = Zeroizing::new(String::new());
@@ -231,7 +191,7 @@ fn read_response(reader: &mut impl BufRead) -> Result<AssuanResponse, AssuanErro
         }
 
         if let Some(payload) = trimmed.strip_prefix("D ") {
-            percent_decode(payload, &mut data)?;
+            percent_decode(payload, &mut data).map_err(AssuanError::Protocol)?;
         } else if trimmed == "OK" || trimmed.starts_with("OK ") {
             return Ok(AssuanResponse::Ok(data));
         } else if let Some(rest) = trimmed.strip_prefix("ERR ") {
@@ -284,7 +244,7 @@ fn interact_assuan(
     applet: Applet,
     serial: Option<u128>,
     use_external_cache: bool,
-    error: Option<&str>,
+    options: PinPromptOptions<'_>,
 ) -> Result<Option<SecretBox<str>>, AssuanError> {
     match read_response(reader)? {
         AssuanResponse::Ok(_) => {}
@@ -292,9 +252,33 @@ fn interact_assuan(
     }
 
     let result = (|| {
-        let description = match serial {
-            Some(serial) => format!("Please unlock {applet} card {serial}"),
-            None => format!("Please unlock the {applet} card"),
+        if let Some(env) = options.env {
+            for (key, value) in [
+                ("ttyname", env.ttyname.as_deref()),
+                ("ttytype", env.ttytype.as_deref()),
+                ("display", env.display.as_deref()),
+                ("xauthority", env.xauthority.as_deref()),
+                ("lc-ctype", env.lc_ctype.as_deref()),
+                ("lc-messages", env.lc_messages.as_deref()),
+            ] {
+                if let Some(val) = value
+                    && let AssuanResponse::Err { message, .. } = send_command(
+                        reader,
+                        writer,
+                        &format!("OPTION {key}={}", percent_encode(val)),
+                    )?
+                {
+                    tracing::debug!("pinentry rejected OPTION {key}: {message}");
+                }
+            }
+        }
+
+        let description = match options.description {
+            Some(desc) => Cow::Borrowed(desc),
+            None => Cow::Owned(match serial {
+                Some(serial) => format!("Please unlock {applet} card {serial}"),
+                None => format!("Please unlock the {applet} card"),
+            }),
         };
         expect_ok(
             reader,
@@ -303,7 +287,7 @@ fn interact_assuan(
         )?;
         expect_ok(reader, writer, "SETPROMPT PIN")?;
 
-        if let Some(err_msg) = error {
+        if let Some(err_msg) = options.error {
             expect_ok(
                 reader,
                 writer,
@@ -367,14 +351,14 @@ mod tests {
 
     use ssh_agent_lib::secrecy::ExposeSecret;
 
-    use super::{Applet, interact_assuan, percent_decode, percent_encode};
+    use super::{Applet, PinPromptOptions, PinentryEnv, interact_assuan};
 
-    fn run_assuan(
+    fn run_assuan_with_options(
         server_responses: &str,
         applet: Applet,
         serial: Option<u128>,
         use_external_cache: bool,
-        error: Option<&str>,
+        options: PinPromptOptions<'_>,
     ) -> (Result<Option<String>, String>, Vec<String>) {
         let mut reader = Cursor::new(server_responses.as_bytes());
         let mut writer = Vec::new();
@@ -384,7 +368,7 @@ mod tests {
             applet,
             serial,
             use_external_cache,
-            error,
+            options,
         )
         .map(|opt| opt.map(|pin| pin.expose_secret().to_owned()))
         .map_err(|err| err.to_string());
@@ -396,23 +380,24 @@ mod tests {
         (res, commands)
     }
 
-    #[test]
-    fn percent_encode_and_decode_roundtrip() {
-        let original = "pin%12\r\nline2\0end";
-        let encoded = percent_encode(original);
-        assert_eq!(encoded, "pin%2512%0D%0Aline2%00end");
-
-        let mut decoded = Vec::new();
-        percent_decode(&encoded, &mut decoded).unwrap();
-        assert_eq!(decoded, original.as_bytes());
-    }
-
-    #[test]
-    fn percent_decode_rejects_malformed_escapes() {
-        let mut out = Vec::new();
-        assert!(percent_decode("abc%", &mut out).is_err());
-        assert!(percent_decode("abc%2", &mut out).is_err());
-        assert!(percent_decode("abc%ZZ", &mut out).is_err());
+    fn run_assuan(
+        server_responses: &str,
+        applet: Applet,
+        serial: Option<u128>,
+        use_external_cache: bool,
+        error: Option<&str>,
+    ) -> (Result<Option<String>, String>, Vec<String>) {
+        run_assuan_with_options(
+            server_responses,
+            applet,
+            serial,
+            use_external_cache,
+            PinPromptOptions {
+                allow_external_cache: use_external_cache,
+                error,
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
@@ -583,6 +568,136 @@ mod tests {
                 "SETPROMPT PIN",
                 "GETPIN",
                 "SETERROR PIN cannot be empty",
+                "GETPIN",
+                "BYE",
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_description_overrides_default_setdesc() {
+        let responses = concat!(
+            "OK Pleased to meet you\n",
+            "OK\n", // SETDESC
+            "OK\n", // SETPROMPT
+            "D 123456\n",
+            "OK\n", // GETPIN
+            "OK closing connection\n",
+        );
+
+        let (res, commands) = run_assuan_with_options(
+            responses,
+            Applet::OpenPgp,
+            Some(42),
+            false,
+            PinPromptOptions {
+                description: Some("Sign commit\n100% verified"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res, Ok(Some("123456".to_owned())));
+        assert_eq!(
+            commands,
+            vec![
+                "SETDESC Sign commit%0A100%25 verified",
+                "SETPROMPT PIN",
+                "GETPIN",
+                "BYE",
+            ]
+        );
+    }
+
+    #[test]
+    fn pinentry_env_emits_present_options_in_assuan_format() {
+        let responses = concat!(
+            "OK Pleased to meet you\n",
+            "OK\n", // OPTION ttyname
+            "OK\n", // OPTION ttytype
+            "OK\n", // OPTION display
+            "ERR 536871187 Unknown option\n", // OPTION xauthority (ignored)
+            "OK\n", // OPTION lc-ctype
+            "OK\n", // OPTION lc-messages
+            "OK\n", // SETDESC
+            "OK\n", // SETPROMPT
+            "D 654321\n",
+            "OK\n", // GETPIN
+            "OK closing connection\n",
+        );
+
+        let env = PinentryEnv {
+            ttyname: Some("/dev/pts/3".to_owned()),
+            ttytype: Some("xterm-256color".to_owned()),
+            display: Some(":0".to_owned()),
+            xauthority: Some("/tmp/auth%1".to_owned()),
+            lc_ctype: Some("en_US.UTF-8".to_owned()),
+            lc_messages: Some("C".to_owned()),
+        };
+
+        let (res, commands) = run_assuan_with_options(
+            responses,
+            Applet::Piv,
+            Some(99),
+            false,
+            PinPromptOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res, Ok(Some("654321".to_owned())));
+        assert_eq!(
+            commands,
+            vec![
+                "OPTION ttyname=/dev/pts/3",
+                "OPTION ttytype=xterm-256color",
+                "OPTION display=:0",
+                "OPTION xauthority=/tmp/auth%251",
+                "OPTION lc-ctype=en_US.UTF-8",
+                "OPTION lc-messages=C",
+                "SETDESC Please unlock PIV card 99",
+                "SETPROMPT PIN",
+                "GETPIN",
+                "BYE",
+            ]
+        );
+    }
+
+    #[test]
+    fn pinentry_env_omits_none_fields() {
+        let responses = concat!(
+            "OK Pleased to meet you\n",
+            "OK\n", // OPTION ttyname
+            "OK\n", // OPTION lc-messages
+            "OK\n", // SETDESC
+            "OK\n", // SETPROMPT
+            "D 123456\n",
+            "OK\n", // GETPIN
+            "OK closing connection\n",
+        );
+
+        let env = PinentryEnv {
+            ttyname: Some("/dev/tty1".to_owned()),
+            lc_messages: Some("en_GB.UTF-8".to_owned()),
+            ..Default::default()
+        };
+
+        let (res, commands) = run_assuan_with_options(
+            responses,
+            Applet::Piv,
+            None,
+            false,
+            PinPromptOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res, Ok(Some("123456".to_owned())));
+        assert_eq!(
+            commands,
+            vec![
+                "OPTION ttyname=/dev/tty1",
+                "OPTION lc-messages=en_GB.UTF-8",
+                "SETDESC Please unlock the PIV card",
+                "SETPROMPT PIN",
                 "GETPIN",
                 "BYE",
             ]

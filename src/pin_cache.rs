@@ -184,6 +184,7 @@ pub(crate) fn verify_pin_with_cache(
         PinPromptOptions {
             allow_external_cache: use_external_cache,
             error: None,
+            ..Default::default()
         },
     )?
     else {
@@ -209,6 +210,7 @@ pub(crate) fn verify_pin_with_cache(
                 PinPromptOptions {
                     allow_external_cache: false,
                     error: Some("Incorrect PIN"),
+                    ..Default::default()
                 },
             )?
             else {
